@@ -147,6 +147,19 @@ function localLinkText(link: SessionData["localLinks"][number]): string {
   }
 }
 
+function sessionDirLabel(dir: string, sessionName: string): string {
+  if (!dir) return "";
+
+  const parts = dir.replace(/\/+$/, "").split("/").filter(Boolean);
+  const name = parts[parts.length - 1] || "";
+  if (!name) return "";
+
+  if (name !== sessionName) return name;
+
+  const parent = parts[parts.length - 2];
+  return parent ? `${parent}/${name}` : name;
+}
+
 function wrapLocalLinks(links: SessionData["localLinks"], maxWidth: number): SessionData["localLinks"][] {
   if (links.length === 0) return [];
 
@@ -265,6 +278,14 @@ function getLocalWindowId(): string | null {
     return windowId || null;
   }
 
+  return null;
+}
+
+function getLocalPaneActive(): boolean | null {
+  if (muxCtx.type !== "tmux") return null;
+  const active = muxCtx.sdk.display("#{pane_active}", { target: muxCtx.paneId });
+  if (active === "1") return true;
+  if (active === "0") return false;
   return null;
 }
 
@@ -1040,11 +1061,15 @@ function App() {
     }
 
     // --- Defense against tmux send-keys injection ---
-    // If terminal focus reporting tells us this pane is NOT focused, ignore
-    // every shortcut. This drops accidental keystrokes from `tmux send-keys`
-    // targeting another pane in the sidebar's window. See the comment on
-    // paneHasTerminalFocus above for the trust model.
-    if (!paneHasTerminalFocus()) return;
+    // Prefer tmux's authoritative pane_active bit when available. Focus-event
+    // reporting is still useful as a fallback, but tmux does not always deliver
+    // a focus-in sequence when the user re-selects a sidebar pane after the TUI
+    // programmatically refocused the main pane. Requiring pane_active=false to
+    // ignore input keeps real selected-sidebar shortcuts working while dropping
+    // `tmux send-keys` delivered to a non-active sidebar pane.
+    const localPaneActive = getLocalPaneActive();
+    if (localPaneActive === false) return;
+    if (localPaneActive === null && !paneHasTerminalFocus()) return;
 
     if (handlePrintableBurstGuard(key)) return;
     handleNormalKey(key);
@@ -1828,12 +1853,7 @@ function SessionCard(props: SessionCardProps) {
   const truncBranch = () => props.session.branch ?? "";
 
   const dirName = () => {
-    const d = props.session.dir;
-    if (!d) return "";
-    const parts = d.replace(/\/+$/, "").split("/");
-    const name = parts[parts.length - 1] || "";
-    if (name === props.session.name) return "";
-    return name;
+    return sessionDirLabel(props.session.dir, props.session.name);
   };
 
   const portHint = () => {
