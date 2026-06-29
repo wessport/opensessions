@@ -105,6 +105,12 @@ interface AgentWatcher {
 - **Never call `process.exit()` directly in TUI**: Use `renderer.destroy()`.
 - **AI session logs**: Always write AI-assisted dev session logs to `ai_logs/` at the project root (this directory — `~/repos/github/opensessions/ai_logs/`), not inside any TPM-installed clone (e.g. `~/.tmux/plugins/opensessions/`). Use the `ai-session-logger` skill's `NN-kebab-case-name.md` convention.
 
+## GitHub / Pull Request Safety
+
+- **Do not open pull requests against the upstream/original repository unless the user explicitly asks.** In this checkout, `origin` may point at `Ataraxy-Labs/opensessions`, but routine AI-created review branches and PRs must target Wes's fork (`wessport/opensessions`).
+- When asked to push or create an MR/PR, default to pushing the branch to the `fork` remote and creating the PR in `wessport/opensessions` (for example, `gh pr create --repo wessport/opensessions ...`).
+- If remotes are ambiguous, stop and ask which repository should receive the PR. Never infer that `origin`/upstream is acceptable from the word “MR”, “PR”, “push”, or “review”.
+
 ## Local Runtime vs Source Checkout
 
 - **Keep the installed runtime and source checkout separate.** For local tmux usage, the running TPM install is expected to live at `~/.tmux/plugins/opensessions`, while this repository checkout (`~/repos/github/opensessions`) is the development/source tree.
