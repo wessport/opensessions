@@ -38,9 +38,28 @@ tmux source-file ~/.tmux.conf
 ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
-Open the sidebar with `prefix o → s`.
+Open or repair the sidebar from inside tmux with:
 
-TPM clones the repo into `~/.tmux/plugins/opensessions`. It does not install a standalone `opensessions` binary. `opensessions` runs from that checkout with your local `bun` installation.
+```bash
+opensessions start
+```
+
+If you installed with TPM, make sure the checkout's `bin` directory is on your `PATH`, for example:
+
+```bash
+export PATH="$HOME/.tmux/plugins/opensessions/bin:$PATH"
+```
+
+After a reboot or terminal session restore, the usual recovery sequence is:
+
+```bash
+tmux new -A -s opensessions
+opensessions start
+```
+
+The tmux keybinding `prefix o → s` focuses the sidebar during normal use, but `opensessions start` is the preferred recovery command after a terminal or tmux session restore.
+
+TPM clones the repo into `~/.tmux/plugins/opensessions`. `opensessions` runs from that checkout with your local `bun` installation.
 
 If you want the same setup as a single shell command:
 
