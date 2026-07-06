@@ -41,10 +41,10 @@ if [ ! -f "$OPENSESSIONS_DIR/opensessions.tmux" ]; then
   exit 1
 fi
 
-# Re-source the plugin entrypoint so keybindings, environment variables, and
+# Re-run the TPM shell entrypoint so keybindings, environment variables, and
 # per-tmux-socket server settings are repaired after a terminal/session restore.
-tmux source-file "$OPENSESSIONS_DIR/opensessions.tmux" >/dev/null 2>&1 || {
-  printf '%s\n' "opensessions: failed to source $OPENSESSIONS_DIR/opensessions.tmux" >&2
+sh "$OPENSESSIONS_DIR/opensessions.tmux" >/dev/null 2>&1 || {
+  printf '%s\n' "opensessions: failed to run $OPENSESSIONS_DIR/opensessions.tmux" >&2
   exit 1
 }
 

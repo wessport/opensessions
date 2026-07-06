@@ -252,7 +252,7 @@ describe("opensessions CLI", () => {
 
   test("provides an opensessions start command for tmux restart recovery", () => {
     expect(cliSrc).toMatch(/Usage: opensessions start/);
-    expect(cliSrc).toMatch(/tmux source-file "\$OPENSESSIONS_DIR\/opensessions\.tmux"/);
+    expect(cliSrc).toMatch(/sh "\$OPENSESSIONS_DIR\/opensessions\.tmux"/);
     expect(cliSrc).toMatch(/focus\.sh/);
     expect(cliSrc).toMatch(/must be run inside an attached tmux session/);
   });
