@@ -237,4 +237,23 @@ describe("tmux plugin: focus shortcut restore", () => {
     expect(focusSrc).toMatch(/auth_post "\/ensure-sidebar\?reveal=1" -d "\$CTX"/);
     expect(focusSrc).not.toMatch(/auth_post "\/toggle" -d "\$CTX"/);
   });
+
+  test("does not treat restored shell panes titled as sidebars as live sidebars", () => {
+    expect(focusSrc).toMatch(/pane_current_command/);
+    expect(focusSrc).toMatch(/zsh\|bash\|fish\|sh\|ksh\|dash/);
+    expect(focusSrc).toMatch(/kill_stale_sidebar_panes "\$WINDOW_ID"/);
+    expect(focusSrc).toMatch(/tmux kill-pane -t "\$pane_id"/);
+  });
+});
+
+describe("opensessions CLI", () => {
+  const cliPath = resolve(__dirname, "../../../bin/opensessions");
+  const cliSrc = readFileSync(cliPath, "utf-8");
+
+  test("provides an opensessions start command for tmux restart recovery", () => {
+    expect(cliSrc).toMatch(/Usage: opensessions start/);
+    expect(cliSrc).toMatch(/sh "\$OPENSESSIONS_DIR\/opensessions\.tmux"/);
+    expect(cliSrc).toMatch(/focus\.sh/);
+    expect(cliSrc).toMatch(/must be run inside an attached tmux session/);
+  });
 });

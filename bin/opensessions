@@ -1,0 +1,51 @@
+#!/usr/bin/env sh
+# Small user-facing helper for the TPM/source checkout.
+# Usage: opensessions start
+
+set -u
+
+usage() {
+  cat <<'EOF'
+Usage: opensessions start
+
+Starts the OpenSessions server if needed and focuses/restores the tmux sidebar.
+Run this inside an attached tmux session.
+EOF
+}
+
+command_name="${1:-}"
+case "$command_name" in
+  start)
+    ;;
+  -h|--help|help|"")
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [ -z "${TMUX:-}" ]; then
+  printf '%s\n' "opensessions: 'opensessions start' must be run inside an attached tmux session." >&2
+  printf '%s\n' "opensessions: create or attach one first, e.g. 'tmux new -A -s opensessions'." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+if [ ! -f "$OPENSESSIONS_DIR/opensessions.tmux" ]; then
+  printf '%s\n' "opensessions: could not find opensessions.tmux under $OPENSESSIONS_DIR" >&2
+  exit 1
+fi
+
+# Re-run the TPM shell entrypoint so keybindings, environment variables, and
+# per-tmux-socket server settings are repaired after a terminal/session restore.
+sh "$OPENSESSIONS_DIR/opensessions.tmux" >/dev/null 2>&1 || {
+  printf '%s\n' "opensessions: failed to run $OPENSESSIONS_DIR/opensessions.tmux" >&2
+  exit 1
+}
+
+exec sh "$OPENSESSIONS_DIR/integrations/tmux-plugin/scripts/focus.sh"
