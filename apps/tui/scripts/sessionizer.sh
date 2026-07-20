@@ -69,10 +69,16 @@ notify_opensessions() {
   local server_port="${OPENSESSIONS_PORT:-7391}"
   local token_file="${OPENSESSIONS_TOKEN_FILE:-}"
 
-  if [ -z "$token_file" ] || [ ! -r "$token_file" ]; then
+  if [ -z "$token_file" ]; then
     return 0
   fi
+
   token=$(cat "$token_file" 2>/dev/null || true)
+  if [ -z "$token" ]; then
+    curl -s -o /dev/null -m 0.5 --connect-timeout 0.1 \
+      "http://$server_host:$server_port/" >/dev/null 2>&1 || true
+    token=$(cat "$token_file" 2>/dev/null || true)
+  fi
   if [ -z "$token" ]; then
     return 0
   fi
