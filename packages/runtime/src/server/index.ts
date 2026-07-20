@@ -2306,8 +2306,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   const PORT_POLL_INTERVAL_MS = 10_000;
   const HIBERNATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
+  const IDENTITY_REFRESH_INTERVAL_MS = 10_000;
   let portPollTimer: ReturnType<typeof setInterval> | null = null;
   let hibernatePollTimer: ReturnType<typeof setInterval> | null = null;
+  let identityRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
   function startPortPoll() {
     // Run initial snapshot immediately so first broadcast has ports
@@ -2337,6 +2339,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearProgrammaticAdjustmentTimer();
     if (portPollTimer) clearInterval(portPollTimer);
     if (hibernatePollTimer) clearInterval(hibernatePollTimer);
+    if (identityRefreshTimer) clearInterval(identityRefreshTimer);
     if (paneScanTimer) clearInterval(paneScanTimer);
     for (const timer of pendingHighlightResets.values()) clearTimeout(timer);
     pendingHighlightResets.clear();
@@ -2349,8 +2352,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearTransientResizeTimer();
     clearResizeStaggerTimers();
     sidebarCoordinator.stop();
-    try { unlinkSync(PID_FILE); } catch {}
-    try { unlinkSync(TOKEN_FILE); } catch {}
+    removePublishedIdentity();
     // Global tmux hooks are shared by every opensessions server on this
     // machine. Only unset them when this is the last live instance — otherwise
     // we'd kneecap a sibling server (e.g. one bound to a different tmux
@@ -2368,20 +2370,52 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }
   }
 
-  // --- Write PID + start server ---
+  // --- Start server + publish PID/token ---
 
-  writeFileSync(PID_FILE, String(process.pid));
   // 32 random bytes = 256 bits of entropy, hex-encoded so it can ride
   // unmodified through tmux command lines, environment variables, and
   // `curl -H` arguments.
   const authToken = randomBytes(32).toString("hex");
-  writeFileSync(TOKEN_FILE, authToken, { mode: 0o600 });
+
+  function publishServerIdentity(): void {
+    const pid = String(process.pid);
+    try {
+      if (readFileSync(PID_FILE, "utf-8").trim() !== pid) {
+        writeFileSync(PID_FILE, pid);
+      }
+    } catch {
+      writeFileSync(PID_FILE, pid);
+    }
+
+    try {
+      if (readFileSync(TOKEN_FILE, "utf-8").trim() !== authToken) {
+        writeFileSync(TOKEN_FILE, authToken, { mode: 0o600 });
+      }
+    } catch {
+      writeFileSync(TOKEN_FILE, authToken, { mode: 0o600 });
+    }
+  }
+
+  function removePublishedIdentity(): void {
+    try {
+      if (readFileSync(PID_FILE, "utf-8").trim() === String(process.pid)) {
+        unlinkSync(PID_FILE);
+      }
+    } catch {}
+
+    try {
+      if (readFileSync(TOKEN_FILE, "utf-8").trim() === authToken) {
+        unlinkSync(TOKEN_FILE);
+      }
+    } catch {}
+  }
 
   const server = Bun.serve({
     port: SERVER_PORT,
     hostname: SERVER_HOST,
     async fetch(req, server) {
       const url = new URL(req.url);
+      publishServerIdentity();
 
       // Allow unauthenticated liveness probe on GET / (used by the
       // tmux-plugin server-common.sh to decide whether to start the
@@ -2757,6 +2791,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       },
     },
   });
+
+  // Publish identity only after the listener is bound. If a duplicate
+  // startup loses the port race, Bun.serve throws above and the failed
+  // process must not overwrite the token used by the live server.
+  publishServerIdentity();
+  identityRefreshTimer = setInterval(publishServerIdentity, IDENTITY_REFRESH_INTERVAL_MS);
 
   // --- Bootstrap ---
 

@@ -180,6 +180,12 @@ describe("TUI: sessionizer sidebar restore", () => {
     expect(sessionizerSrc).toMatch(/notify_opensessions "\$session_name"/);
   });
 
+  test("sessionizer probes liveness to republish a missing token before giving up", () => {
+    expect(sessionizerSrc).toMatch(/token=\$\(cat "\$token_file"/);
+    expect(sessionizerSrc).toMatch(/http:\/\/\$server_host:\$server_port\//);
+    expect(sessionizerSrc).toMatch(/token=\$\(cat "\$token_file"[\s\S]*token=\$\(cat "\$token_file"/);
+  });
+
   test("sessionizer prefers a typed valid directory over fzf's highlighted match", () => {
     const queryCheck = sessionizerSrc.indexOf('[ -n "$query" ] && [ -d "$query" ]');
     const matchCheck = sessionizerSrc.indexOf('[ -n "$match" ]');
