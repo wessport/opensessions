@@ -144,6 +144,12 @@ describe("TUI: q keystroke wiring", () => {
     expect(keyboardGate).toMatch(/if \(localPaneActive === false\) return/);
     expect(keyboardGate).toMatch(/if \(handlePrintableBurstGuard\(key\)\) return;\s*\n\s*handleNormalKey\(key\)/);
   });
+
+  test("background sidebars do not run the spinner animation loop", () => {
+    expect(tuiSrc).toMatch(/const isCurrentSidebar = createMemo/);
+    const spinnerEffect = tuiSrc.match(/createEffect\(\(\) => \{\s*\n\s*if \(!isCurrentSidebar\(\)/);
+    expect(spinnerEffect).not.toBeNull();
+  });
 });
 
 describe("TUI: session card directory label", () => {

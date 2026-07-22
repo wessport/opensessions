@@ -823,9 +823,15 @@ function App() {
   const hasRunning = createMemo(() =>
     sessions.some((s) => s.agentState?.status === "running"),
   );
+  const isCurrentSidebar = createMemo(() => {
+    if (muxCtx.type === "none") return true;
+    const localSession = mySession();
+    const current = currentSession();
+    return !!localSession && (!current || localSession === current);
+  });
 
   createEffect(() => {
-    if (!hasRunning() && !initializing()) return;
+    if (!isCurrentSidebar() || (!hasRunning() && !initializing())) return;
     const interval = setInterval(() => {
       setSpinIdx((i) => (i + 1) % SPINNERS.length);
     }, 120);
