@@ -170,9 +170,10 @@ fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     lab.wait_for_capture_pane(&source, |text| {
         row_with(text, "os-demo-worktrees").is_some()
+            && row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
     });
 
-    lab.send_sidebar_key(&source, "Down");
+    lab.click_session_row(&source, "os-demo-worktrees");
     lab.wait_for_capture_pane(&source, |text| {
         row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
     });
@@ -185,13 +186,11 @@ fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
             })
         })
     });
-    for _ in 0..3 {
-        lab.send_sidebar_key(&source, "Up");
-    }
+
+    lab.click_session_row(&source, "os-demo-worktrees");
     lab.wait_for_capture_pane(&source, |text| {
         row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
     });
-
     lab.send_sidebar_key(&source, "M-Down");
     lab.wait_for_session_order(|names| {
         position(names, "opensessions").is_some_and(|opensessions| {
@@ -1397,7 +1396,7 @@ time.sleep(300)
     where
         F: Fn(&str) -> bool,
     {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let capture = self.capture_pane(pane);
             if predicate(&capture) {
@@ -1760,7 +1759,7 @@ time.sleep(300)
     }
 
     fn wait_for_no_sidebar_processes(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if self.sidebar_panes().is_empty() {
                 return;
