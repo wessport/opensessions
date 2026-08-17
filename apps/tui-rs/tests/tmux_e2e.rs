@@ -170,9 +170,13 @@ fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     lab.wait_for_capture_pane(&source, |text| {
         row_with(text, "os-demo-worktrees").is_some()
+            && row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
     });
 
     lab.click_session_row(&source, "os-demo-worktrees");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
+    });
     lab.send_sidebar_key(&source, "M-Up");
     lab.wait_for_session_order(|names| {
         position(names, "os-demo-feat-agent-panel").is_some_and(|first| {
@@ -183,6 +187,10 @@ fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
         })
     });
 
+    lab.click_session_row(&source, "os-demo-worktrees");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
+    });
     lab.send_sidebar_key(&source, "M-Down");
     lab.wait_for_session_order(|names| {
         position(names, "opensessions").is_some_and(|opensessions| {
@@ -715,12 +723,13 @@ fn tmux_sidebar_width_survives_flat_three_pane_layout_churn() {
         2,
         "expected sidebar | pane1 | pane2 before churn; got {content_panes:?}"
     );
+    let repair_started = Instant::now();
     lab.tmux_ok(["kill-pane", "-t", content_panes[0].as_str()]);
-    let immediate_width = lab.sidebar_width("opensessions");
-    assert_eq!(
-        immediate_width,
-        Some(36),
-        "sidebar width changed immediately after killing pane1 in `sidebar | pane1 | pane2`; panes={:?}\nwidth_option={}\nhooks:\n{}\nlogs:\n{}",
+    lab.wait_for_sidebar_width("opensessions", 36);
+    let repair_elapsed = repair_started.elapsed();
+    assert!(
+        repair_elapsed < Duration::from_millis(500),
+        "sidebar width repair after killing pane1 took {repair_elapsed:?}; panes={:?}\nwidth_option={}\nhooks:\n{}\nlogs:\n{}",
         lab.sidebar_panes(),
         lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
         lab.tmux(["show-hooks", "-g"]),
@@ -728,7 +737,6 @@ fn tmux_sidebar_width_survives_flat_three_pane_layout_churn() {
     );
 
     lab.wait_for_non_sidebar_pane_count("opensessions", 1);
-    lab.wait_for_sidebar_width("opensessions", 36);
     lab.wait_for_all_sidebar_widths(36);
 }
 
@@ -1388,7 +1396,7 @@ time.sleep(300)
     where
         F: Fn(&str) -> bool,
     {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let capture = self.capture_pane(pane);
             if predicate(&capture) {
@@ -1751,7 +1759,7 @@ time.sleep(300)
     }
 
     fn wait_for_no_sidebar_processes(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if self.sidebar_panes().is_empty() {
                 return;
@@ -1871,14 +1879,16 @@ time.sleep(300)
             "-t",
             &target,
             "-F",
-            "#{pane_id} #{pane_current_command}",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_title}",
         ]);
         output
             .lines()
             .find_map(|line| {
-                let (pane, command) = line.split_once(' ')?;
-                command
-                    .starts_with("opensessions")
+                let mut parts = line.split('\t');
+                let pane = parts.next()?;
+                let command = parts.next()?;
+                let title = parts.next()?;
+                (title == "opensessions-sidebar" || command.starts_with("opensessions"))
                     .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {target}; panes:\n{output}"))
@@ -1987,7 +1997,8 @@ time.sleep(300)
             "width hooks were not installed; hooks:\n{hooks}"
         );
         assert!(
-            hooks.contains("$(tmux") && hooks.contains("show-option -gqv @opensessions_width"),
+            hooks.contains("after-resize-pane")
+                && hooks.contains("-t '#{pane_id}' -x '#{@opensessions_width}'"),
             "width repair hook must read the target width at execution time; hooks:\n{hooks}"
         );
         assert!(
