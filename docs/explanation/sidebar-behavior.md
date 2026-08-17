@@ -99,9 +99,8 @@ The accepted rule set is:
 - debounced `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
 - `repair-width` from a TUI client carries no width; it only asks the server to re-apply Fixed Sidebar Width after tmux resized the pane
-- `after-resize-pane` performs direct repair of only the pane that triggered the hook; it fires during our own repairs, so it must not launch a global scan
-- `after-kill-pane` and `pane-exited` perform one immediate server-owned global repair before the hook returns, then queue a follow-up for layout churn that settles later
-- `after-resize-window` and `client-resized` request server-owned global repair; queued requests settle for 50 ms and coalesce into one pass
+- `after-resize-pane` starts direct background repair of only the pane that triggered the hook; it fires during our own repairs, so it must remain idempotent and must not launch a global scan
+- `after-kill-pane`, `pane-exited`, `after-resize-window`, and `client-resized` request server-owned global repair; queued requests settle for 50 ms and coalesce into one pass
 - `pane-exited` also notifies the server for orphan-sidebar cleanup
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - global repair is single-flight: a request that arrives during a pass causes one follow-up pass rather than concurrent work, and every pass reads the latest configured width
@@ -232,7 +231,7 @@ What fixed it:
 
 - idempotent tmux hook repair: only sidebar panes whose current width differs from Fixed Sidebar Width are resized
 - targeted `after-resize-pane` repair: each hook invocation checks only its triggering pane, preventing global repair scans from recursively fanning out
-- immediate topology repair: pane exits run one bounded server pass before returning so tmux cannot expose redistributed sidebar width
+- targeted `after-resize-pane` repair restores a changed sidebar without scanning every pane
 - coalesced global repair: topology and client-resize bursts are handled by one server worker instead of concurrent hook pipelines
 - no width-authoring path from observed pane width
 - no unconditional resize hook that can recursively trigger itself

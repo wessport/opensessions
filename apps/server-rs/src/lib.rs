@@ -1101,7 +1101,6 @@ impl StateSource for ReadOnlyMuxStateSource {
                     provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
                 }
                 if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
                     self.request_sidebar_width_repair();
                 }
                 None
