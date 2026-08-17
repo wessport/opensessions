@@ -1987,7 +1987,8 @@ time.sleep(300)
             "width hooks were not installed; hooks:\n{hooks}"
         );
         assert!(
-            hooks.contains("$(tmux") && hooks.contains("show-option -gqv @opensessions_width"),
+            hooks.contains("after-resize-pane")
+                && hooks.contains("-t '#{pane_id}' -x '#{@opensessions_width}'"),
             "width repair hook must read the target width at execution time; hooks:\n{hooks}"
         );
         assert!(
