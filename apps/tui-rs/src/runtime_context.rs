@@ -81,10 +81,26 @@ where
             .filter(|value| !value.is_empty())?,
     };
 
-    let panes = tmux_query(&["list-panes", "-t", &window_id, "-F", "#{pane_id}"])?;
-    let main_pane = panes
+    let panes = tmux_query(&[
+        "list-panes",
+        "-t",
+        &window_id,
+        "-F",
+        "#{pane_id}\t#{pane_active}",
+    ])?;
+    let panes = panes
         .lines()
-        .map(str::trim)
+        .filter_map(|line| line.trim().split_once('\t'))
+        .collect::<Vec<_>>();
+    if !panes
+        .iter()
+        .any(|(candidate, active)| *candidate == pane_id && *active == "1")
+    {
+        return None;
+    }
+    let main_pane = panes
+        .iter()
+        .map(|(candidate, _)| *candidate)
         .find(|candidate| !candidate.is_empty() && *candidate != pane_id)?;
 
     Some(RefocusPlan {
@@ -99,8 +115,11 @@ mod tests {
     #[test]
     fn refocus_plan_excludes_untitled_sidebar_pane_by_id() {
         let plan = refocus_plan("%1", Some("@2"), |args| {
-            assert_eq!(args, ["list-panes", "-t", "@2", "-F", "#{pane_id}"]);
-            Some("%1\n%2".to_string())
+            assert_eq!(
+                args,
+                ["list-panes", "-t", "@2", "-F", "#{pane_id}\t#{pane_active}"]
+            );
+            Some("%1\t1\n%2\t0".to_string())
         });
 
         assert_eq!(
@@ -109,5 +128,18 @@ mod tests {
                 select_pane: "%2".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn refocus_plan_does_not_steal_focus_after_user_leaves_sidebar() {
+        let plan = refocus_plan("%1", Some("@2"), |args| {
+            assert_eq!(
+                args,
+                ["list-panes", "-t", "@2", "-F", "#{pane_id}\t#{pane_active}"]
+            );
+            Some("%1\t0\n%2\t1".to_string())
+        });
+
+        assert_eq!(plan, None);
     }
 }

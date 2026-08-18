@@ -84,6 +84,10 @@ struct ShutdownAnnouncement {
 }
 
 impl ShutdownAnnouncement {
+    fn is_announced(&self) -> bool {
+        self.announced.load(Ordering::Acquire)
+    }
+
     fn announce_once(
         &self,
         state_source: &Option<Arc<dyn StateSource>>,
@@ -144,6 +148,8 @@ pub trait StateSource: Send + Sync + 'static {
     fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
 
     fn cleanup_mux_hooks(&self) {}
+
+    fn cleanup_sidebar_clients(&self) {}
 
     fn start_background_tasks(
         self: Arc<Self>,
@@ -633,6 +639,14 @@ impl StateSource for ReadOnlyMuxStateSource {
     fn cleanup_mux_hooks(&self) {
         for provider in &self.providers {
             provider.cleanup_hooks();
+        }
+    }
+
+    fn cleanup_sidebar_clients(&self) {
+        for provider in &self.providers {
+            for pane in provider.list_sidebar_panes(None) {
+                provider.kill_sidebar_pane(&pane.pane_id);
+            }
         }
     }
 
@@ -1381,11 +1395,11 @@ impl ReadOnlyMuxStateSource {
     fn enforce_sidebar_width(&self, width: u16) -> usize {
         let panes = self.sidebar_panes_to_resize(width);
         let pane_count = panes.len();
-        for pane_id in panes {
+        for pane_id in &panes {
             debug_log(format!("width-repair: resize pane={pane_id} to={width}",));
-            for provider in &self.providers {
-                provider.resize_sidebar_pane(&pane_id, width);
-            }
+        }
+        for provider in &self.providers {
+            provider.resize_sidebar_panes(&panes, width);
         }
         pane_count
     }
@@ -2582,6 +2596,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             && let Some(source) = cleanup_state_source.as_ref()
         {
             source.cleanup_mux_hooks();
+            source.cleanup_sidebar_clients();
         }
         let cleanup_result = cleanup_owned_identity(&config.pid_file, &token_file, &token);
         match (result, cleanup_result) {
@@ -2703,6 +2718,11 @@ async fn handle_connection(
         && parsed.header("authorization") != Some(&format!("Bearer {auth_token}"))
     {
         write_http_response(&mut stream, "401 Unauthorized", "unauthorized").await?;
+        return Ok(());
+    }
+
+    if shutdown_announcement.is_announced() {
+        write_http_response(&mut stream, "503 Service Unavailable", "server is closing").await?;
         return Ok(());
     }
 
