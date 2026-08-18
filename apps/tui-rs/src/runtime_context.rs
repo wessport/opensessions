@@ -81,20 +81,33 @@ where
             .filter(|value| !value.is_empty())?,
     };
 
-    let panes = tmux_query(&[
-        "list-panes",
-        "-t",
-        &window_id,
-        "-F",
-        "#{pane_id} #{pane_title}",
-    ])?;
-    let main_line = panes
+    let panes = tmux_query(&["list-panes", "-t", &window_id, "-F", "#{pane_id}"])?;
+    let main_pane = panes
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.contains("opensessions-sidebar"))?;
-    let main_pane = main_line.split_whitespace().next()?;
+        .find(|candidate| !candidate.is_empty() && *candidate != pane_id)?;
 
     Some(RefocusPlan {
         select_pane: main_pane.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refocus_plan_excludes_untitled_sidebar_pane_by_id() {
+        let plan = refocus_plan("%1", Some("@2"), |args| {
+            assert_eq!(args, ["list-panes", "-t", "@2", "-F", "#{pane_id}"]);
+            Some("%1\n%2".to_string())
+        });
+
+        assert_eq!(
+            plan,
+            Some(RefocusPlan {
+                select_pane: "%2".to_string(),
+            })
+        );
+    }
 }
