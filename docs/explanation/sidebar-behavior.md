@@ -217,6 +217,20 @@ Symptoms of broken per-server wiring:
 
 The recovery path is: clear stale tmux-scoped overrides, refresh hooks from the current plugin, restart the derived server for that tmux socket, and respawn visible sidebar panes.
 
+### Background work must scale with visible activity
+
+The control plane may have a sidebar process in every managed window, but only sidebar panes in an active window of an attached tmux client are visible. Hidden panes must not run animation timers. Visible running/warmup spinners use a deliberately modest cadence; state changes still render immediately.
+
+Server backstops are adaptive rather than fixed-rate full snapshots:
+
+- tmux topology/focus fingerprints back off while unchanged, and only a changed fingerprint builds a complete state snapshot
+- agent filesystem scans back off while no agent is active
+- Git and port discovery run independently on a slower adaptive schedule, so routine tmux polling cannot launch Git, `ps`, or `lsof`
+- the owned tmux socket is checked without spawning commands; when it stops accepting connections, the server exits and skips cleanup commands that cannot succeed against the missing namespace
+- debug logging is opt-in through `OPENSESSIONS_DEBUG_LOG`
+
+E2E tmux clients also monitor their test parent and use tmux `exit-unattached`, so an interrupted test converges toward stopping its tmux namespace and server instead of leaving a polling environment behind.
+
 ## Regressions We Already Paid For
 
 These are the big historical failure modes worth remembering.

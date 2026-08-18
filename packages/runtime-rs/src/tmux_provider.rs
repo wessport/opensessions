@@ -150,6 +150,35 @@ impl TmuxClient {
         parse_clients(&self.run(&["list-clients", "-F", client_format()]).stdout)
     }
 
+    pub fn state_fingerprint(&self) -> Option<u64> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let output = self.run(&["list-panes", "-a", "-F", state_fingerprint_format()]);
+        if !output.ok() || output.stdout.is_empty() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        output.stdout.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    pub fn list_visible_sidebar_pane_ids(&self) -> Vec<String> {
+        self.run(&[
+            "list-panes",
+            "-a",
+            "-f",
+            "#{&&:#{session_attached},#{window_active},#{==:#{pane_title},opensessions-sidebar}}",
+            "-F",
+            "#{pane_id}",
+        ])
+        .stdout
+        .lines()
+        .filter(|pane_id| !pane_id.is_empty())
+        .map(str::to_string)
+        .collect()
+    }
+
     pub fn list_panes(&self, scope: PaneScope<'_>) -> Vec<PaneInfo> {
         let mut args = vec!["list-panes"];
         match scope {
@@ -479,6 +508,10 @@ impl MuxProvider for TmuxProvider {
             .collect()
     }
 
+    fn state_fingerprint(&self) -> Option<u64> {
+        self.client.state_fingerprint()
+    }
+
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
     }
@@ -666,6 +699,10 @@ impl MuxProvider for TmuxProvider {
                 window_width: window_widths.get(&pane.window_id).copied(),
             })
             .collect()
+    }
+
+    fn list_visible_sidebar_pane_ids(&self) -> Vec<String> {
+        self.client.list_visible_sidebar_pane_ids()
     }
 
     fn list_agent_panes(&self, session_name: &str) -> Vec<AgentPane> {
@@ -878,6 +915,10 @@ fn pane_format() -> &'static str {
     "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
 }
 
+fn state_fingerprint_format() -> &'static str {
+    "#{session_id}\t#{session_name}\t#{session_created}\t#{session_attached}\t#{session_windows}\t#{session_path}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_panes}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
+}
+
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     let title = pane.title.to_lowercase();
     let command = pane.command.to_lowercase();
@@ -1063,6 +1104,25 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct VisibilityRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CommandRunner for VisibilityRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            CommandOutput {
+                exit_code: 0,
+                stdout: (args.first().map(String::as_str) == Some("list-panes"))
+                    .then_some("%1")
+                    .unwrap_or_default()
+                    .to_string(),
+                stderr: String::new(),
+            }
+        }
+    }
+
     #[test]
     fn client_focus_uses_tmux_target_client_not_window_active_state() {
         let runner = Arc::new(RecordingRunner::default());
@@ -1085,6 +1145,43 @@ mod tests {
                 "-p".to_string(),
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn visible_sidebars_require_an_attached_client_and_active_window() {
+        let runner = Arc::new(VisibilityRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert_eq!(provider.list_visible_sidebar_pane_ids(), vec!["%1"]);
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "list-panes".to_string(),
+                "-a".to_string(),
+                "-f".to_string(),
+                "#{&&:#{session_attached},#{window_active},#{==:#{pane_title},opensessions-sidebar}}"
+                    .to_string(),
+                "-F".to_string(),
+                "#{pane_id}".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
+    fn state_fingerprint_uses_one_tmux_snapshot() {
+        let runner = Arc::new(RecordingRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert!(provider.state_fingerprint().is_some());
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "list-panes".to_string(),
+                "-a".to_string(),
+                "-F".to_string(),
+                state_fingerprint_format().to_string(),
+            ]],
         );
     }
 

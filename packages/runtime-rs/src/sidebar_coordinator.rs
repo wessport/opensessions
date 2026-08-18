@@ -20,6 +20,7 @@ pub struct SidebarCoordinatorState {
 pub struct SidebarCoordinator {
     width: u32,
     visible: bool,
+    hidden_by_user: bool,
     lifecycle: SidebarLifecycle,
     warmup_until: Option<u64>,
 }
@@ -29,6 +30,7 @@ impl SidebarCoordinator {
         Self {
             width,
             visible: false,
+            hidden_by_user: false,
             lifecycle: SidebarLifecycle::Idle,
             warmup_until: None,
         }
@@ -66,6 +68,7 @@ impl SidebarCoordinator {
             return;
         }
         self.visible = true;
+        self.hidden_by_user = false;
         self.lifecycle = SidebarLifecycle::Warming;
         self.warmup_until = None;
     }
@@ -76,7 +79,7 @@ impl SidebarCoordinator {
     }
 
     pub fn warmup_done(&mut self) {
-        if self.is_closing() {
+        if self.is_closing() || self.hidden_by_user {
             return;
         }
         self.visible = true;
@@ -89,7 +92,7 @@ impl SidebarCoordinator {
     }
 
     pub fn acknowledge_sidebar_connected(&mut self) {
-        if self.is_closing() {
+        if self.is_closing() || self.hidden_by_user {
             return;
         }
         self.visible = true;
@@ -103,6 +106,7 @@ impl SidebarCoordinator {
             return;
         }
         self.visible = false;
+        self.hidden_by_user = true;
         self.lifecycle = SidebarLifecycle::Idle;
         self.warmup_until = None;
     }
@@ -126,5 +130,33 @@ impl SidebarCoordinator {
 
     fn is_closing(&self) -> bool {
         self.lifecycle == SidebarLifecycle::Closing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_connection_cannot_undo_an_explicit_hide() {
+        let mut coordinator = SidebarCoordinator::new(36);
+        coordinator.acknowledge_sidebar_connected();
+        coordinator.hide();
+
+        coordinator.acknowledge_sidebar_connected();
+        coordinator.mark_ready();
+
+        assert!(!coordinator.state().visible);
+    }
+
+    #[test]
+    fn showing_again_accepts_sidebar_connections() {
+        let mut coordinator = SidebarCoordinator::new(36);
+        coordinator.hide();
+        coordinator.begin_warmup();
+
+        coordinator.acknowledge_sidebar_connected();
+
+        assert!(coordinator.state().visible);
     }
 }

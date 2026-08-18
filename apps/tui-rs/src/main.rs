@@ -123,11 +123,12 @@ async fn main() -> Result<()> {
     let mut last_lazydiff_launch: Option<std::time::Instant> = None;
     let mut pending_sidebar_width: Option<PendingSidebarWidthCommand> = None;
     let mut startup_refocused = false;
-    // Render-tick interval: advance the spinner clock and redraw at ~120ms so
-    // the "warming up…" / agent-running spinners animate even when no server
-    // state arrives.
+    let mut visible_sidebar_pane_ids = Vec::new();
+    // Spinner animation is intentionally low-frequency. More importantly,
+    // background sidebar panes do not wake at all: only panes visible in an
+    // active window of an attached tmux client receive animation ticks.
     let render_epoch = std::time::Instant::now();
-    let mut render_tick = tokio::time::interval(tokio::time::Duration::from_millis(120));
+    let mut render_tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -142,6 +143,11 @@ async fn main() -> Result<()> {
         // other event.
         let flash_deadline = app.as_ref().and_then(|app| app.flash_deadline);
         let sidebar_width_due = pending_sidebar_width.as_ref().map(|pending| pending.due_at);
+        let animate_sidebar = app.as_ref().is_some_and(animation_needed)
+            && sidebar_should_animate(
+                identity.as_ref().map(|identity| identity.pane_id.as_str()),
+                &visible_sidebar_pane_ids,
+            );
 
         tokio::select! {
             biased;
@@ -155,37 +161,18 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            _ = render_tick.tick() => {
+            _ = async {
+                if animate_sidebar {
+                    render_tick.tick().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
                 if let Some(app) = &mut app {
                     let now_ms = render_epoch.elapsed().as_millis() as u64;
                     if app.spinner_now != now_ms {
                         app.spinner_now = now_ms;
-                        // Only redraw if there's something animating. Otherwise
-                        // a 120ms idle wakeup costs about a single buffer diff
-                        // which still fights the terminal for cursor focus.
-                        let needs_redraw = app.initializing
-                            || app.sessions.iter().any(|session| {
-                                session.agents.iter().any(|agent| {
-                                    matches!(
-                                        agent.status,
-                                        opensessions_sidebar::generated::protocol::AgentStatus::Running
-                                            | opensessions_sidebar::generated::protocol::AgentStatus::ToolRunning
-                                    )
-                                })
-                                    || session
-                                        .agent_state
-                                        .as_ref()
-                                        .map(|state| {
-                                            matches!(
-                                                state.status,
-                                                opensessions_sidebar::generated::protocol::AgentStatus::Running
-                                            )
-                                        })
-                                        .unwrap_or(false)
-                            });
-                        if needs_redraw {
-                            terminal.draw(app)?;
-                        }
+                        terminal.draw(app)?;
                     }
                 }
                 continue;
@@ -325,6 +312,9 @@ async fn main() -> Result<()> {
                     if matches!(decoded, ServerMessage::Quit) {
                         return Ok(());
                     }
+                    if let ServerMessage::State(state) = &decoded {
+                        visible_sidebar_pane_ids = state.visible_sidebar_pane_ids.clone();
+                    }
                     match (&mut app, decoded) {
                         (slot @ None, ServerMessage::State(state)) => {
                             debug_log(format!(
@@ -377,6 +367,28 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn sidebar_should_animate(pane_id: Option<&str>, visible_pane_ids: &[String]) -> bool {
+    pane_id.is_some_and(|pane_id| visible_pane_ids.iter().any(|visible| visible == pane_id))
+}
+
+fn animation_needed(app: &App) -> bool {
+    app.initializing
+        || app.sessions.iter().any(|session| {
+            session.agents.iter().any(|agent| {
+                matches!(
+                    agent.status,
+                    opensessions_sidebar::generated::protocol::AgentStatus::Running
+                        | opensessions_sidebar::generated::protocol::AgentStatus::ToolRunning
+                )
+            }) || session.agent_state.as_ref().is_some_and(|state| {
+                matches!(
+                    state.status,
+                    opensessions_sidebar::generated::protocol::AgentStatus::Running
+                )
+            })
+        })
 }
 
 async fn send_or_queue_client_command(
@@ -678,6 +690,19 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn spinner_ticks_only_when_this_sidebar_is_visible() {
+        assert!(sidebar_should_animate(
+            Some("%1"),
+            &["%1".to_string(), "%2".to_string()],
+        ));
+        assert!(!sidebar_should_animate(
+            Some("%3"),
+            &["%1".to_string(), "%2".to_string()],
+        ));
+        assert!(!sidebar_should_animate(None, &["%1".to_string()]));
+    }
 
     #[test]
     fn lazydiff_resolution_prefers_explicit_env_override() {

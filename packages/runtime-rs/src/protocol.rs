@@ -37,6 +37,8 @@ pub struct ServerState {
     pub sessions: Vec<SessionData>,
     pub focused_session: Option<String>,
     pub current_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_sidebar_pane_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
