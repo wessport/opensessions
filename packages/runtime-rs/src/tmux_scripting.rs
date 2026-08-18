@@ -124,11 +124,17 @@ pub fn hook_context_format() -> &'static str {
     "#{client_tty}|#{session_name}|#{window_id}|#{pane_id}|#{pane_active}"
 }
 
-pub fn http_hook_command(base: &str, path: &str, data: Option<&str>, background: bool) -> String {
+pub fn http_hook_command(
+    base: &str,
+    path: &str,
+    data: Option<&str>,
+    background: bool,
+    token_file: &str,
+) -> String {
     let body = data.map(|data| format!(" -d '{data}'")).unwrap_or_default();
     run_shell_command(
         &format!(
-            "curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path}{body} >/dev/null 2>&1 || true"
+            "token=$(cat '{token_file}' 2>/dev/null) && curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H \"Authorization: Bearer $token\" -X POST {base}{path}{body} >/dev/null 2>&1 || true"
         ),
         background,
     )
@@ -168,19 +174,19 @@ pub fn close_orphan_sidebar_pipeline() -> String {
     )
 }
 
-pub fn pane_exited_hook_command(base: &str) -> String {
+pub fn pane_exited_hook_command(base: &str, token_file: &str) -> String {
     format!(
         "{} ; {}",
         run_shell_command(&close_orphan_sidebar_pipeline(), false),
-        http_hook_command(base, "/pane-exited", None, false),
+        http_hook_command(base, "/pane-exited", None, false, token_file),
     )
 }
 
-pub fn pane_died_hook_command(base: &str) -> String {
+pub fn pane_died_hook_command(base: &str, token_file: &str) -> String {
     format!(
         "{} ; {}",
         run_shell_command(&close_dead_content_pane_pipeline(), false),
-        http_hook_command(base, "/pane-exited", None, false),
+        http_hook_command(base, "/pane-exited", None, false, token_file),
     )
 }
 
@@ -274,7 +280,7 @@ mod tests {
 
     #[test]
     fn renders_pane_exited_hook_with_orphan_close_before_server_cleanup() {
-        let hook = pane_exited_hook_command("http://127.0.0.1:1234");
+        let hook = pane_exited_hook_command("http://127.0.0.1:1234", "/tmp/token");
 
         assert!(hook.starts_with(
             "run-shell \"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{window_panes},1},##{==:##{pane_title},opensessions-sidebar}}'"

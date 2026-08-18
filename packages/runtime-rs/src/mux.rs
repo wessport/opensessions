@@ -65,7 +65,7 @@ pub trait MuxProvider: Send + Sync {
     fn get_client_tty(&self) -> String;
     fn create_session(&self, name: Option<&str>, dir: Option<&str>);
     fn kill_session(&self, name: &str);
-    fn setup_hooks(&self, server_host: &str, server_port: u16);
+    fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str);
     fn cleanup_hooks(&self);
     fn set_sidebar_width_hint(&self, _width: u16) {}
 

@@ -11,7 +11,8 @@ use futures_util::{SinkExt, StreamExt};
 use opensessions_sidebar::app::{App, LaunchTarget};
 use opensessions_sidebar::cli::{Args, resolve_endpoint_from_env};
 use opensessions_sidebar::client::{
-    connect_ws, decode_server_message, encode_client_command, fire_quit_http, validate_hello,
+    connect_ws_path_with_token, decode_server_message, encode_client_command, fire_quit_http,
+    validate_hello,
 };
 use opensessions_sidebar::generated::protocol::{ClientCommand, ServerMessage};
 use opensessions_sidebar::input::{UiKey, UiMouse, apply_ui_key, apply_ui_mouse};
@@ -81,13 +82,15 @@ async fn main() -> Result<()> {
     } else {
         args.server_port
     };
+    let auth_token = std::fs::read_to_string(&env.token_file)
+        .with_context(|| format!("read opensessions token {}", env.token_file))?;
 
     let identity = pane_identity_resolve(|key| std::env::var(key).ok(), tmux_display_message);
 
     debug_log(format!(
         "starting: connecting to ws://{server_host}:{server_port}/ identity={identity:?}"
     ));
-    let mut ws = connect_ws(&server_host, server_port)
+    let mut ws = connect_ws_path_with_token(&server_host, server_port, "/", auth_token.trim())
         .await
         .with_context(|| format!("connect ws://{server_host}:{server_port}/"))?;
     debug_log("ws: connected");
@@ -245,8 +248,9 @@ async fn main() -> Result<()> {
                             // fire-and-forget on the current_thread runtime.
                             let host = server_host.clone();
                             let port = server_port;
+                            let quit_token = auth_token.clone();
                             tokio::spawn(async move {
-                                fire_quit_http(&host, port).await;
+                                fire_quit_http(&host, port, quit_token.trim()).await;
                             });
                         }
                     }

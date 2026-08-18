@@ -9,6 +9,7 @@ pub struct ServerSettings {
     pub host: String,
     pub port: u16,
     pub pid_file: String,
+    pub token_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub struct OpensessionsEndpoint {
     pub host: String,
     pub port: u16,
     pub pid_file: PathBuf,
+    pub token_file: PathBuf,
 }
 
 impl OpensessionsEndpoint {
@@ -65,11 +67,16 @@ impl OpensessionsEndpoint {
             server_key_string.as_deref(),
             env("OPENSESSIONS_PID_FILE").as_deref(),
         ));
+        let token_file = PathBuf::from(resolve_token_file(
+            server_key_string.as_deref(),
+            env("OPENSESSIONS_TOKEN_FILE").as_deref(),
+        ));
         Self {
             server_key,
             host,
             port,
             pid_file,
+            token_file,
         }
     }
 }
@@ -149,6 +156,16 @@ pub fn resolve_pid_file(server_key: Option<&str>, explicit: Option<&str>) -> Str
     }
 }
 
+pub fn resolve_token_file(server_key: Option<&str>, explicit: Option<&str>) -> String {
+    if let Some(path) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return path.to_string();
+    }
+    match server_key {
+        Some(key) => format!("/tmp/opensessions.{key}.token"),
+        None => "/tmp/opensessions.token".to_string(),
+    }
+}
+
 pub fn resolve_server_settings(env: impl Fn(&str) -> Option<String>) -> ServerSettings {
     let rust_port_base = env("OPENSESSIONS_RUST")
         .map(|value| value.trim() == "1")
@@ -160,6 +177,7 @@ pub fn resolve_server_settings(env: impl Fn(&str) -> Option<String>) -> ServerSe
         host: endpoint.host,
         port: endpoint.port,
         pid_file: endpoint.pid_file.to_string_lossy().to_string(),
+        token_file: endpoint.token_file.to_string_lossy().to_string(),
     }
 }
 

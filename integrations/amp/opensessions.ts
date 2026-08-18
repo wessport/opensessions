@@ -192,6 +192,21 @@ function serverUrls(): string[] {
   return resolveServerUrls();
 }
 
+function authToken(serverUrl: string): string | undefined {
+  try {
+    const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
+    if (explicit) return readFileSync(explicit, "utf8").trim();
+    const port = Number.parseInt(new URL(serverUrl).port, 10);
+    const key = port - RUST_SERVER_PORT_BASE;
+    const path = key >= 0 && key < 20000
+      ? `/tmp/opensessions.${key}.token`
+      : "/tmp/opensessions.token";
+    return readFileSync(path, "utf8").trim();
+  } catch {
+    return undefined;
+  }
+}
+
 let preferredServerUrl: string | undefined;
 
 plog(`plugin loaded endpoints=${serverUrls().join(",")} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
@@ -266,9 +281,11 @@ async function postOnce(payload: EventPayload): Promise<boolean> {
   for (const serverUrl of candidates) {
     const endpoint = `${serverUrl}/api/agent-event`;
     try {
+      const token = authToken(serverUrl);
+      if (!token) continue;
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(POST_TIMEOUT_MS),
       });

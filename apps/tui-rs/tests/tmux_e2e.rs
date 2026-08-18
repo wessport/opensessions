@@ -559,7 +559,7 @@ fn tmux_sidebar_stays_closed_across_session_and_window_switch_hooks() {
     let lab = started_lab("opensessions-e2e-open-close");
     lab.wait_for_all_sidebar_widths(36);
 
-    post_hook(lab.port, "/toggle");
+    post_hook(lab.port, "/toggle", &lab.auth_token());
     lab.wait_for_no_sidebar_processes();
 
     lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
@@ -798,14 +798,19 @@ fn tmux_sidebar_switch_stays_responsive_with_100_connected_clients() {
     runtime.block_on(async {
         let mut clients = Vec::new();
         for index in 0..100 {
-            let ws = opensessions_sidebar::client::connect_ws("127.0.0.1", lab.port)
-                .await
-                .unwrap_or_else(|err| panic!("connect passive ws client {index}: {err}"));
+            let ws = opensessions_sidebar::client::connect_ws_path_with_token(
+                "127.0.0.1",
+                lab.port,
+                "/",
+                &lab.auth_token(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("connect passive ws client {index}: {err}"));
             clients.push(ws);
         }
 
         for _ in 0..25 {
-            post_refresh(lab.port);
+            post_refresh(lab.port, &lab.auth_token());
         }
 
         let started = Instant::now();
@@ -948,14 +953,14 @@ fn assert_worktree_group_columns(text: &str) {
     );
 }
 
-fn post_refresh(port: u16) {
-    post_hook(port, "/refresh");
+fn post_refresh(port: u16, token: &str) {
+    post_hook(port, "/refresh", token);
 }
 
-fn post_hook(port: u16, path: &str) {
+fn post_hook(port: u16, path: &str, token: &str) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect /refresh");
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())
@@ -964,10 +969,10 @@ fn post_hook(port: u16, path: &str) {
     let _ = stream.read(&mut response);
 }
 
-fn post_body(port: u16, path: &str, content_type: &str, body: &str) {
+fn post_body(port: u16, path: &str, content_type: &str, body: &str, token: &str) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect post body");
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -1078,6 +1083,17 @@ impl Lab {
         );
     }
 
+    fn token_file(&self) -> PathBuf {
+        self.root.join("server.token")
+    }
+
+    fn auth_token(&self) -> String {
+        fs::read_to_string(self.token_file())
+            .expect("read e2e server token")
+            .trim()
+            .to_string()
+    }
+
     fn setup_tmux(&mut self) {
         let _ = Command::new("tmux")
             .args(["-L", &self.socket, "kill-server"])
@@ -1165,6 +1181,7 @@ time.sleep(300)
                 "OPENSESSIONS_PID_FILE",
                 self.root.join("server.pid").to_str().unwrap(),
             )
+            .env("OPENSESSIONS_TOKEN_FILE", self.token_file())
             .stdout(File::create(self.root.join("server.stdout.log")).expect("server stdout log"))
             .stderr(File::create(self.root.join("server.stderr.log")).expect("server stderr log"))
             .spawn()
@@ -1198,8 +1215,9 @@ time.sleep(300)
         let sidebar = self.sidebar_bin();
         for session in SIDEBAR_SESSIONS {
             let command = format!(
-                "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
+                "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_TOKEN_FILE={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
                 self.port,
+                shell_quote(&self.token_file().to_string_lossy()),
                 shell_quote(&self.root.join("debug.log").to_string_lossy()),
                 sidebar.display(),
                 shell_quote(
@@ -1253,8 +1271,9 @@ time.sleep(300)
         ]);
         let sidebar = self.sidebar_bin();
         let command = format!(
-            "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
+            "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_TOKEN_FILE={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
             self.port,
+            shell_quote(&self.token_file().to_string_lossy()),
             shell_quote(&self.root.join("debug.log").to_string_lossy()),
             sidebar.display(),
             shell_quote(
@@ -1325,7 +1344,13 @@ time.sleep(300)
             "ts": 1,
         })
         .to_string();
-        post_body(self.port, "/api/agent-event", "application/json", &body);
+        post_body(
+            self.port,
+            "/api/agent-event",
+            "application/json",
+            &body,
+            &self.auth_token(),
+        );
     }
 
     fn post_watcher_like_agent_event(
@@ -1345,7 +1370,13 @@ time.sleep(300)
             "ts": 1,
         })
         .to_string();
-        post_body(self.port, "/api/agent-event", "application/json", &body);
+        post_body(
+            self.port,
+            "/api/agent-event",
+            "application/json",
+            &body,
+            &self.auth_token(),
+        );
     }
 
     fn focus_agent_pane(&self, session: &str, agent: &str, thread_id: &str, pane_id: &str) {
@@ -1356,9 +1387,14 @@ time.sleep(300)
             .expect("build e2e tokio runtime");
 
         runtime.block_on(async {
-            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
-                .await
-                .expect("connect focus-agent ws client");
+            let mut ws = opensessions_sidebar::client::connect_ws_path_with_token(
+                "127.0.0.1",
+                self.port,
+                "/",
+                &self.auth_token(),
+            )
+            .await
+            .expect("connect focus-agent ws client");
             let _ = ws.next().await.expect("read ws hello").expect("ws hello");
             let _ = ws
                 .next()
@@ -1688,9 +1724,14 @@ time.sleep(300)
             .expect("build e2e tokio runtime");
 
         runtime.block_on(async {
-            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
-                .await
-                .expect("connect reorder ws client");
+            let mut ws = opensessions_sidebar::client::connect_ws_path_with_token(
+                "127.0.0.1",
+                self.port,
+                "/",
+                &self.auth_token(),
+            )
+            .await
+            .expect("connect reorder ws client");
             let _ = ws.next().await.expect("read ws hello").expect("ws hello");
             let _ = ws
                 .next()
@@ -1737,9 +1778,14 @@ time.sleep(300)
             .expect("build e2e tokio runtime");
 
         runtime.block_on(async {
-            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
-                .await
-                .expect("connect session-order ws client");
+            let mut ws = opensessions_sidebar::client::connect_ws_path_with_token(
+                "127.0.0.1",
+                self.port,
+                "/",
+                &self.auth_token(),
+            )
+            .await
+            .expect("connect session-order ws client");
             let _ = ws.next().await.expect("read ws hello").expect("ws hello");
             let state = ws
                 .next()
