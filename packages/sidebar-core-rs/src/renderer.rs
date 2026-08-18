@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1024,7 +1026,7 @@ fn build_session_detail_row(
     let has_ports = !session.ports.is_empty();
     let has_diff_stats = session.insertions > 0 || session.deletions > 0;
     let detail_text = if !session.branch.is_empty() {
-        Some(session.branch.as_str())
+        Some(Cow::Borrowed(session.branch.as_str()))
     } else {
         dir_name(session)
     };
@@ -1053,7 +1055,7 @@ fn build_session_detail_row(
     }
     if let Some(detail_text) = detail_text {
         let available = width.saturating_sub(line.width() + suffix_width);
-        line.push(truncate_right(detail_text, available), branch_color);
+        line.push(truncate_right(&detail_text, available), branch_color);
     }
     if has_ports {
         let port_text = if session.ports.len() == 1 {
@@ -2073,9 +2075,20 @@ fn spinner_clock(app: &App) -> u64 {
     }
 }
 
-fn dir_name(session: &SessionData) -> Option<&str> {
-    let basename = session.dir.trim_end_matches('/').rsplit('/').next()?;
-    (basename != session.name).then_some(basename)
+fn dir_name(session: &SessionData) -> Option<Cow<'_, str>> {
+    let mut parts = session
+        .dir
+        .trim_end_matches('/')
+        .rsplit('/')
+        .filter(|part| !part.is_empty());
+    let basename = parts.next()?;
+    if basename != session.name {
+        return Some(Cow::Borrowed(basename));
+    }
+
+    parts
+        .next()
+        .map(|parent| Cow::Owned(format!("{parent}/{basename}")))
 }
 
 fn truncate_left(value: &str, max_cols: usize) -> String {
@@ -2939,6 +2952,15 @@ mod tests {
             collapsed_worktree_groups: Vec::new(),
             ts: 0,
         })
+    }
+
+    #[test]
+    fn session_detail_keeps_directory_context_when_name_matches_basename() {
+        let app = app_from_sessions(vec![session("Geoalchemist", "/repos/Geoalchemist", "")]);
+
+        let lines = render_text(&app, 40, 24);
+
+        assert_has_line(&lines, "     repos/Geoalchemist");
     }
 
     #[test]
