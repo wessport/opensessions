@@ -503,16 +503,24 @@ impl MuxProvider for TmuxProvider {
         self.client.kill_session(STASH_SESSION);
     }
 
-    fn setup_hooks(&self, server_host: &str, server_port: u16) {
+    fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str) {
         let base = format!("http://{server_host}:{server_port}");
         let hook_context = hook_context_format();
-        let focus_cmd = http_hook_command(&base, "/focus", Some(hook_context), true);
-        let refresh_cmd = http_hook_command(&base, "/refresh", None, true);
-        let ensure_cmd = http_hook_command(&base, "/ensure-sidebar", Some(hook_context), true);
-        let pane_exited_cmd = pane_exited_hook_command(&base);
-        let pane_died_cmd = pane_died_hook_command(&base);
-        let client_resized_cmd = http_hook_command(&base, "/client-resized", None, true);
-        let pane_layout_changed_cmd = http_hook_command(&base, "/pane-layout-changed", None, true);
+        let focus_cmd = http_hook_command(&base, "/focus", Some(hook_context), true, token_file);
+        let refresh_cmd = http_hook_command(&base, "/refresh", None, true, token_file);
+        let ensure_cmd = http_hook_command(
+            &base,
+            "/ensure-sidebar",
+            Some(hook_context),
+            true,
+            token_file,
+        );
+        let pane_exited_cmd = pane_exited_hook_command(&base, token_file);
+        let pane_died_cmd = pane_died_hook_command(&base, token_file);
+        let client_resized_cmd =
+            http_hook_command(&base, "/client-resized", None, true, token_file);
+        let pane_layout_changed_cmd =
+            http_hook_command(&base, "/pane-layout-changed", None, true, token_file);
 
         self.client.set_global_hook(
             "client-session-changed",

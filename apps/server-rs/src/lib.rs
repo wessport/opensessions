@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::path::PathBuf;
@@ -139,7 +141,7 @@ fn debug_log(line: impl AsRef<str>) {
 pub trait StateSource: Send + Sync + 'static {
     fn snapshot_json(&self) -> String;
 
-    fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16) {}
+    fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
 
     fn cleanup_mux_hooks(&self) {}
 
@@ -620,11 +622,11 @@ impl ReadOnlyMuxStateSource {
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
-    fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
+    fn setup_mux_hooks(&self, server_host: &str, server_port: u16, token_file: &str) {
         let width = self.current_sidebar_width_u16();
         for provider in &self.providers {
             provider.set_sidebar_width_hint(width);
-            provider.setup_hooks(server_host, server_port);
+            provider.setup_hooks(server_host, server_port, token_file);
         }
     }
 
@@ -2396,6 +2398,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub pid_file: PathBuf,
+    pub token_file: PathBuf,
     state_source: Option<Arc<dyn StateSource>>,
 }
 
@@ -2405,8 +2408,14 @@ impl ServerConfig {
             host: host.into(),
             port,
             pid_file: pid_file.into(),
+            token_file: PathBuf::new(),
             state_source: None,
         }
+    }
+
+    pub fn with_token_file(mut self, token_file: impl Into<PathBuf>) -> Self {
+        self.token_file = token_file.into();
+        self
     }
 
     pub fn with_state_source(mut self, source: impl StateSource) -> Self {
@@ -2476,6 +2485,60 @@ impl From<tokio::task::JoinError> for ServerError {
     }
 }
 
+fn generate_auth_token() -> Result<String, ServerError> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn write_private_file(path: &Path, contents: &str, generation: &str) -> std::io::Result<()> {
+    let temporary = path.with_extension(format!("tmp.{}.{generation}", process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(temporary, path)
+}
+
+fn publish_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+    // Token first, pid last: discovery treats the pid file as the publication
+    // marker and can never observe a generation without its credential.
+    let generation = &token[..16];
+    write_private_file(token_file, token, generation)?;
+    if let Err(error) = write_private_file(pid_file, &process::id().to_string(), generation) {
+        let _ = fs::remove_file(token_file);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn cleanup_owned_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+    if !owns_identity_generation(pid_file, token_file, token) {
+        return Ok(());
+    }
+    match fs::remove_file(pid_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::remove_file(token_file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn owns_identity_generation(pid_file: &Path, token_file: &Path, token: &str) -> bool {
+    fs::read_to_string(pid_file).is_ok_and(|pid| pid.trim() == process::id().to_string())
+        && fs::read_to_string(token_file).is_ok_and(|current| current.trim() == token)
+}
+
 pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerError> {
     let bind_addr = (config.host.as_str(), config.port)
         .to_socket_addrs()?
@@ -2483,7 +2546,13 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         .ok_or_else(|| ServerError::new("server bind address did not resolve"))?;
     let listener = TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?;
-    fs::write(&config.pid_file, process::id().to_string())?;
+    let token_file = if config.token_file.as_os_str().is_empty() {
+        config.pid_file.with_extension("token")
+    } else {
+        config.token_file.clone()
+    };
+    let token = generate_auth_token()?;
+    publish_identity(&config.pid_file, &token_file, &token)?;
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
     let (state_updates, _) = broadcast::channel(16);
@@ -2492,7 +2561,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         let _background_tasks = source
             .clone()
             .start_background_tasks(state_updates.clone(), shutdown.clone());
-        source.setup_mux_hooks(&config.host, addr.port());
+        source.setup_mux_hooks(&config.host, addr.port(), &token_file.to_string_lossy());
     }
     let task_shutdown = shutdown.clone();
     let state_source = config.state_source.clone();
@@ -2506,12 +2575,15 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             state_source,
             state_updates,
             loop_shutdown_announcement,
+            token.clone(),
         )
         .await;
-        if let Some(source) = cleanup_state_source.as_ref() {
+        if owns_identity_generation(&config.pid_file, &token_file, &token)
+            && let Some(source) = cleanup_state_source.as_ref()
+        {
             source.cleanup_mux_hooks();
         }
-        let cleanup_result = fs::remove_file(&config.pid_file);
+        let cleanup_result = cleanup_owned_identity(&config.pid_file, &token_file, &token);
         match (result, cleanup_result) {
             (Err(err), _) => Err(err),
             (Ok(()), Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
@@ -2533,6 +2605,7 @@ async fn run_accept_loop(
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
+    auth_token: String,
 ) -> Result<(), ServerError> {
     let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
@@ -2551,6 +2624,7 @@ async fn run_accept_loop(
                 let connection_state_source = state_source.clone();
                 let connection_state_updates = state_updates.clone();
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
+                let connection_auth_token = auth_token.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let _ = handle_connection(
@@ -2559,6 +2633,7 @@ async fn run_accept_loop(
                         connection_state_source,
                         connection_state_updates,
                         connection_shutdown_announcement,
+                        connection_auth_token,
                     )
                     .await;
                 });
@@ -2597,6 +2672,7 @@ async fn handle_connection(
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
+    auth_token: String,
 ) -> Result<(), ServerError> {
     let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
         .await
@@ -2619,6 +2695,16 @@ async fn handle_connection(
     )
     .await
     .map_err(|_| ServerError::new("timed out reading http request body"))??;
+
+    // The root GET is the only unauthenticated liveness probe. Everything
+    // capable of observing or mutating an instance, including WS upgrades,
+    // must prove possession of that instance's token.
+    if !(parsed.method == "GET" && parsed.path == "/" && !parsed.is_websocket_upgrade())
+        && parsed.header("authorization") != Some(&format!("Bearer {auth_token}"))
+    {
+        write_http_response(&mut stream, "401 Unauthorized", "unauthorized").await?;
+        return Ok(());
+    }
 
     if parsed.method == "POST" && parsed.path == "/refresh" {
         if let Some(state_source) = &state_source {
@@ -3174,18 +3260,43 @@ mod tests {
     static NEXT_SERVER_ID: AtomicUsize = AtomicUsize::new(0);
 
     async fn send_raw_request(request: &[u8]) -> Vec<u8> {
+        send_raw_request_with_auth(request, true).await
+    }
+
+    async fn send_raw_request_with_auth(request: &[u8], authorized: bool) -> Vec<u8> {
         let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
         let pid_file = std::env::temp_dir().join(format!(
             "opensessions-server-test-{}-{id}.pid",
             process::id()
         ));
-        let server = start_server(ServerConfig::new("127.0.0.1", 0, pid_file))
+        let token_file = pid_file.with_extension("token");
+        let server = start_server(ServerConfig::new("127.0.0.1", 0, &pid_file))
             .await
             .expect("start test server");
+        let token = fs::read_to_string(token_file).expect("read test token");
         let mut stream = TcpStream::connect(server.addr())
             .await
             .expect("connect to test server");
-        stream.write_all(request).await.expect("write test request");
+        let request = if authorized {
+            let split = request.windows(2).position(|window| window == b"\r\n");
+            split.map_or_else(
+                || request.to_vec(),
+                |index| {
+                    let mut authenticated = request[..index + 2].to_vec();
+                    authenticated.extend_from_slice(
+                        format!("Authorization: Bearer {}\r\n", token.trim()).as_bytes(),
+                    );
+                    authenticated.extend_from_slice(&request[index + 2..]);
+                    authenticated
+                },
+            )
+        } else {
+            request.to_vec()
+        };
+        stream
+            .write_all(&request)
+            .await
+            .expect("write test request");
 
         let mut response = Vec::new();
         tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
@@ -3194,6 +3305,100 @@ mod tests {
             .expect("read server response");
         server.shutdown().await.expect("stop test server");
         response
+    }
+
+    #[tokio::test]
+    async fn non_liveness_http_routes_require_instance_token() {
+        let unauthorized = send_raw_request_with_auth(
+            b"POST /refresh HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            false,
+        )
+        .await;
+        assert!(unauthorized.starts_with(b"HTTP/1.1 401 Unauthorized"));
+
+        let liveness =
+            send_raw_request_with_auth(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", false).await;
+        assert!(liveness.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    async fn request_at(addr: SocketAddr, request: String) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        if let Ok(result) = tokio::time::timeout(
+            Duration::from_millis(100),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        {
+            result.expect("read response");
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_requires_the_matching_instance_token() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-ws-auth-{}-{id}", process::id()));
+        let pid = root.with_extension("pid");
+        let token_path = root.with_extension("token");
+        let server =
+            start_server(ServerConfig::new("127.0.0.1", 0, &pid).with_token_file(&token_path))
+                .await
+                .expect("start");
+        let token = fs::read_to_string(&token_path).expect("token");
+        let upgrade = |authorization: &str| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{authorization}\r\n"
+            )
+        };
+        let denied = request_at(server.addr(), upgrade("")).await;
+        assert!(denied.starts_with(b"HTTP/1.1 401 Unauthorized"));
+        let accepted = request_at(
+            server.addr(),
+            upgrade(&format!("Authorization: Bearer {}\r\n", token.trim())),
+        )
+        .await;
+        assert!(accepted.starts_with(b"HTTP/1.1 101 Switching Protocols"));
+        server.shutdown().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn tokens_are_isolated_and_rotate_on_restart() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-isolation-{}-{id}", process::id()));
+        let pid_a = root.with_extension("a.pid");
+        let token_a = root.with_extension("a.token");
+        let pid_b = root.with_extension("b.pid");
+        let token_b = root.with_extension("b.token");
+        let first =
+            start_server(ServerConfig::new("127.0.0.1", 0, &pid_a).with_token_file(&token_a))
+                .await
+                .expect("first");
+        let second =
+            start_server(ServerConfig::new("127.0.0.1", 0, &pid_b).with_token_file(&token_b))
+                .await
+                .expect("second");
+        let first_token = fs::read_to_string(&token_a).expect("first token");
+        let second_token = fs::read_to_string(&token_b).expect("second token");
+        assert_ne!(first_token, second_token);
+        let wrong = request_at(second.addr(), format!("POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n", first_token.trim())).await;
+        assert!(wrong.starts_with(b"HTTP/1.1 401 Unauthorized"));
+        let first_addr = first.addr();
+        first.shutdown().await.expect("stop first");
+        let restarted = start_server(
+            ServerConfig::new("127.0.0.1", first_addr.port(), &pid_a).with_token_file(&token_a),
+        )
+        .await
+        .expect("restart");
+        let rotated = fs::read_to_string(&token_a).expect("rotated token");
+        assert_ne!(first_token, rotated);
+        let stale = request_at(restarted.addr(), format!("POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n", first_token.trim())).await;
+        assert!(stale.starts_with(b"HTTP/1.1 401 Unauthorized"));
+        restarted.shutdown().await.expect("stop restart");
+        second.shutdown().await.expect("stop second");
     }
 
     #[tokio::test]

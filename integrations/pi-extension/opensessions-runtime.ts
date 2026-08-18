@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { readFileSync } from "node:fs";
 
 interface PiRuntimePayload {
   pid: number;
@@ -73,6 +74,21 @@ function resolveServerUrls(): string[] {
   return urls;
 }
 
+function authToken(serverUrl: string): string | undefined {
+  try {
+    const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
+    if (explicit) return readFileSync(explicit, "utf8").trim();
+    const port = Number.parseInt(new URL(serverUrl).port, 10);
+    const key = port - RUST_SERVER_PORT_BASE;
+    return readFileSync(
+      key >= 0 && key < 20000 ? `/tmp/opensessions.${key}.token` : "/tmp/opensessions.token",
+      "utf8",
+    ).trim();
+  } catch {
+    return undefined;
+  }
+}
+
 export default function opensessionsRuntime(pi: ExtensionAPI) {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let heartbeatRequest: Promise<void> | null = null;
@@ -93,9 +109,11 @@ export default function opensessionsRuntime(pi: ExtensionAPI) {
   async function post(path: string, body: unknown): Promise<void> {
     for (const serverUrl of resolveServerUrls()) {
       try {
+        const token = authToken(serverUrl);
+        if (!token) continue;
         const response = await fetch(`${serverUrl}${path}`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
           body: JSON.stringify(body),
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });

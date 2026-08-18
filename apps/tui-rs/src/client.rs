@@ -37,21 +37,21 @@ pub fn encode_client_command(command: &ClientCommand) -> serde_json::Result<Stri
 ///   `fetch(`http://${SERVER_HOST}:${SERVER_PORT}/quit`, { method: "POST" })`
 /// This is fire-and-forget — the server replies, then closes the WS, which
 /// tears down the renderer.
-pub fn build_quit_http_request(host: &str, port: u16) -> String {
+pub fn build_quit_http_request(host: &str, port: u16, token: &str) -> String {
     format!(
-        "POST /quit HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "POST /quit HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
 }
 
 /// Fire-and-forget HTTP POST to `/quit`. Errors are intentionally swallowed:
 /// this is a fallback for when the WS Quit frame might be lost while the TUI
 /// is tearing down.
-pub async fn fire_quit_http(host: &str, port: u16) {
+pub async fn fire_quit_http(host: &str, port: u16, token: &str) {
     let Ok(mut stream) = TcpStream::connect((host, port)).await else {
         return;
     };
     let _ = stream
-        .write_all(build_quit_http_request(host, port).as_bytes())
+        .write_all(build_quit_http_request(host, port, token).as_bytes())
         .await;
     let _ = stream.shutdown().await;
 }
@@ -60,7 +60,9 @@ pub async fn connect_ws(
     host: &str,
     port: u16,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    connect_ws_path(host, port, "/").await
+    let token_file = std::env::var("OPENSESSIONS_TOKEN_FILE").unwrap_or_default();
+    let token = std::fs::read_to_string(token_file).unwrap_or_default();
+    connect_ws_path_with_token(host, port, "/", token.trim()).await
 }
 
 pub async fn connect_ws_path(
@@ -68,7 +70,22 @@ pub async fn connect_ws_path(
     port: u16,
     path_and_query: &str,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let token_file = std::env::var("OPENSESSIONS_TOKEN_FILE").unwrap_or_default();
+    let token = std::fs::read_to_string(token_file).unwrap_or_default();
+    connect_ws_path_with_token(host, port, path_and_query, token.trim()).await
+}
+
+pub async fn connect_ws_path_with_token(
+    host: &str,
+    port: u16,
+    path_and_query: &str,
+    token: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let uri: Uri = format!("ws://{host}:{port}{path_and_query}").parse()?;
-    let (ws, _) = ClientBuilder::from_uri(uri).connect().await?;
+    let builder = ClientBuilder::from_uri(uri).add_header(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse()?,
+    )?;
+    let (ws, _) = builder.connect().await?;
     Ok(ws)
 }

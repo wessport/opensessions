@@ -29,6 +29,7 @@ PORT_BASE=22000
 TMUX_OPENSESSIONS_PORT="$(tmux show-environment -g OPENSESSIONS_PORT 2>/dev/null | cut -d= -f2)"
 TMUX_OPENSESSIONS_HOST="$(tmux show-environment -g OPENSESSIONS_HOST 2>/dev/null | cut -d= -f2)"
 TMUX_OPENSESSIONS_PID_FILE="$(tmux show-environment -g OPENSESSIONS_PID_FILE 2>/dev/null | cut -d= -f2)"
+TMUX_OPENSESSIONS_TOKEN_FILE="$(tmux show-environment -g OPENSESSIONS_TOKEN_FILE 2>/dev/null | cut -d= -f2)"
 
 if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
   PORT="$TMUX_OPENSESSIONS_PORT"
@@ -36,6 +37,13 @@ elif [ -n "$SERVER_KEY" ]; then
   PORT=$((PORT_BASE + SERVER_KEY))
 else
   PORT="7391"
+fi
+if [ -n "$TMUX_OPENSESSIONS_TOKEN_FILE" ]; then
+  TOKEN_FILE="$TMUX_OPENSESSIONS_TOKEN_FILE"
+elif [ -n "$SERVER_KEY" ]; then
+  TOKEN_FILE="/tmp/opensessions.${SERVER_KEY}.token"
+else
+  TOKEN_FILE="/tmp/opensessions.token"
 fi
 HOST="${TMUX_OPENSESSIONS_HOST:-127.0.0.1}"
 if [ -n "$TMUX_OPENSESSIONS_PID_FILE" ]; then
@@ -68,6 +76,10 @@ show_startup_error() {
 
 server_alive() {
   curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
+}
+
+auth_token() {
+  cat "$TOKEN_FILE" 2>/dev/null
 }
 
 acquire_start_lock() {
@@ -134,6 +146,7 @@ ensure_server() {
   OPENSESSIONS_HOST="$HOST" \
   OPENSESSIONS_PORT="$PORT" \
   OPENSESSIONS_PID_FILE="$PID_FILE" \
+  OPENSESSIONS_TOKEN_FILE="$TOKEN_FILE" \
   OPENSESSIONS_DIR="$PLUGIN_DIR" \
     "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 

@@ -27,6 +27,7 @@ impl Args {
 pub struct ResolvedEndpoint {
     pub server_host: String,
     pub server_port: u16,
+    pub token_file: String,
 }
 
 pub fn resolve_endpoint_from_env<F>(env: F) -> ResolvedEndpoint
@@ -40,10 +41,17 @@ where
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_SERVER_HOST.to_string());
+    let token_file = env("OPENSESSIONS_TOKEN_FILE")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| match server_key {
+            Some(key) => format!("/tmp/opensessions.{key}.token"),
+            None => "/tmp/opensessions.token".to_string(),
+        });
 
     ResolvedEndpoint {
         server_host,
         server_port,
+        token_file,
     }
 }
 

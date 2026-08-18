@@ -4,7 +4,8 @@ use opensessions_server::{ServerConfig, default_state_source_from_env, start_ser
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = resolve_server_settings(|key| std::env::var(key).ok());
-    let mut config = ServerConfig::new(settings.host, settings.port, settings.pid_file);
+    let mut config = ServerConfig::new(settings.host, settings.port, settings.pid_file)
+        .with_token_file(settings.token_file);
     if let Some(source) = default_state_source_from_env(|key| std::env::var(key).ok()) {
         config = config.with_state_source(source);
     }
