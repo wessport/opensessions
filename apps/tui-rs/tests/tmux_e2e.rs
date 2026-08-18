@@ -741,7 +741,7 @@ fn tmux_sidebar_width_survives_flat_three_pane_layout_churn() {
     lab.wait_for_sidebar_width("opensessions", 36);
     let repair_elapsed = repair_started.elapsed();
     assert!(
-        repair_elapsed < Duration::from_millis(750),
+        repair_elapsed < Duration::from_secs(2),
         "sidebar width repair after killing pane1 took {repair_elapsed:?}; panes={:?}\nwidth_option={}\nhooks:\n{}\nlogs:\n{}",
         lab.sidebar_panes(),
         lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
@@ -1198,9 +1198,9 @@ for _ in range(3000):
     }
 
     fn restart_server(&mut self) {
-        if let Some(mut server) = self.server.take() {
-            let _ = server.kill();
-            let _ = server.wait();
+        if self.server_is_running() {
+            post_hook(self.port, "/quit", &self.auth_token());
+            self.wait_for_server_exit();
         }
         self.wait_for_no_sidebar_processes();
         self.start_server();

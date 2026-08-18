@@ -682,9 +682,13 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn mux_namespace_available(&self) -> bool {
-        self.tmux_socket_path
-            .as_ref()
-            .is_none_or(|socket_path| tmux_socket_is_live(socket_path))
+        self.tmux_socket_path.as_ref().is_none_or(|socket_path| {
+            tmux_socket_is_live(socket_path)
+                && self
+                    .providers
+                    .iter()
+                    .any(|provider| !provider.list_sessions().is_empty())
+        })
     }
 
     fn start_background_tasks(
@@ -692,7 +696,6 @@ impl StateSource for ReadOnlyMuxStateSource {
         state_updates: broadcast::Sender<String>,
         shutdown: broadcast::Sender<()>,
     ) -> Vec<JoinHandle<()>> {
-        let socket_path = self.tmux_socket_path.clone();
         let mut tasks = vec![
             tokio::spawn(run_agent_watcher_loop(
                 self.clone(),
@@ -714,14 +717,15 @@ impl StateSource for ReadOnlyMuxStateSource {
                 shutdown.clone(),
             )),
             tokio::spawn(run_tmux_state_poll_loop(
-                self,
+                self.clone(),
                 state_updates,
                 shutdown.clone(),
             )),
         ];
-        if let Some(socket_path) = socket_path {
+        if self.tmux_socket_path.is_some() {
+            let liveness_source = self.clone();
             tasks.push(tokio::task::spawn_blocking(move || {
-                run_tmux_socket_liveness_loop(socket_path, shutdown)
+                run_tmux_socket_liveness_loop(liveness_source, shutdown)
             }));
         }
         tasks
@@ -1901,9 +1905,16 @@ fn tmux_socket_is_live(socket_path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket_path).is_ok()
 }
 
-fn run_tmux_socket_liveness_loop(socket_path: PathBuf, shutdown: broadcast::Sender<()>) {
+fn run_tmux_socket_liveness_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    shutdown: broadcast::Sender<()>,
+) {
     let mut shutdown_rx = shutdown.subscribe();
     let mut missing_polls = 0;
+    let socket_path = source
+        .tmux_socket_path
+        .as_deref()
+        .expect("tmux liveness watcher requires a socket path");
     debug_log(format!(
         "tmux socket liveness watcher started for {}",
         socket_path.display(),
@@ -1915,7 +1926,7 @@ fn run_tmux_socket_liveness_loop(socket_path: PathBuf, shutdown: broadcast::Send
         ) {
             return;
         }
-        if tmux_socket_is_live(&socket_path) {
+        if source.mux_namespace_available() {
             missing_polls = 0;
         } else {
             missing_polls += 1;
