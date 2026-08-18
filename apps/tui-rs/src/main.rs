@@ -215,7 +215,13 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            event = events.next() => {
+            event = async {
+                if app.is_some() {
+                    events.next().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
                 let Some(event) = event else {
                     return Ok(());
                 };

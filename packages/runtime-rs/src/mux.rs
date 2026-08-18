@@ -125,6 +125,11 @@ pub trait MuxProvider: Send + Sync {
     fn kill_sidebar_pane(&self, _pane_id: &str) {}
     fn prepare_sidebar_window(&self, _window_id: &str) {}
     fn resize_sidebar_pane(&self, _pane_id: &str, _width: u16) {}
+    fn resize_sidebar_panes(&self, pane_ids: &[String], width: u16) {
+        for pane_id in pane_ids {
+            self.resize_sidebar_pane(pane_id, width);
+        }
+    }
     fn kill_orphaned_sidebar_panes(&self) {}
     fn kill_orphaned_sidebar_panes_with_fallbacks(
         &self,

@@ -248,6 +248,23 @@ impl TmuxClient {
         self.run(&["resize-pane", "-t", target, "-x", &width.to_string()]);
     }
 
+    pub fn resize_pane_widths(&self, targets: &[String], width: u16) {
+        if targets.is_empty() {
+            return;
+        }
+        let script = targets
+            .iter()
+            .map(|target| {
+                format!(
+                    "tmux resize-pane -t {} -x {width} >/dev/null 2>&1 || true",
+                    shell_quote(target)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.run(&["run-shell", "-b", &script]);
+    }
+
     pub fn set_window_remain_on_exit(&self, target: &str, enabled: bool) {
         self.run(&[
             "set-window-option",
@@ -741,6 +758,10 @@ impl MuxProvider for TmuxProvider {
         self.client.resize_pane_width(pane_id, width);
     }
 
+    fn resize_sidebar_panes(&self, pane_ids: &[String], width: u16) {
+        self.client.resize_pane_widths(pane_ids, width);
+    }
+
     fn kill_orphaned_sidebar_panes(&self) {
         self.kill_orphaned_sidebar_panes_with_fallbacks(&HashMap::new());
     }
@@ -1064,6 +1085,23 @@ mod tests {
                 "-p".to_string(),
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn sidebar_width_repairs_are_sent_in_one_tmux_invocation() {
+        let runner = Arc::new(RecordingRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.resize_sidebar_panes(&["%1".to_string(), "%2".to_string()], 36);
+
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "run-shell".to_string(),
+                "-b".to_string(),
+                "tmux resize-pane -t '%1' -x 36 >/dev/null 2>&1 || true; tmux resize-pane -t '%2' -x 36 >/dev/null 2>&1 || true".to_string(),
+            ]],
         );
     }
 }

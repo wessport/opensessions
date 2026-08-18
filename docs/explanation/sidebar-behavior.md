@@ -104,6 +104,7 @@ The accepted rule set is:
 - `pane-exited` also notifies the server for orphan-sidebar cleanup
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - global repair is single-flight: a request that arrives during a pass causes one follow-up pass rather than concurrent work, and every pass reads the latest configured width
+- each provider starts a global pass with one mux invocation when possible, then uses independent race-tolerant pane repairs so interactive commands can interleave
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
 
 ## Global Width Repair Rules

@@ -131,12 +131,13 @@ pub fn http_hook_command(
     background: bool,
     token_file: &str,
 ) -> String {
+    run_shell_command(&http_hook_script(base, path, data, token_file), background)
+}
+
+fn http_hook_script(base: &str, path: &str, data: Option<&str>, token_file: &str) -> String {
     let body = data.map(|data| format!(" -d '{data}'")).unwrap_or_default();
-    run_shell_command(
-        &format!(
-            "token=$(cat '{token_file}' 2>/dev/null) && curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H \"Authorization: Bearer $token\" -X POST {base}{path}{body} >/dev/null 2>&1 || true"
-        ),
-        background,
+    format!(
+        "token=$(cat '{token_file}' 2>/dev/null) && curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H \"Authorization: Bearer $token\" -X POST {base}{path}{body} >/dev/null 2>&1 || true"
     )
 }
 
@@ -175,10 +176,13 @@ pub fn close_orphan_sidebar_pipeline() -> String {
 }
 
 pub fn pane_exited_hook_command(base: &str, token_file: &str) -> String {
-    format!(
-        "{} ; {}",
-        run_shell_command(&close_orphan_sidebar_pipeline(), false),
-        http_hook_command(base, "/pane-exited", None, false, token_file),
+    run_shell_command(
+        &format!(
+            "{} ; {}",
+            close_orphan_sidebar_pipeline(),
+            http_hook_script(base, "/pane-exited", None, token_file),
+        ),
+        true,
     )
 }
 
@@ -283,7 +287,7 @@ mod tests {
         let hook = pane_exited_hook_command("http://127.0.0.1:1234", "/tmp/token");
 
         assert!(hook.starts_with(
-            "run-shell \"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{window_panes},1},##{==:##{pane_title},opensessions-sidebar}}'"
+            "run-shell -b \"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{window_panes},1},##{==:##{pane_title},opensessions-sidebar}}'"
         ));
         assert!(
             hook.contains("switch-client -c \\\"\\$client\\\" -t \\\"=\\$fallback:\\\"")
@@ -295,5 +299,6 @@ mod tests {
         );
         assert!(hook.contains("-X POST http://127.0.0.1:1234/pane-exited"));
         assert!(!hook.contains("list-panes -a -f '##{&&:##{>:"));
+        assert_eq!(hook.matches("run-shell").count(), 1);
     }
 }
