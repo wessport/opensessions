@@ -96,6 +96,17 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 - **Built-in watchers in Rust runtime/server**: Amp, Claude Code, Codex, OpenCode, Pi, and Droid watcher parsing lives in `packages/runtime-rs/src/agent_watchers.rs` and server scanning lives in `apps/server-rs/src/lib.rs`.
 - **Do not reintroduce pane-derived agent status**: panes can help focus/kill/routing, but watcher/API events are the source of agent status.
 
+## Fork And Pull Request Safety
+
+- Treat `origin` as the canonical repository and `fork` as the user's fork, but verify the remote URLs and branches before acting or reporting where work was pushed.
+- Fetch the intended base before creating a pull-request branch, then branch from the exact `<remote>/<base>` ref. Branch from the current branch only when the user explicitly requests a stacked change.
+- Before pushing or opening a pull request, inspect the merge base, commits on both sides, and changed files. Stop if the comparison contains unintended work or unexpected history divergence.
+- Treat `fork/main` as independent from `origin/main`; never assume they are synchronized. Do not merge, reset, or force-update either base branch merely to clean up a comparison without explicit approval.
+- A GitHub post-push “create pull request” URL may target the canonical upstream even when the branch was pushed to a fork. Before sharing or creating a pull request, verify the base repository and branch and the head repository and branch. For a fork-local pull request, verify the fork's base branch exists and use an explicit same-repository comparison such as `https://github.com/<fork-owner>/<repo>/compare/<base>...<head>?expand=1`.
+- After creating or updating a pull request, inspect its actual metadata and comparison. Verify repositories, branches, commit count, changed files, and mergeability before reporting success. Never claim a pull request was created when only a branch was pushed or a comparison URL was provided.
+- When the user requests only a commit and push, report the pushed branch and commit without adding a pull-request link.
+- Force-push only with explicit approval, using `--force-with-lease` pinned to the remote commit inspected immediately beforehand.
+
 ## Common Commands
 
 ```bash
