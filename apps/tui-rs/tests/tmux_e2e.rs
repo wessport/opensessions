@@ -554,6 +554,16 @@ fn tmux_sidebar_quit_closes_the_server_and_every_sidebar_client() {
 }
 
 #[test]
+fn tmux_sidebar_server_exits_when_its_tmux_namespace_disappears() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-missing-tmux");
+
+    lab.tmux_ok(["kill-server"]);
+
+    lab.wait_for_server_exit();
+}
+
+#[test]
 fn tmux_sidebar_stays_closed_across_session_and_window_switch_hooks() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-open-close");
@@ -1117,6 +1127,10 @@ impl Lab {
 
         self.spawn_attached_client_for("opensessions");
         self.wait_for_client_session("opensessions");
+        // If the Rust test process is interrupted before `Drop`, the Python
+        // client notices that its parent vanished and closes its pty. Tmux can
+        // then exit, and the opensessions server detects the unavailable socket.
+        self.tmux_ok(["set-option", "-g", "exit-unattached", "on"]);
     }
 
     fn spawn_attached_client_for(&mut self, session: &str) {
@@ -1136,7 +1150,11 @@ if pid == 0:
     os.execvp("tmux", ["tmux", "-L", socket, "attach-session", "-t", session])
 
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-time.sleep(300)
+parent = os.getppid()
+for _ in range(3000):
+    if os.getppid() != parent:
+        break
+    time.sleep(0.1)
 "#;
         Command::new("python3")
             .arg("-c")
@@ -1237,7 +1255,9 @@ time.sleep(300)
                 "opensessions-sidebar",
             ]);
         }
-        sleep(Duration::from_millis(1200));
+        for session in SIDEBAR_SESSIONS {
+            self.wait_for_text(session, "sessions");
+        }
     }
 
     fn spawn_window_with_sidebar(&self, session: &str, window_name: &str) -> String {
@@ -1803,7 +1823,7 @@ time.sleep(300)
     }
 
     fn wait_for_server_exit(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             if let Some(server) = &mut self.server
                 && server.try_wait().expect("poll server process").is_some()
@@ -1813,7 +1833,7 @@ time.sleep(300)
             }
             sleep(Duration::from_millis(100));
         }
-        panic!("server did not exit after q; logs:\n{}", self.logs());
+        panic!("server did not exit; logs:\n{}", self.logs());
     }
 
     fn server_is_running(&mut self) -> bool {

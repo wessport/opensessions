@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,17 @@ pub trait MuxProvider: Send + Sync {
 
     fn name(&self) -> &str;
     fn list_sessions(&self) -> Vec<MuxSessionInfo>;
+
+    fn state_fingerprint(&self) -> Option<u64> {
+        let sessions = self.list_sessions();
+        if sessions.is_empty() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        format!("{sessions:?}{:?}", self.get_current_session()).hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
     fn switch_session(&self, name: &str, client_tty: Option<&str>);
     fn get_current_session(&self) -> Option<String>;
     fn get_session_dir(&self, name: &str) -> String;
@@ -102,6 +115,10 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn list_sidebar_panes(&self, _session_name: Option<&str>) -> Vec<SidebarPane> {
+        Vec::new()
+    }
+
+    fn list_visible_sidebar_pane_ids(&self) -> Vec<String> {
         Vec::new()
     }
 

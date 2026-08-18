@@ -1337,6 +1337,7 @@ mod tests {
             sessions: Vec::new(),
             focused_session: None,
             current_session: None,
+            visible_sidebar_pane_ids: Vec::new(),
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,

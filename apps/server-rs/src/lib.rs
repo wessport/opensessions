@@ -63,12 +63,16 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
-const GIT_CACHE_TTL_MS: u64 = 5_000;
-const PORT_POLL_INTERVAL_MS: u64 = 10_000;
+const EXPENSIVE_DATA_POLL_MS: u64 = 10_000;
+const EXPENSIVE_DATA_IDLE_MAX_MS: u64 = 60_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const TMUX_STATE_POLL_MS: u64 = 2_000;
+const AGENT_WATCHER_IDLE_MAX_MS: u64 = 10_000;
+const TMUX_STATE_IDLE_MAX_MS: u64 = 30_000;
+const MISSING_TMUX_POLLS_BEFORE_SHUTDOWN: u32 = 2;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
+const SIDEBAR_LIFECYCLE_POLL_MS: u64 = 500;
 const SIDEBAR_WIDTH_REPAIR_SETTLE_MS: u64 = 50;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
@@ -117,14 +121,12 @@ impl SidebarWidthRepairScheduler {
     }
 }
 
-/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
-/// so live focus/agent-state issues can be diagnosed without extra env setup;
-/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
+/// Append a single debug line when explicit diagnostics are enabled.
 fn debug_log(line: impl AsRef<str>) {
     use std::io::Write;
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .ok()
-        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
+    let Ok(path) = std::env::var("OPENSESSIONS_DEBUG_LOG") else {
+        return;
+    };
     if path.is_empty() {
         return;
     }
@@ -150,6 +152,10 @@ pub trait StateSource: Send + Sync + 'static {
     fn cleanup_mux_hooks(&self) {}
 
     fn cleanup_sidebar_clients(&self) {}
+
+    fn mux_namespace_available(&self) -> bool {
+        true
+    }
 
     fn start_background_tasks(
         self: Arc<Self>,
@@ -361,14 +367,12 @@ impl GitCommandRunner for SystemGitCommandRunner {
 #[derive(Debug, Clone)]
 struct CachedGitInfo {
     info: GitInfo,
-    ts: u64,
 }
 
 #[derive(Debug, Clone)]
 struct CachedPortSnapshot {
     session_names: Vec<String>,
     ports_by_session: HashMap<String, Vec<u16>>,
-    ts: u64,
 }
 
 pub struct ReadOnlyMuxStateSource {
@@ -394,15 +398,19 @@ pub struct ReadOnlyMuxStateSource {
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
+    tmux_socket_path: Option<PathBuf>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 pub fn default_state_source_from_env(
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<ReadOnlyMuxStateSource> {
-    if env("TMUX").is_some() {
+    if let Some(tmux) = env("TMUX") {
         let provider = Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default())));
         let mut source = ReadOnlyMuxStateSource::new(vec![provider]);
+        if let Some(socket_path) = tmux.split(',').next().filter(|path| !path.is_empty()) {
+            source = source.with_tmux_socket_path(socket_path);
+        }
         let config = env("HOME")
             .map(PathBuf::from)
             .map(|home| load_config_from_home(&home));
@@ -440,6 +448,7 @@ impl ReadOnlyMuxStateSource {
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
+            tmux_socket_path: None,
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -451,6 +460,11 @@ impl ReadOnlyMuxStateSource {
 
     pub fn with_detail_panel_height(mut self, height: u16) -> Self {
         self.detail_panel_height = Mutex::new(clamp_detail_panel_height(height));
+        self
+    }
+
+    pub fn with_tmux_socket_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tmux_socket_path = Some(path.into());
         self
     }
 
@@ -467,6 +481,23 @@ impl ReadOnlyMuxStateSource {
 
     fn is_sidebar_visible(&self) -> bool {
         self.sidebar_coordinator.lock().unwrap().state().visible
+    }
+
+    fn tmux_state_fingerprint(&self) -> Option<u64> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let fingerprints = self
+            .providers
+            .iter()
+            .filter_map(|provider| provider.state_fingerprint())
+            .collect::<Vec<_>>();
+        if fingerprints.is_empty() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        fingerprints.hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     fn persist_sidebar_width(&self, width: u16) {
@@ -650,12 +681,19 @@ impl StateSource for ReadOnlyMuxStateSource {
         }
     }
 
+    fn mux_namespace_available(&self) -> bool {
+        self.tmux_socket_path
+            .as_ref()
+            .is_none_or(|socket_path| tmux_socket_is_live(socket_path))
+    }
+
     fn start_background_tasks(
         self: Arc<Self>,
         state_updates: broadcast::Sender<String>,
         shutdown: broadcast::Sender<()>,
     ) -> Vec<JoinHandle<()>> {
-        vec![
+        let socket_path = self.tmux_socket_path.clone();
+        let mut tasks = vec![
             tokio::spawn(run_agent_watcher_loop(
                 self.clone(),
                 state_updates.clone(),
@@ -670,8 +708,23 @@ impl StateSource for ReadOnlyMuxStateSource {
                 self.clone(),
                 shutdown.clone(),
             )),
-            tokio::spawn(run_tmux_state_poll_loop(self, state_updates, shutdown)),
-        ]
+            tokio::spawn(run_expensive_data_refresh_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )),
+            tokio::spawn(run_tmux_state_poll_loop(
+                self,
+                state_updates,
+                shutdown.clone(),
+            )),
+        ];
+        if let Some(socket_path) = socket_path {
+            tasks.push(tokio::task::spawn_blocking(move || {
+                run_tmux_socket_liveness_loop(socket_path, shutdown)
+            }));
+        }
+        tasks
     }
 
     fn snapshot_json(&self) -> String {
@@ -683,6 +736,11 @@ impl StateSource for ReadOnlyMuxStateSource {
             .iter()
             .map(|provider| provider.as_ref())
             .collect::<Vec<_>>();
+        let visible_sidebar_pane_ids = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.list_visible_sidebar_pane_ids())
+            .collect();
         let visible_session_names = self.visible_session_names();
         let metadata_by_session = visible_session_names.as_ref().map(|names| {
             names
@@ -696,7 +754,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 })
                 .collect()
         });
-        let git_by_session = self.git_info_by_session(visible_session_names.as_deref());
+        let git_by_session = self.git_info_by_session(visible_session_names.as_deref(), false);
         let (agent_state_by_session, agents_by_session, event_timestamps_by_session) =
             visible_session_names
                 .as_ref()
@@ -721,7 +779,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     (Some(states), Some(agents), Some(timestamps))
                 })
                 .unwrap_or((None, None, None));
-        let ports_by_session = self.discover_live_ports(visible_session_names.as_deref());
+        let ports_by_session = self.discover_live_ports(visible_session_names.as_deref(), false);
         let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
         debug_log(format!(
             "snapshot_json mode={} init={} width={}",
@@ -740,6 +798,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             portless_state: None,
             focused_session: self.focused_session.lock().unwrap().clone(),
             current_session_override: None,
+            visible_sidebar_pane_ids,
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
             agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
@@ -1420,6 +1479,7 @@ impl ReadOnlyMuxStateSource {
     fn git_info_by_session(
         &self,
         visible_session_names: Option<&[String]>,
+        force_refresh: bool,
     ) -> Option<HashMap<String, GitInfo>> {
         let visible =
             visible_session_names.map(|names| names.iter().cloned().collect::<HashSet<_>>());
@@ -1432,50 +1492,46 @@ impl ReadOnlyMuxStateSource {
                 {
                     continue;
                 }
-                git_by_session.insert(session.name, self.git_info_for_dir(&session.dir));
+                git_by_session.insert(
+                    session.name,
+                    self.git_info_for_dir(&session.dir, force_refresh),
+                );
             }
         }
         Some(git_by_session)
     }
 
-    fn git_info_for_dir(&self, dir: &str) -> GitInfo {
+    fn git_info_for_dir(&self, dir: &str, force_refresh: bool) -> GitInfo {
         if dir.is_empty() {
             return GitInfo::empty();
         }
 
-        let now = (self.now_ms)();
         if let Some(cached) = self.git_info_cache.lock().unwrap().get(dir).cloned()
-            && now.saturating_sub(cached.ts) < GIT_CACHE_TTL_MS
+            && !force_refresh
         {
             return cached.info;
         }
 
         let output = self.git_command_runner.git_info_output(dir);
-        if output.is_empty() {
-            return GitInfo::empty();
-        }
         let info = parse_git_info_output(&output);
-        self.git_info_cache.lock().unwrap().insert(
-            dir.to_string(),
-            CachedGitInfo {
-                info: info.clone(),
-                ts: now,
-            },
-        );
+        self.git_info_cache
+            .lock()
+            .unwrap()
+            .insert(dir.to_string(), CachedGitInfo { info: info.clone() });
         info
     }
 
     fn discover_live_ports(
         &self,
         visible_session_names: Option<&[String]>,
+        force_refresh: bool,
     ) -> Option<HashMap<String, Vec<u16>>> {
         let session_names = visible_session_names
             .map(|names| names.to_vec())
             .unwrap_or_else(|| self.sorted_session_names());
-        let now = (self.now_ms)();
         if let Some(cached) = self.port_snapshot_cache.lock().unwrap().clone()
             && cached.session_names == session_names
-            && now.saturating_sub(cached.ts) < PORT_POLL_INTERVAL_MS
+            && !force_refresh
         {
             return Some(cached.ports_by_session);
         }
@@ -1498,32 +1554,58 @@ impl ReadOnlyMuxStateSource {
             }
         }
 
-        if pane_pids_by_session.is_empty() {
-            return Some(discover_session_ports(PortDiscoveryInput {
-                session_names,
+        let ports_by_session = if pane_pids_by_session.is_empty() {
+            discover_session_ports(PortDiscoveryInput {
+                session_names: session_names.clone(),
                 pane_pids_by_session,
                 process_rows: Vec::new(),
                 lsof_fields: "",
-            }));
-        }
-
-        let lsof_fields = self.port_command_runner.lsof_fields();
-        let cache_session_names = session_names.clone();
-        let ports_by_session = discover_session_ports(PortDiscoveryInput {
-            session_names,
-            pane_pids_by_session,
-            process_rows: self.port_command_runner.process_rows(),
-            lsof_fields: &lsof_fields,
-        });
+            })
+        } else {
+            let lsof_fields = self.port_command_runner.lsof_fields();
+            discover_session_ports(PortDiscoveryInput {
+                session_names: session_names.clone(),
+                pane_pids_by_session,
+                process_rows: self.port_command_runner.process_rows(),
+                lsof_fields: &lsof_fields,
+            })
+        };
         self.port_snapshot_cache
             .lock()
             .unwrap()
             .replace(CachedPortSnapshot {
-                session_names: cache_session_names,
+                session_names,
                 ports_by_session: ports_by_session.clone(),
-                ts: now,
             });
         Some(ports_by_session)
+    }
+
+    fn refresh_expensive_data(&self) -> bool {
+        let previous_git = self
+            .git_info_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(dir, cached)| (dir.clone(), cached.info.clone()))
+            .collect::<HashMap<_, _>>();
+        let previous_ports = self
+            .port_snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cached| cached.ports_by_session.clone());
+        let visible_session_names = self.visible_session_names();
+        let _ = self.git_info_by_session(visible_session_names.as_deref(), true);
+        let current_ports = self.discover_live_ports(visible_session_names.as_deref(), true);
+        let current_git = self
+            .git_info_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(dir, cached)| (dir.clone(), cached.info.clone()))
+            .collect::<HashMap<_, _>>();
+
+        previous_git != current_git || previous_ports != current_ports
     }
 
     fn toggle_sidebar(&self) {
@@ -1720,7 +1802,7 @@ async fn run_sidebar_lifecycle_loop(
     shutdown: broadcast::Sender<()>,
 ) {
     let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = tokio::time::interval(Duration::from_millis(SIDEBAR_LIFECYCLE_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -1803,94 +1885,128 @@ async fn run_coalesced_sidebar_width_repairs<F, Fut>(
     }
 }
 
-/// Poll tmux state on a fixed cadence and broadcast a fresh snapshot whenever
-/// the JSON differs from the last broadcast, so the sidebar picks up new
-/// sessions, agent panes, focus changes, and other mux state without requiring
-/// an explicit hook.
-async fn run_tmux_state_poll_loop(
+fn adaptive_poll_delay_ms(unchanged_polls: u32, base_ms: u64, max_ms: u64) -> u64 {
+    let shift = unchanged_polls.min(10);
+    base_ms.saturating_mul(1_u64 << shift).min(max_ms)
+}
+
+fn agent_status_needs_fast_polling(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
+    )
+}
+
+fn tmux_socket_is_live(socket_path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
+fn run_tmux_socket_liveness_loop(socket_path: PathBuf, shutdown: broadcast::Sender<()>) {
+    let mut shutdown_rx = shutdown.subscribe();
+    let mut missing_polls = 0;
+    debug_log(format!(
+        "tmux socket liveness watcher started for {}",
+        socket_path.display(),
+    ));
+    loop {
+        if !matches!(
+            shutdown_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ) {
+            return;
+        }
+        if tmux_socket_is_live(&socket_path) {
+            missing_polls = 0;
+        } else {
+            missing_polls += 1;
+            debug_log(format!(
+                "tmux socket {} is not accepting connections ({missing_polls}/{MISSING_TMUX_POLLS_BEFORE_SHUTDOWN})",
+                socket_path.display(),
+            ));
+            if missing_polls >= MISSING_TMUX_POLLS_BEFORE_SHUTDOWN {
+                debug_log(format!(
+                    "tmux namespace at {} is unavailable; shutting down server",
+                    socket_path.display(),
+                ));
+                let _ = shutdown.send(());
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(TMUX_STATE_POLL_MS));
+    }
+}
+
+async fn run_expensive_data_refresh_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,
     shutdown: broadcast::Sender<()>,
 ) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(TMUX_STATE_POLL_MS));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Seed `last_hash` from the current state so the first tick does not
-    // broadcast an unprovoked snapshot. Subsequent broadcasts only happen
-    // when something other than `ts` actually changes.
-    let mut last_hash: u64 = {
-        let mut hasher = DefaultHasher::new();
-        strip_ts_field(&source.snapshot_json()).hash(&mut hasher);
-        hasher.finish()
-    };
+    let mut unchanged_polls = 0;
     loop {
+        let delay = adaptive_poll_delay_ms(
+            unchanged_polls,
+            EXPENSIVE_DATA_POLL_MS,
+            EXPENSIVE_DATA_IDLE_MAX_MS,
+        );
         tokio::select! {
             _ = shutdown_rx.recv() => return,
-            _ = interval.tick() => {
-                // Hooks correct tmux layout churn immediately; this slower poll
-                // is only a backstop for missed external tmux changes.
-
-                let snapshot = source.snapshot_json();
-                // Hash the snapshot ignoring the per-tick `ts` field so that
-                // identical state on consecutive ticks does not trigger a
-                // wasteful re-broadcast. Anything else changing (sessions,
-                // panes, widths, init state, focus) flips the hash and the
-                // sidebar receives a fresh state.
-                let stripped = strip_ts_field(&snapshot);
-                let mut hasher = DefaultHasher::new();
-                stripped.hash(&mut hasher);
-                let hash = hasher.finish();
-                if hash != last_hash {
-                    last_hash = hash;
-                    debug_log("tmux_state_poll_loop: state changed, broadcasting");
-                    let _ = state_updates.send(snapshot);
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => {
+                let refresh_source = source.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    refresh_source.refresh_expensive_data()
+                })
+                .await
+                .unwrap_or(false);
+                if changed {
+                    unchanged_polls = 0;
+                    let snapshot_source = source.clone();
+                    if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
+                        snapshot_source.snapshot_json()
+                    }).await {
+                        let _ = state_updates.send(snapshot);
+                    }
+                } else {
+                    unchanged_polls = unchanged_polls.saturating_add(1);
                 }
             }
         }
     }
 }
 
-/// Remove `,"ts":\d+` (or leading variant) from a JSON snapshot string so a
-/// monotonically increasing timestamp does not defeat the change-detection
-/// hash in `run_tmux_state_poll_loop`. Cheap byte scan; no full JSON parse.
-fn strip_ts_field(snapshot: &str) -> String {
-    let mut out = String::with_capacity(snapshot.len());
-    let bytes = snapshot.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &snapshot[i..];
-        let key = "\"ts\":";
-        if rest.starts_with(key)
-            || rest.starts_with(&format!(",{key}"))
-            || rest.starts_with(&format!("{{{key}"))
-        {
-            // Preserve a leading `,` or `{` while dropping the rest of the
-            // `"ts":<digits>` token.
-            let mut prefix_len = 0;
-            if rest.starts_with(',') || rest.starts_with('{') {
-                prefix_len = 1;
-                out.push(rest.chars().next().unwrap());
+/// Poll only cheap tmux topology/focus data, backing off while it is stable.
+/// Full snapshots (including git and port discovery) are built only after the
+/// fingerprint changes, so routine polling cannot repeatedly launch those
+/// subprocesses. Hooks remain the immediate path for known tmux changes.
+async fn run_tmux_state_poll_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+) {
+    let mut shutdown_rx = shutdown.subscribe();
+    let mut last_fingerprint = None;
+    let mut unchanged_polls = 0;
+    loop {
+        let delay =
+            adaptive_poll_delay_ms(unchanged_polls, TMUX_STATE_POLL_MS, TMUX_STATE_IDLE_MAX_MS);
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => {
+                let Some(fingerprint) = source.tmux_state_fingerprint() else {
+                    unchanged_polls = unchanged_polls.saturating_add(1);
+                    continue;
+                };
+                if last_fingerprint == Some(fingerprint) {
+                    unchanged_polls = unchanged_polls.saturating_add(1);
+                    continue;
+                }
+                last_fingerprint = Some(fingerprint);
+                unchanged_polls = 0;
+                debug_log("tmux_state_poll_loop: state changed, broadcasting");
+                let _ = state_updates.send(source.snapshot_json());
             }
-            // Skip past `"ts":`
-            let mut j = i + prefix_len + key.len();
-            // Skip digits.
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            // If we left a leading `,`, also drop a trailing `,` to avoid
-            // doubling separators when ts was sandwiched.
-            if prefix_len == 1 && bytes.get(i) == Some(&b',') && bytes.get(j) == Some(&b',') {
-                j += 1;
-            }
-            i = j;
-            continue;
         }
-        out.push(snapshot[i..].chars().next().unwrap());
-        i += snapshot[i..].chars().next().unwrap().len_utf8();
     }
-    out
 }
 
 async fn run_agent_watcher_loop(
@@ -1899,22 +2015,26 @@ async fn run_agent_watcher_loop(
     shutdown: broadcast::Sender<()>,
 ) {
     let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(AGENT_WATCHER_POLL_MS));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
+    let mut unchanged_polls = 0;
 
     loop {
+        let delay = adaptive_poll_delay_ms(
+            unchanged_polls,
+            AGENT_WATCHER_POLL_MS,
+            AGENT_WATCHER_IDLE_MAX_MS,
+        );
         tokio::select! {
             _ = shutdown_rx.recv() => return,
-            _ = interval.tick() => {
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => {
                 let now = current_time_ms();
                 let snapshots = tokio::task::spawn_blocking(move || scan_agent_watcher_snapshots(now))
                     .await
                     .unwrap_or_default();
-                debug_log(format!(
-                    "agent_watcher_loop: tick scanned {} snapshots",
-                    snapshots.len()
-                ));
+                let has_active_agents = snapshots
+                    .iter()
+                    .any(|snapshot| agent_status_needs_fast_polling(snapshot.status));
+                let mut changed = false;
                 for snapshot in snapshots {
                     if snapshot.status == AgentStatus::Idle {
                         continue;
@@ -1933,11 +2053,17 @@ async fn run_agent_watcher_loop(
                         ));
                         last_seen.insert(key, fingerprint);
                         let _ = state_updates.send(source.snapshot_json());
+                        changed = true;
                     } else {
                         debug_log(format!(
                             "agent_watcher_loop: dropped snapshot agent={agent} status={status:?} (no matching session)",
                         ));
                     }
+                }
+                if changed || has_active_agents {
+                    unchanged_polls = 0;
+                } else {
+                    unchanged_polls = unchanged_polls.saturating_add(1);
                 }
             }
         }
@@ -2594,6 +2720,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         .await;
         if owns_identity_generation(&config.pid_file, &token_file, &token)
             && let Some(source) = cleanup_state_source.as_ref()
+            && source.mux_namespace_available()
         {
             source.cleanup_mux_hooks();
             source.cleanup_sidebar_clients();
@@ -3278,6 +3405,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_SERVER_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn idle_polling_backs_off_and_resets_after_activity() {
+        assert_eq!(adaptive_poll_delay_ms(0, 2_000, 30_000), 2_000);
+        assert_eq!(adaptive_poll_delay_ms(1, 2_000, 30_000), 4_000);
+        assert_eq!(adaptive_poll_delay_ms(4, 2_000, 30_000), 30_000);
+        assert_eq!(adaptive_poll_delay_ms(20, 2_000, 30_000), 30_000);
+        assert!(agent_status_needs_fast_polling(AgentStatus::Running));
+        assert!(agent_status_needs_fast_polling(AgentStatus::ToolRunning));
+        assert!(agent_status_needs_fast_polling(AgentStatus::Waiting));
+        assert!(!agent_status_needs_fast_polling(AgentStatus::Done));
+        assert!(!agent_status_needs_fast_polling(AgentStatus::Stale));
+    }
 
     async fn send_raw_request(request: &[u8]) -> Vec<u8> {
         send_raw_request_with_auth(request, true).await

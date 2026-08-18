@@ -2055,9 +2055,8 @@ fn separator(palette: &Palette, width: usize) -> StyledLine {
 }
 
 /// 10-frame braille spinner used for agents in `Running` / `ToolRunning`
-/// state. Frame cadence is 120ms — the same period as the render tick in
-/// `apps/tui-rs/src/main.rs`,
-/// so the glyph advances exactly once per tick (smooth, no stutter).
+/// state. The timestamp selects a 120ms frame, while the sidebar event loop
+/// controls how often a visible pane actually redraws it.
 fn agent_spinner(ts: u64) -> &'static str {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     FRAMES[((ts / 120) as usize) % FRAMES.len()]
@@ -2880,6 +2879,7 @@ mod tests {
             sessions,
             focused_session: None,
             current_session: Some("opensessions".to_string()),
+            visible_sidebar_pane_ids: Vec::new(),
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
@@ -2942,6 +2942,7 @@ mod tests {
             }],
             focused_session: None,
             current_session: Some("opensessions".to_string()),
+            visible_sidebar_pane_ids: Vec::new(),
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
@@ -3202,6 +3203,7 @@ mod tests {
             sessions: vec![first, second],
             focused_session: None,
             current_session: None,
+            visible_sidebar_pane_ids: Vec::new(),
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
@@ -3410,6 +3412,7 @@ mod tests {
             sessions: Vec::new(),
             focused_session: None,
             current_session: None,
+            visible_sidebar_pane_ids: Vec::new(),
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
