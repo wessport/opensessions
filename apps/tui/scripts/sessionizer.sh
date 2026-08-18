@@ -33,14 +33,27 @@ if [ ${#valid_dirs[@]} -eq 0 ]; then
   exit 1
 fi
 
-selected=$(find "${valid_dirs[@]}" -mindepth 1 -maxdepth "$MAXDEPTH" -type d 2>/dev/null | fzf \
+fzf_output=$(find "${valid_dirs[@]}" -mindepth 1 -maxdepth "$MAXDEPTH" -type d -not -path '*/.*' 2>/dev/null | fzf \
   --reverse \
-  --header="Pick a directory for new session" \
+  --print-query \
+  --header="Pick a directory (or type a path and press Enter)" \
   --preview=':' \
   --preview-window=hidden \
   --bind='ctrl-c:abort')
 
-[ -z "$selected" ] && exit 0
+# --print-query outputs line 1 as the query and line 2 as the selected match.
+query=$(printf '%s\n' "$fzf_output" | sed -n '1p')
+match=$(printf '%s\n' "$fzf_output" | sed -n '2p')
+
+# fzf can return a highlighted match even when the user entered an explicit
+# directory, so prefer a non-empty, valid typed path.
+if [ -n "$query" ] && [ -d "$query" ]; then
+  selected="$query"
+elif [ -n "$match" ]; then
+  selected="$match"
+else
+  exit 0
+fi
 
 # Derive session name from directory basename, replacing dots with underscores
 session_name=$(basename "$selected" | tr '.' '_')
