@@ -1013,28 +1013,6 @@ fn tmux_sidebar_server_stays_responsive_while_opening_many_windows() {
     let mut lab = Lab::new("opensessions-e2e-sidebar-stampede");
     lab.setup_repos();
     lab.setup_tmux();
-    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("resolve project root");
-    lab.tmux_ok([
-        "set-environment",
-        "-g",
-        "OPENSESSIONS_DIR",
-        project_root.to_str().unwrap(),
-    ]);
-    lab.tmux_ok([
-        "set-environment",
-        "-g",
-        "OPENSESSIONS_PORT",
-        &lab.port.to_string(),
-    ]);
-    lab.tmux_ok([
-        "set-environment",
-        "-g",
-        "OPENSESSIONS_TOKEN_FILE",
-        lab.token_file().to_str().unwrap(),
-    ]);
     for index in 0..15 {
         let session = format!("stampede-{index}");
         lab.tmux_ok([
@@ -1395,6 +1373,26 @@ impl Lab {
 
         self.spawn_attached_client_for("opensessions");
         self.wait_for_client_session("opensessions");
+        self.tmux_ok([
+            "set-environment",
+            "-g",
+            "OPENSESSIONS_DIR",
+            self.project_root().to_str().unwrap(),
+        ]);
+        for (name, value) in [
+            ("OPENSESSIONS_HOST", "127.0.0.1".to_string()),
+            ("OPENSESSIONS_PORT", self.port.to_string()),
+            (
+                "OPENSESSIONS_TOKEN_FILE",
+                self.token_file().to_string_lossy().into_owned(),
+            ),
+            (
+                "OPENSESSIONS_DEBUG_LOG",
+                self.root.join("debug.log").to_string_lossy().into_owned(),
+            ),
+        ] {
+            self.tmux_ok(["set-environment", "-g", name, &value]);
+        }
         // If the Rust test process is interrupted before `Drop`, the Python
         // client notices that its parent vanished and closes its pty. Tmux can
         // then exit, and the opensessions server detects the unavailable socket.
@@ -2391,6 +2389,13 @@ for _ in range(3000):
 
     fn config_path(&self) -> PathBuf {
         self.home_dir().join(".config/opensessions/config.json")
+    }
+
+    fn project_root(&self) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("resolve project root")
     }
 
     fn target_debug_bin(&self, name: &str) -> PathBuf {
