@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -159,6 +159,77 @@ fn tmux_sidebar_x_on_active_worktree_child_kills_that_child_after_confirm() {
 
     lab.send_sidebar_key(&source, "y");
     lab.wait_for_session_absent("os-demo-feat-agent-panel");
+}
+
+#[test]
+fn tmux_sidebar_click_spawns_live_sidebar_for_session_with_spaces() {
+    let _guard = e2e_serial_guard();
+    let mut lab = Lab::new("opensessions-e2e-spaced-session");
+    lab.setup_repos();
+    lab.setup_tmux();
+    let spaced_dir = lab.root.join("jobseeker-feedback");
+    fs::create_dir_all(&spaced_dir).expect("create spaced-session directory");
+    lab.tmux_ok([
+        "new-session",
+        "-d",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "-s",
+        "jobseeker feedback",
+        "-c",
+        spaced_dir.to_str().unwrap(),
+        "sh",
+    ]);
+    lab.start_server();
+    lab.spawn_sidebars();
+
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("jobseeker feedback"));
+    lab.click_session_row(&source, "jobseeker feedback");
+    lab.wait_for_client_session("jobseeker feedback");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let panes = lab.tmux([
+            "list-panes",
+            "-t",
+            "=jobseeker feedback:",
+            "-F",
+            "#{pane_id}\t#{pane_title}\t#{pane_dead}",
+        ]);
+        if let Some(pane) = panes.lines().find_map(|line| {
+            let mut parts = line.split('\t');
+            let pane = parts.next()?;
+            let title = parts.next()?;
+            let dead = parts.next()?;
+            (title == "opensessions-sidebar" && dead == "0").then(|| pane.to_string())
+        }) && lab.capture_pane(&pane).contains("sessions")
+        {
+            assert!(
+                lab.tmux(["list-panes", "-a", "-F", "#{pane_id}"])
+                    .lines()
+                    .any(|pane| pane == source),
+                "switching to a spaced session removed the source sidebar"
+            );
+            return;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "spaced session did not get a live sidebar; panes:\n{}\n\nlogs:\n{}",
+        lab.tmux([
+            "list-panes",
+            "-t",
+            "=jobseeker feedback:",
+            "-F",
+            "#{pane_id} title=#{pane_title} dead=#{pane_dead} status=#{pane_dead_status} command=#{pane_current_command}"
+        ]),
+        lab.logs(),
+    );
 }
 
 #[test]
@@ -487,7 +558,7 @@ fn tmux_sidebar_width_is_fixed_and_rejects_manual_sidebar_resize() {
 }
 
 #[test]
-fn tmux_sidebar_width_slider_is_the_only_width_author() {
+fn tmux_sidebar_width_slider_and_mouse_drag_are_width_authors() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-width-slider");
     let source = lab.sidebar_pane("opensessions");
@@ -537,6 +608,53 @@ fn tmux_sidebar_width_slider_is_the_only_width_author() {
         lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
         "21"
     );
+
+    let source = lab.sidebar_pane("opensessions");
+    let mouse_binding = lab.tmux(["list-keys", "-T", "root", "MouseDrag1Border"]);
+    assert!(
+        mouse_binding.contains("@opensessions_mouse_resize_window")
+            && mouse_binding.contains("/set-sidebar-width"),
+        "OpenSessions did not extend the default mouse border binding:\n{mouse_binding}"
+    );
+    let window_id = lab.tmux([
+        "display-message",
+        "-p",
+        "-t",
+        source.as_str(),
+        "#{window_id}",
+    ]);
+    lab.tmux_ok([
+        "set-option",
+        "-gq",
+        "@opensessions_mouse_resize_window",
+        window_id.as_str(),
+    ]);
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "43"]);
+    sleep(Duration::from_millis(150));
+    assert_eq!(
+        lab.tmux([
+            "display-message",
+            "-p",
+            "-t",
+            source.as_str(),
+            "#{pane_width}"
+        ]),
+        "43",
+        "mouse resize transaction was repaired before it could be accepted"
+    );
+    post_body(
+        lab.port,
+        "/set-sidebar-width",
+        "text/plain",
+        "43",
+        &lab.auth_token(),
+    );
+    lab.tmux_ok(["set-option", "-gu", "@opensessions_mouse_resize_window"]);
+    lab.wait_for_all_sidebar_widths(43);
+    lab.wait_for_config_sidebar_width(43);
+
+    lab.restart_server();
+    lab.wait_for_all_sidebar_widths(43);
 }
 
 #[test]
@@ -683,6 +801,56 @@ fn tmux_sidebar_closes_window_cleanly_when_last_content_pane_exits() {
         "last content pane exit should not surface resize-hook failures; logs:\n{}",
         lab.logs(),
     );
+}
+
+#[test]
+fn tmux_sidebar_bulk_window_cleanup_keeps_active_window() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-window-cleanup");
+
+    let active_window = lab.current_window_index("opensessions");
+    let first_cleanup = lab.spawn_window_with_sidebar("opensessions", "cleanup-one");
+    let second_cleanup = lab.spawn_window_with_sidebar("opensessions", "cleanup-two");
+    let source = lab.sidebar_pane_in_window("opensessions", &active_window);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        &format!("opensessions:{active_window}"),
+    ]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_active_window("opensessions", &active_window);
+
+    lab.send_sidebar_key(&source, "W");
+    lab.wait_for_capture_pane(&source, |text| {
+        text.contains("Windows")
+            && text.contains("cleanup-one")
+            && text.contains("cleanup-two")
+            && text.contains("● 0")
+    });
+    lab.send_sidebar_key(&source, "Down");
+    lab.send_sidebar_key(&source, "Enter");
+    lab.wait_for_active_window("opensessions", &first_cleanup);
+
+    let cleanup_sidebar = lab.sidebar_pane_in_window("opensessions", &first_cleanup);
+    lab.send_sidebar_key(&cleanup_sidebar, "W");
+    lab.wait_for_capture_pane(&cleanup_sidebar, |text| {
+        text.contains("Windows") && text.contains("● 1")
+    });
+    lab.send_sidebar_key(&cleanup_sidebar, "Up");
+    lab.send_sidebar_key(&cleanup_sidebar, "Right");
+    lab.send_sidebar_key(&cleanup_sidebar, "Down");
+    lab.send_sidebar_key(&cleanup_sidebar, "Down");
+    lab.send_sidebar_key(&cleanup_sidebar, "Right");
+    lab.send_sidebar_key(&cleanup_sidebar, "Enter");
+    lab.wait_for_capture_pane(&cleanup_sidebar, |text| {
+        text.contains("Close 2 windows?") && text.contains("Processes in these windows")
+    });
+    lab.send_sidebar_key(&cleanup_sidebar, "Enter");
+
+    lab.wait_for_window_absent("opensessions", &active_window);
+    lab.wait_for_window_absent("opensessions", &second_cleanup);
+    lab.wait_for_active_window("opensessions", &first_cleanup);
 }
 
 #[test]
@@ -840,6 +1008,93 @@ fn tmux_sidebar_switch_stays_responsive_with_100_connected_clients() {
 }
 
 #[test]
+fn tmux_sidebar_server_stays_responsive_while_opening_many_windows() {
+    let _guard = e2e_serial_guard();
+    let mut lab = Lab::new("opensessions-e2e-sidebar-stampede");
+    lab.setup_repos();
+    lab.setup_tmux();
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("resolve project root");
+    lab.tmux_ok([
+        "set-environment",
+        "-g",
+        "OPENSESSIONS_DIR",
+        project_root.to_str().unwrap(),
+    ]);
+    lab.tmux_ok([
+        "set-environment",
+        "-g",
+        "OPENSESSIONS_PORT",
+        &lab.port.to_string(),
+    ]);
+    lab.tmux_ok([
+        "set-environment",
+        "-g",
+        "OPENSESSIONS_TOKEN_FILE",
+        lab.token_file().to_str().unwrap(),
+    ]);
+    for index in 0..15 {
+        let session = format!("stampede-{index}");
+        lab.tmux_ok([
+            "new-session",
+            "-d",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            "-s",
+            &session,
+            "-c",
+            lab.root.join("opensessions").to_str().unwrap(),
+            "sh",
+        ]);
+    }
+    lab.start_server();
+
+    let port = lab.port;
+    let token = lab.auth_token();
+    let toggle = thread::spawn(move || post_hook(port, "/toggle", &token));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && lab.sidebar_panes().is_empty() {
+        sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !lab.sidebar_panes().is_empty(),
+        "toggle never began spawning sidebars; logs:\n{}",
+        lab.logs()
+    );
+
+    let started = Instant::now();
+    let response = get_liveness(lab.port);
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "server did not answer liveness while sidebars connected: {response:?}\nlogs:\n{}",
+        lab.logs()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "server liveness was blocked for {:?} by the sidebar connection burst\nlogs:\n{}",
+        started.elapsed(),
+        lab.logs()
+    );
+
+    toggle.join().expect("toggle request");
+    let expected_sidebars = SIDEBAR_SESSIONS.len() + 15;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && lab.sidebar_panes().len() < expected_sidebars {
+        sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        lab.sidebar_panes().len(),
+        expected_sidebars,
+        "not every window retained a live sidebar\nlogs:\n{}",
+        lab.logs()
+    );
+}
+
+#[test]
 fn tmux_sidebar_switch_latency_during_width_repair_probe() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("os-e2e-latency");
@@ -961,6 +1216,19 @@ fn assert_worktree_group_columns(text: &str) {
 
 fn post_refresh(port: u16, token: &str) {
     post_hook(port, "/refresh", token);
+}
+
+fn get_liveness(port: u16) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect liveness");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set liveness timeout");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write liveness");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read liveness");
+    response
 }
 
 fn post_hook(port: u16, path: &str, token: &str) {

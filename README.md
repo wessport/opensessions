@@ -88,6 +88,8 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 - Session context in the UI: branch in the list, working directory in the detail panel, thread names, and detected localhost ports.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
 - Fast switching with `j`/`k`, arrows, `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
+- Theme palettes and backgrounds can be chosen independently: press `t` to open the picker, use `←`/`→` to choose a transparent or solid background, then confirm with `Enter`.
+- Keyboard-first window management with `W`: inspect pane commands, switch with `Enter`, or mark inactive windows with `→` for reviewed bulk closure without closing the active window.
 - `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, and in-app theme switching.
 - Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local Rust WebSocket/HTTP server.
 
@@ -186,7 +188,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 ## Current Caveats
 
 - The app is local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden.
-- `theme`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
+- `theme`, `transparentBackground`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
 - tmux is the only supported mux today.
 

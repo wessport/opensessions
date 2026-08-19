@@ -4,7 +4,7 @@ use crate::protocol::AgentStatus;
 
 pub fn map_amp_state(amp_state: &str) -> Option<AgentStatus> {
     match amp_state {
-        "working" | "streaming" | "running_tools" => Some(AgentStatus::Running),
+        "working" | "streaming" | "running_tools" | "compacting" => Some(AgentStatus::Running),
         "tool_use" => Some(AgentStatus::ToolRunning),
         "awaiting_approval" => Some(AgentStatus::Waiting),
         "idle" => Some(AgentStatus::Done),

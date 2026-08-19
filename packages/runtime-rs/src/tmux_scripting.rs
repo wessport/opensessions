@@ -1,5 +1,6 @@
 const SIDEBAR_PANE_TITLE: &str = "opensessions-sidebar";
 const SIDEBAR_WIDTH_OPTION: &str = "@opensessions_width";
+pub const SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION: &str = "@opensessions_mouse_resize_window";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxVar {
@@ -165,6 +166,18 @@ pub fn resized_pane_width_repair_command() -> String {
     )
 }
 
+pub fn sidebar_mouse_resize_marker_script() -> String {
+    format!(
+        "tmux -S #{{socket_path}} set-option -gq {SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION} '#{{mouse_window}}'"
+    )
+}
+
+pub fn sidebar_mouse_resize_report_script(base: &str, token_file: &str) -> String {
+    format!(
+        "width=$(tmux -S #{{socket_path}} list-panes -t '#{{mouse_window}}' -f '##{{==:##{{pane_title}},{SIDEBAR_PANE_TITLE}}}' -F '##{{pane_width}}' | head -n 1); configured=$(tmux -S #{{socket_path}} show-option -gqv {SIDEBAR_WIDTH_OPTION}); if [ -n \"$width\" ] && [ \"$width\" != \"$configured\" ]; then token=$(cat '{token_file}' 2>/dev/null) && curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H \"Authorization: Bearer $token\" -X POST {base}/set-sidebar-width -d \"$width\" >/dev/null 2>&1 || true; fi; tmux -S #{{socket_path}} set-option -gu {SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION} >/dev/null 2>&1 || true"
+    )
+}
+
 pub fn close_orphan_sidebar_pipeline() -> String {
     format!(
         "tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | while IFS=$(printf '\\t') read -r session pane windows; do if [ \"$windows\" -le 1 ]; then fallback=$(tmux -S #{{socket_path}} list-sessions -F '{}' | awk -v s=\"$session\" '$0==s {{ if (prev != \"\") {{ print prev; exit }}; seen=1; next }} seen {{ print; exit }} {{ prev=$0 }}'); tmux -S #{{socket_path}} list-clients -t \"=$session:\" -F '{}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux -S #{{socket_path}} switch-client -c \"$client\" -t \"=$fallback:\" >/dev/null 2>&1 || true; done; fi; tmux -S #{{socket_path}} kill-pane -t \"$pane\" >/dev/null 2>&1 || true; done",
@@ -228,10 +241,16 @@ fn sidebar_width_repair_filter() -> TmuxFormat {
         TmuxFormat::gt(TmuxVar::WindowPanes.format(), TmuxFormat::literal("1")),
         TmuxFormat::and([
             sidebar_pane_filter(),
-            TmuxFormat::neq(
-                TmuxVar::PaneWidth.format(),
-                TmuxVar::SidebarWidthOption.format(),
-            ),
+            TmuxFormat::and([
+                TmuxFormat::neq(
+                    TmuxVar::PaneWidth.format(),
+                    TmuxVar::SidebarWidthOption.format(),
+                ),
+                TmuxFormat::neq(
+                    TmuxFormat::var_name("window_id"),
+                    TmuxFormat::var_name(SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION),
+                ),
+            ]),
         ]),
     ])
 }
@@ -278,7 +297,26 @@ mod tests {
     fn renders_resized_pane_repair_without_a_global_scan() {
         assert_eq!(
             resized_pane_width_repair_command(),
-            "run-shell -b \"[ '#{&&:#{>:#{window_panes},1},#{&&:#{==:#{pane_title},opensessions-sidebar},#{!=:#{pane_width},#{@opensessions_width}}}}' != 1 ] || tmux -S #{socket_path} resize-pane -t '#{pane_id}' -x '#{@opensessions_width}'\""
+            "run-shell -b \"[ '#{&&:#{>:#{window_panes},1},#{&&:#{==:#{pane_title},opensessions-sidebar},#{&&:#{!=:#{pane_width},#{@opensessions_width}},#{!=:#{window_id},#{@opensessions_mouse_resize_window}}}}}' != 1 ] || tmux -S #{socket_path} resize-pane -t '#{pane_id}' -x '#{@opensessions_width}'\""
+        );
+    }
+
+    #[test]
+    fn renders_mouse_resize_as_explicit_width_intent() {
+        assert_eq!(
+            sidebar_mouse_resize_marker_script(),
+            "tmux -S #{socket_path} set-option -gq @opensessions_mouse_resize_window '#{mouse_window}'"
+        );
+        let report =
+            sidebar_mouse_resize_report_script("http://127.0.0.1:1234", "/tmp/opensessions.token");
+        assert!(report.contains("list-panes -t '#{mouse_window}'"));
+        assert!(report.contains("-f '##{==:##{pane_title},opensessions-sidebar}'"));
+        assert!(report.contains("-F '##{pane_width}'"));
+        assert!(report.contains("-X POST http://127.0.0.1:1234/set-sidebar-width -d \"$width\""));
+        assert!(
+            report.ends_with(
+                "set-option -gu @opensessions_mouse_resize_window >/dev/null 2>&1 || true"
+            )
         );
     }
 

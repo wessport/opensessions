@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use ratatui::Frame;
@@ -12,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, DisplaySessionEntry, Modal};
 use crate::generated::protocol::{
-    AgentEvent, AgentPanelScope, AgentStatus, MetadataTone, SessionData,
+    AgentEvent, AgentPanelScope, AgentStatus, MetadataTone, SessionData, WindowData,
 };
 use crate::session_display::worktree_group_key;
 
@@ -69,6 +70,7 @@ pub fn detail_separator_row(app: &App, width: u16, height: u16) -> u16 {
 
 pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel {
     let palette = palette_for_theme(app.theme.as_deref());
+    let background = background_for_theme(app.theme.as_deref(), app.transparent_background);
     let width = app
         .terminal_width()
         .map(|value| value as usize)
@@ -104,6 +106,7 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     RenderModel {
         lines,
         layout,
+        background,
         session_scrollbar,
         agent_scrollbar,
     }
@@ -161,8 +164,12 @@ fn sidebar_layout(app: &App, width: u16, height: u16) -> SidebarLayout {
 pub(crate) fn render_model(frame: &mut Frame<'_>, model: &RenderModel) {
     let area = frame.area();
     let [screen] = Layout::vertical([Constraint::Length(area.height)]).areas(area);
+    let mut screen_style = Style::default().fg(WHITE.color());
+    if let Some(background) = model.background {
+        screen_style = screen_style.bg(background.color());
+    }
     Block::default()
-        .style(Style::default().fg(WHITE.color()))
+        .style(screen_style)
         .render(screen, frame.buffer_mut());
 
     let layout = model.layout;
@@ -288,6 +295,7 @@ fn render_lines(frame: &mut Frame<'_>, lines: &[StyledLine], start: usize, area:
 pub(crate) struct RenderModel {
     lines: Vec<StyledLine>,
     layout: SidebarLayout,
+    background: Option<Rgb>,
     session_scrollbar: Option<ScrollbarSpec>,
     agent_scrollbar: Option<ScrollbarSpec>,
 }
@@ -1461,7 +1469,15 @@ fn render_modal_overlay(
     match &app.modal {
         Modal::ThemePicker {
             query, selected, ..
-        } => render_theme_picker_overlay(palette, lines, width, height, query, *selected),
+        } => render_theme_picker_overlay(
+            palette,
+            lines,
+            width,
+            height,
+            query,
+            *selected,
+            app.transparent_background,
+        ),
         Modal::WidthSlider { draft_width, .. } => {
             render_width_slider_overlay(palette, lines, width, height, *draft_width)
         }
@@ -1469,7 +1485,134 @@ fn render_modal_overlay(
             let (title, label) = app.kill_confirm_copy(target);
             render_kill_confirm_overlay(palette, lines, width, height, &title, &label)
         }
+        Modal::WindowManager {
+            session,
+            windows,
+            selected,
+            marked,
+            confirming,
+        } => render_window_manager_overlay(
+            palette,
+            lines,
+            width,
+            height,
+            session,
+            windows,
+            *selected,
+            marked,
+            *confirming,
+        ),
         Modal::None => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_window_manager_overlay(
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+    session: &str,
+    windows: &[WindowData],
+    selected: usize,
+    marked: &HashSet<String>,
+    confirming: bool,
+) {
+    let box_width = width.min(38);
+    let visible_items = windows.len().clamp(1, 10);
+    let box_height = if confirming { 7 } else { visible_items + 6 };
+    if height < box_height + 2 || box_width < MIN_SIDEBAR_WIDTH as usize {
+        return;
+    }
+    let start_y = (height - box_height) / 2;
+    let start_x = (width - box_width) / 2;
+    let inner_width = box_width - 2;
+    let border_color = if confirming {
+        palette.red
+    } else {
+        palette.blue
+    };
+
+    let framed = |content: &str, color: Rgb| {
+        let content = truncate_right(content, inner_width.saturating_sub(2));
+        let pad = inner_width.saturating_sub(content.width() + 1);
+        let mut line = StyledLine::blank();
+        line.push(" ".repeat(start_x), palette.white);
+        line.push("│", border_color);
+        line.push(" ", palette.white);
+        line.push(content, color);
+        line.push(" ".repeat(pad), palette.white);
+        line.push("│", border_color);
+        line
+    };
+    let border = |left: &str, right: &str| {
+        let mut line = StyledLine::blank();
+        line.push(" ".repeat(start_x), palette.white);
+        line.push(left, border_color);
+        line.push("─".repeat(inner_width), border_color);
+        line.push(right, border_color);
+        line
+    };
+
+    let title = if confirming {
+        format!("Close {} windows?", marked.len())
+    } else {
+        "Windows".to_string()
+    };
+    let mut rows = vec![
+        border("╭", "╮"),
+        framed(&title, border_color),
+        framed(session, palette.text),
+    ];
+
+    if confirming {
+        rows.push(framed("Processes in these windows will stop", palette.red));
+        rows.push(framed("enter close · esc back", palette.overlay0));
+        rows.push(framed("", palette.white));
+    } else if windows.is_empty() {
+        rows.push(framed("Loading windows…", palette.overlay0));
+    } else {
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(visible_items)
+            .min(windows.len().saturating_sub(visible_items));
+        for (index, window) in windows.iter().enumerate().skip(start).take(visible_items) {
+            let cursor = if index == selected { "›" } else { " " };
+            let state = if window.active {
+                "●"
+            } else if marked.contains(&window.id) {
+                "×"
+            } else {
+                " "
+            };
+            let processes = if window.pane_commands.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", window.pane_commands.join(", "))
+            };
+            let active = if window.active { "  current" } else { "" };
+            rows.push(framed(
+                &format!(
+                    "{cursor} {state} {} {}{processes}{active}",
+                    window.index, window.name
+                ),
+                if window.active {
+                    palette.green
+                } else if marked.contains(&window.id) {
+                    palette.red
+                } else {
+                    palette.subtext0
+                },
+            ));
+        }
+        rows.push(framed("enter switch · ← keep · → close", palette.overlay0));
+    }
+    rows.push(border("╰", "╯"));
+
+    for (offset, row) in rows.into_iter().enumerate() {
+        if let Some(target) = lines.get_mut(start_y + offset) {
+            *target = row;
+        }
     }
 }
 
@@ -1480,6 +1623,7 @@ fn render_theme_picker_overlay(
     height: usize,
     query: &str,
     selected: usize,
+    transparent_background: bool,
 ) {
     let box_width: usize = 28;
     let visible_items: usize = 12;
@@ -1553,11 +1697,48 @@ fn render_theme_picker_overlay(
     }
     row += 1;
 
-    // Blank separator
+    // Background mode
     let mut blank = StyledLine::blank();
     blank.push(" ".repeat(start_x), palette.white);
     blank.push("│", border_color);
-    blank.push(" ".repeat(inner_width), palette.white);
+    let background_label = " ‹ transparent · solid ›";
+    blank.push(
+        " ‹ ",
+        if transparent_background {
+            palette.blue
+        } else {
+            palette.overlay0
+        },
+    );
+    blank.push(
+        "transparent",
+        if transparent_background {
+            palette.text
+        } else {
+            palette.overlay0
+        },
+    );
+    blank.push(" · ", palette.overlay0);
+    blank.push(
+        "solid",
+        if transparent_background {
+            palette.overlay0
+        } else {
+            palette.text
+        },
+    );
+    blank.push(
+        " ›",
+        if transparent_background {
+            palette.overlay0
+        } else {
+            palette.blue
+        },
+    );
+    blank.push(
+        " ".repeat(inner_width.saturating_sub(background_label.width())),
+        palette.white,
+    );
     blank.push("│", border_color);
     if row < lines.len() {
         lines[row] = blank;
@@ -2026,6 +2207,8 @@ fn footer(palette: &Palette, width: usize) -> [StyledLine; 2] {
         (" width  ", palette.overlay1),
         ("d", palette.overlay0),
         (" hide  ", palette.overlay1),
+        ("W", palette.overlay0),
+        (" windows  ", palette.overlay1),
         ("x", palette.overlay0),
         (" kill", palette.overlay1),
     ];
@@ -2302,9 +2485,8 @@ impl CellStyle {
     }
 
     fn to_ratatui_style(self) -> Style {
-        Style::default()
-            .fg(self.fg.color())
-            .bg(self.bg.map_or(Color::Reset, Rgb::color))
+        let style = Style::default().fg(self.fg.color());
+        self.bg.map_or(style, |bg| style.bg(bg.color()))
     }
 }
 
@@ -2709,6 +2891,27 @@ const AURA: Palette = Palette {
     surface2: Rgb::new(45, 45, 45),
 };
 
+const ELECTRIC_FUSION: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(198, 116, 242),
+    lavender: Rgb::new(198, 116, 242),
+    pink: Rgb::new(198, 116, 242),
+    yellow: Rgb::new(220, 240, 149),
+    green: Rgb::new(173, 255, 188),
+    red: Rgb::new(194, 62, 105),
+    peach: Rgb::new(220, 240, 149),
+    teal: Rgb::new(173, 255, 188),
+    sky: Rgb::new(198, 116, 242),
+    text: Rgb::new(48, 38, 59),
+    subtext0: Rgb::new(85, 72, 91),
+    subtext1: Rgb::new(106, 89, 111),
+    overlay0: Rgb::new(139, 119, 143),
+    overlay1: Rgb::new(166, 145, 169),
+    surface1: Rgb::new(173, 255, 188),
+    surface2: Rgb::new(220, 240, 149),
+};
+
 const MATRIX: Palette = Palette {
     white: Rgb::new(255, 255, 255),
     black: Rgb::new(0, 0, 0),
@@ -2793,8 +2996,8 @@ pub const THEME_NAMES: &[&str] = &[
     "flexoki",
     "ayu",
     "aura",
+    "electric-fusion",
     "matrix",
-    "transparent",
     "shades-of-purple",
 ];
 
@@ -2819,11 +3022,47 @@ pub fn palette_for_theme(name: Option<&str>) -> Palette {
         Some("flexoki") => FLEXOKI,
         Some("ayu") => AYU,
         Some("aura") => AURA,
+        Some("electric-fusion") => ELECTRIC_FUSION,
         Some("matrix") => MATRIX,
         Some("transparent") => TRANSPARENT,
         Some("shades-of-purple") => SHADES_OF_PURPLE,
         _ => CATPPUCCIN_MOCHA,
     }
+}
+
+/// Preserve the original sidebar distinction between opaque themes and the
+/// themes that deliberately inherit the terminal background.
+fn background_for_theme(name: Option<&str>, transparent_background: bool) -> Option<Rgb> {
+    if transparent_background {
+        return None;
+    }
+    let background = match name {
+        Some("catppuccin-latte") => 0xdce0e8,
+        Some("catppuccin-frappe") => 0x232634,
+        Some("catppuccin-macchiato") => 0x181926,
+        Some("tokyo-night") => 0x13131a,
+        Some("gruvbox-dark") => 0x1b1b1b,
+        Some("nord") => 0x242933,
+        Some("dracula") => 0x191a21,
+        Some("github-dark") => 0x010409,
+        Some("one-dark") => 0x1b1f27,
+        Some("kanagawa") => 0x131320,
+        Some("everforest") => 0x232a2e,
+        Some("material") => 0x192227,
+        Some("cobalt2") => 0x0e1e2e,
+        Some("flexoki") => 0x0a0a09,
+        Some("ayu") => 0x070a0e,
+        Some("aura") => 0x0f0f0f,
+        Some("electric-fusion") => 0xf2eddd,
+        Some("matrix") => 0x050705,
+        Some("shades-of-purple") => 0x1e1e3f,
+        _ => 0x11111b,
+    };
+    Some(Rgb::new(
+        ((background >> 16) & 0xff) as u8,
+        ((background >> 8) & 0xff) as u8,
+        (background & 0xff) as u8,
+    ))
 }
 
 // Default foreground used for the screen-filling Block in `render_model`.
@@ -2833,7 +3072,10 @@ const WHITE: Rgb = Rgb::new(255, 255, 255);
 mod tests {
     use super::*;
     use crate::app::{App, KillTarget, Modal};
-    use crate::generated::protocol::{AgentEvent, ClientCommand, ServerState, SessionData};
+    use crate::generated::protocol::{
+        AgentEvent, ClientCommand, ServerState, SessionData, WindowData,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn agent(agent: &str, status: AgentStatus, thread_name: Option<&str>) -> AgentEvent {
         AgentEvent {
@@ -2848,6 +3090,44 @@ mod tests {
             pane_id: None,
             liveness: None,
         }
+    }
+
+    #[test]
+    fn electric_fusion_theme_uses_the_slack_palette() {
+        assert!(THEME_NAMES.contains(&"electric-fusion"));
+
+        let palette = palette_for_theme(Some("electric-fusion"));
+
+        assert_eq!(palette.yellow, Rgb::new(220, 240, 149));
+        assert_eq!(palette.green, Rgb::new(173, 255, 188));
+        assert_eq!(palette.blue, Rgb::new(198, 116, 242));
+        assert_eq!(palette.lavender, Rgb::new(198, 116, 242));
+        assert_eq!(
+            background_for_theme(Some("electric-fusion"), false),
+            Some(Rgb::new(242, 237, 221))
+        );
+    }
+
+    #[test]
+    fn transparent_theme_preserves_the_terminal_background() {
+        assert_eq!(background_for_theme(Some("electric-fusion"), true), None);
+        assert_eq!(CellStyle::fg(WHITE).to_ratatui_style().bg, None);
+    }
+
+    #[test]
+    fn opaque_theme_background_survives_line_rendering() {
+        let mut app = app_from_sessions(Vec::new());
+        app.theme = Some("electric-fusion".to_string());
+        app.transparent_background = false;
+        let model = build_model(&app, 40, 24);
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+
+        terminal.draw(|frame| render_model(frame, &model)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().bg,
+            Color::Rgb(242, 237, 221)
+        );
     }
 
     fn session(name: &str, dir: &str, branch: &str) -> SessionData {
@@ -2881,6 +3161,7 @@ mod tests {
             current_session: Some("opensessions".to_string()),
             visible_sidebar_pane_ids: Vec::new(),
             theme: None,
+            transparent_background: false,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
@@ -2944,6 +3225,7 @@ mod tests {
             current_session: Some("opensessions".to_string()),
             visible_sidebar_pane_ids: Vec::new(),
             theme: None,
+            transparent_background: false,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
@@ -2986,6 +3268,52 @@ mod tests {
             "long kill target should be visibly truncated inside narrow modal\n{}",
             lines.join("\n")
         );
+    }
+
+    #[test]
+    fn window_manager_overlay_shows_processes_marks_and_current_window() {
+        let mut app = app_from_sessions(vec![session("project", "/tmp/project", "main")]);
+        app.modal = Modal::WindowManager {
+            session: "project".to_string(),
+            windows: vec![
+                WindowData {
+                    id: "@1".to_string(),
+                    index: 0,
+                    name: "cvm".to_string(),
+                    active: true,
+                    pane_commands: vec!["amp".to_string()],
+                },
+                WindowData {
+                    id: "@2".to_string(),
+                    index: 1,
+                    name: "regression".to_string(),
+                    active: false,
+                    pane_commands: vec!["zsh".to_string()],
+                },
+            ],
+            selected: 1,
+            marked: HashSet::from(["@2".to_string()]),
+            confirming: false,
+        };
+
+        let lines = render_text(&app, 36, 24);
+
+        assert!(lines.iter().any(|line| line.contains("Windows")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("● 0 cvm") && line.contains("amp")),
+            "active window and process should be visible\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("› × 1 regression") && line.contains("zsh")),
+            "marked window and process should be visible\n{}",
+            lines.join("\n")
+        );
+        assert!(lines.iter().any(|line| line.contains("enter switch")));
     }
 
     #[test]
@@ -3205,6 +3533,7 @@ mod tests {
             current_session: None,
             visible_sidebar_pane_ids: Vec::new(),
             theme: None,
+            transparent_background: false,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
@@ -3414,6 +3743,7 @@ mod tests {
             current_session: None,
             visible_sidebar_pane_ids: Vec::new(),
             theme: None,
+            transparent_background: false,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,

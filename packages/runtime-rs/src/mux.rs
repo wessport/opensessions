@@ -19,6 +19,15 @@ pub struct ActiveWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxWindowInfo {
+    pub id: String,
+    pub index: u32,
+    pub name: String,
+    pub active: bool,
+    pub pane_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarPane {
     pub pane_id: String,
     pub session_name: String,
@@ -81,6 +90,9 @@ pub trait MuxProvider: Send + Sync {
     fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str);
     fn cleanup_hooks(&self);
     fn set_sidebar_width_hint(&self, _width: u16) {}
+    fn is_sidebar_mouse_resize_active(&self, _window_id: &str) -> bool {
+        false
+    }
 
     fn is_window_capable(&self) -> bool {
         false
@@ -101,6 +113,14 @@ pub trait MuxProvider: Send + Sync {
     fn list_active_windows(&self) -> Vec<ActiveWindow> {
         Vec::new()
     }
+
+    fn list_windows(&self, _session_name: &str) -> Vec<MuxWindowInfo> {
+        Vec::new()
+    }
+
+    fn switch_window(&self, _session_name: &str, _window_id: &str, _client_tty: Option<&str>) {}
+
+    fn kill_windows(&self, _session_name: &str, _window_ids: &[String]) {}
 
     fn get_current_window_id(&self) -> Option<String> {
         None

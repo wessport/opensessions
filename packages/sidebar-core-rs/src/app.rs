@@ -5,7 +5,7 @@ use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WI
 
 use crate::generated::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, ClientCommand, ServerMessage,
-    ServerState, SessionData, SessionFilterMode,
+    ServerState, SessionData, SessionFilterMode, WindowData,
 };
 use crate::renderer::{AgentPaneTarget, HitTarget, agent_focus_target};
 pub use crate::session_display::DisplaySessionEntry;
@@ -74,12 +74,20 @@ pub enum Modal {
         query: String,
         selected: usize,
         original_theme: Option<String>,
+        original_transparent_background: bool,
     },
     WidthSlider {
         draft_width: u16,
     },
     KillConfirm {
         target: KillTarget,
+    },
+    WindowManager {
+        session: String,
+        windows: Vec<WindowData>,
+        selected: usize,
+        marked: HashSet<String>,
+        confirming: bool,
     },
 }
 
@@ -93,6 +101,7 @@ pub struct App {
     pub init_label: Option<String>,
     pub sidebar_width: u16,
     pub theme: Option<String>,
+    pub transparent_background: bool,
     pub ts: u64,
     /// Locally-driven spinner clock in ms. Advances on every render tick
     /// (see `main.rs` event loop) so spinners animate even when no server
@@ -118,6 +127,7 @@ pub struct App {
     last_activated_session: Option<String>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
+    pending_theme_intent: Option<(String, bool)>,
     pending_sidebar_width_intent: Option<u16>,
     pending_detail_panel_height_intent: Option<usize>,
     pending_agent_panel_scope_intent: Option<AgentPanelScope>,
@@ -143,6 +153,7 @@ impl App {
             init_label: state.init_label,
             sidebar_width: state.sidebar_width.min(u16::MAX as u32) as u16,
             theme: state.theme,
+            transparent_background: state.transparent_background,
             ts: state.ts,
             spinner_now: 0,
             session_filter: state.session_filter.unwrap_or_default(),
@@ -166,6 +177,7 @@ impl App {
             last_activated_session: None,
             terminal_width: None,
             pane_identity: None,
+            pending_theme_intent: None,
             pending_sidebar_width_intent: None,
             pending_detail_panel_height_intent: None,
             pending_agent_panel_scope_intent: None,
@@ -254,7 +266,7 @@ impl App {
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
                 self.apply_server_sidebar_width(state.sidebar_width.min(u16::MAX as u32) as u16);
-                self.theme = state.theme;
+                self.apply_server_theme(state.theme, state.transparent_background);
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
                 self.apply_server_agent_panel_scope(state.agent_panel_scope);
@@ -303,6 +315,26 @@ impl App {
                         session_name: identity.session_name,
                         window_id: identity.window_id,
                     });
+                }
+            }
+            ServerMessage::WindowList {
+                session,
+                mut windows,
+            } => {
+                if let Modal::WindowManager {
+                    session: requested_session,
+                    windows: modal_windows,
+                    selected,
+                    marked,
+                    confirming,
+                } = &mut self.modal
+                    && *requested_session == session
+                {
+                    windows.sort_by_key(|window| window.index);
+                    *selected = windows.iter().position(|window| window.active).unwrap_or(0);
+                    *modal_windows = windows;
+                    marked.clear();
+                    *confirming = false;
                 }
             }
             ServerMessage::Hello(_) | ServerMessage::Quit => {}
@@ -549,6 +581,7 @@ impl App {
             }),
             't' => self.open_theme_picker(),
             'w' => self.open_width_slider(),
+            'W' => self.open_window_manager(),
             'f' => self.cycle_filter(),
             'a' => self.toggle_agent_panel_scope(),
             _ => {}
@@ -759,7 +792,12 @@ impl App {
     /// fresh `State` broadcast carrying the new theme name, which
     /// `apply_server_message` stores on `self.theme`.
     pub fn set_theme_request(&mut self, theme: String) {
-        self.commands.push(ClientCommand::SetTheme { theme });
+        self.theme = Some(theme.clone());
+        self.pending_theme_intent = Some((theme.clone(), self.transparent_background));
+        self.commands.push(ClientCommand::SetTheme {
+            theme,
+            transparent_background: self.transparent_background,
+        });
     }
 
     /// Arm a 150ms click-flash highlight on the given target. Mirrors the TS
@@ -792,19 +830,30 @@ impl App {
             query: String::new(),
             selected: 0,
             original_theme: self.theme.clone(),
+            original_transparent_background: self.transparent_background,
         };
     }
 
     pub fn close_theme_picker(&mut self) {
-        if let Modal::ThemePicker { original_theme, .. } = &self.modal {
+        if let Modal::ThemePicker {
+            original_theme,
+            original_transparent_background,
+            ..
+        } = &self.modal
+        {
             self.theme = original_theme.clone();
+            self.transparent_background = *original_transparent_background;
         }
         self.modal = Modal::None;
     }
 
+    pub fn set_transparent_background(&mut self, transparent: bool) {
+        self.transparent_background = transparent;
+    }
+
     pub fn confirm_theme_picker(&mut self) {
         if let Some(name) = self.theme.clone() {
-            self.commands.push(ClientCommand::SetTheme { theme: name });
+            self.set_theme_request(name);
         }
         self.modal = Modal::None;
     }
@@ -830,6 +879,109 @@ impl App {
         for name in self.kill_target_session_names(&target) {
             self.commands.push(ClientCommand::KillSession { name });
         }
+    }
+
+    pub fn open_window_manager(&mut self) {
+        let Some(session) = self.focused_session_name().map(str::to_string) else {
+            return;
+        };
+        self.modal = Modal::WindowManager {
+            session: session.clone(),
+            windows: Vec::new(),
+            selected: 0,
+            marked: HashSet::new(),
+            confirming: false,
+        };
+        self.commands
+            .push(ClientCommand::RequestWindows { session });
+    }
+
+    pub fn move_window_manager_selection(&mut self, delta: isize) {
+        let Modal::WindowManager {
+            windows,
+            selected,
+            confirming,
+            ..
+        } = &mut self.modal
+        else {
+            return;
+        };
+        if *confirming || windows.is_empty() {
+            return;
+        }
+        *selected = selected
+            .saturating_add_signed(delta)
+            .min(windows.len().saturating_sub(1));
+    }
+
+    pub fn set_selected_window_marked(&mut self, should_close: bool) {
+        let Modal::WindowManager {
+            windows,
+            selected,
+            marked,
+            confirming,
+            ..
+        } = &mut self.modal
+        else {
+            return;
+        };
+        if *confirming {
+            return;
+        }
+        let Some(window) = windows.get(*selected) else {
+            return;
+        };
+        if should_close && !window.active {
+            marked.insert(window.id.clone());
+        } else {
+            marked.remove(&window.id);
+        }
+    }
+
+    pub fn activate_or_advance_window_manager(&mut self) {
+        let Modal::WindowManager {
+            session,
+            windows,
+            selected,
+            marked,
+            confirming,
+            ..
+        } = &mut self.modal
+        else {
+            return;
+        };
+        if marked.is_empty() {
+            let Some(window) = windows.get(*selected) else {
+                return;
+            };
+            self.commands.push(ClientCommand::SwitchWindow {
+                session: session.clone(),
+                window_id: window.id.clone(),
+            });
+            self.modal = Modal::None;
+            return;
+        }
+        if !*confirming {
+            *confirming = true;
+            return;
+        }
+        let mut window_ids = marked.iter().cloned().collect::<Vec<_>>();
+        window_ids.sort();
+        self.commands.push(ClientCommand::KillWindows {
+            session: session.clone(),
+            window_ids,
+        });
+        self.modal = Modal::None;
+    }
+
+    pub fn back_or_close_window_manager(&mut self) {
+        if let Modal::WindowManager { confirming, .. } = &mut self.modal
+            && *confirming
+        {
+            *confirming = false;
+            return;
+        }
+        self.modal = Modal::None;
     }
 
     pub fn kill_confirm_copy(&self, target: &KillTarget) -> (String, String) {
@@ -919,6 +1071,24 @@ impl App {
         if let Modal::WidthSlider { draft_width } = &mut self.modal {
             *draft_width = server_width;
         }
+    }
+
+    fn apply_server_theme(&mut self, server_theme: Option<String>, transparent_background: bool) {
+        if matches!(&self.modal, Modal::ThemePicker { .. }) {
+            return;
+        }
+        if let Some((intent_theme, intent_background)) = self.pending_theme_intent.as_ref() {
+            if server_theme.as_deref() == Some(intent_theme.as_str())
+                && transparent_background == *intent_background
+            {
+                self.pending_theme_intent = None;
+                self.theme = server_theme;
+                self.transparent_background = transparent_background;
+            }
+            return;
+        }
+        self.theme = server_theme;
+        self.transparent_background = transparent_background;
     }
 
     fn apply_server_detail_panel_height(&mut self, server_height: usize) {
@@ -1339,6 +1509,7 @@ mod tests {
             current_session: None,
             visible_sidebar_pane_ids: Vec::new(),
             theme: None,
+            transparent_background: false,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
@@ -1348,6 +1519,43 @@ mod tests {
             collapsed_worktree_groups: Vec::new(),
             ts: 0,
         }
+    }
+
+    #[test]
+    fn theme_picker_preview_ignores_stale_server_theme_until_confirmation() {
+        let mut state = empty_state(10);
+        state.theme = Some("transparent".to_string());
+        let mut app = App::from_state(state);
+        app.open_theme_picker();
+        app.theme = Some("electric-fusion".to_string());
+
+        let mut stale = empty_state(10);
+        stale.theme = Some("transparent".to_string());
+        app.apply_server_message(ServerMessage::State(stale));
+
+        assert_eq!(app.theme.as_deref(), Some("electric-fusion"));
+        app.confirm_theme_picker();
+        assert!(matches!(
+            app.commands.as_slice(),
+            [ClientCommand::SetTheme {
+                theme,
+                transparent_background: false,
+            }] if theme == "electric-fusion"
+        ));
+
+        let mut stale = empty_state(10);
+        stale.theme = Some("transparent".to_string());
+        app.apply_server_message(ServerMessage::State(stale));
+        assert_eq!(app.theme.as_deref(), Some("electric-fusion"));
+
+        let mut acknowledged = empty_state(10);
+        acknowledged.theme = Some("electric-fusion".to_string());
+        app.apply_server_message(ServerMessage::State(acknowledged));
+
+        let mut later = empty_state(10);
+        later.theme = Some("transparent".to_string());
+        app.apply_server_message(ServerMessage::State(later));
+        assert_eq!(app.theme.as_deref(), Some("transparent"));
     }
 
     fn session(name: &str, dir: &str, is_worktree: bool) -> SessionData {

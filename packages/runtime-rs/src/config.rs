@@ -26,6 +26,8 @@ pub struct OpensessionsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_position: Option<SidebarPosition>,
@@ -94,6 +96,11 @@ fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
         );
     }
     insert_option(&mut map, "theme", updates.theme);
+    insert_option(
+        &mut map,
+        "transparentBackground",
+        updates.transparent_background,
+    );
     insert_option(&mut map, "sidebarWidth", updates.sidebar_width);
     insert_option(&mut map, "sidebarPosition", updates.sidebar_position);
     insert_option(&mut map, "keybinding", updates.keybinding);

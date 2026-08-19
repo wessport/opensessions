@@ -109,7 +109,20 @@ fn apply_modal_key(app: &mut App, key: UiKey) {
         Modal::ThemePicker { .. } => apply_theme_picker_key(app, key),
         Modal::WidthSlider { .. } => apply_width_slider_key(app, key),
         Modal::KillConfirm { .. } => apply_kill_confirm_key(app, key),
+        Modal::WindowManager { .. } => apply_window_manager_key(app, key),
         Modal::None => {}
+    }
+}
+
+fn apply_window_manager_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Up => app.move_window_manager_selection(-1),
+        UiKey::Down => app.move_window_manager_selection(1),
+        UiKey::Right => app.set_selected_window_marked(true),
+        UiKey::Left => app.set_selected_window_marked(false),
+        UiKey::Enter => app.activate_or_advance_window_manager(),
+        UiKey::Esc => app.back_or_close_window_manager(),
+        _ => {}
     }
 }
 
@@ -130,6 +143,8 @@ fn apply_theme_picker_key(app: &mut App, key: UiKey) {
         UiKey::Enter => {
             app.confirm_theme_picker();
         }
+        UiKey::Left => app.set_transparent_background(true),
+        UiKey::Right => app.set_transparent_background(false),
         UiKey::Up => {
             if let Modal::ThemePicker {
                 query, selected, ..
@@ -280,5 +295,181 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
         UiMouse::DragEnd => {
             app.resize_drag_state = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Modal;
+    use crate::generated::protocol::{
+        AgentPanelScope, ClientCommand, ServerMessage, ServerState, SessionData, WindowData,
+    };
+
+    fn app_with_windows() -> App {
+        let mut app = App::from_state(ServerState {
+            sessions: vec![SessionData {
+                name: "project".to_string(),
+                created_at: 0,
+                dir: "/tmp/project".to_string(),
+                branch: String::new(),
+                dirty: false,
+                changed_files: 0,
+                insertions: 0,
+                deletions: 0,
+                is_worktree: false,
+                unseen: false,
+                panes: 3,
+                ports: Vec::new(),
+                local_links: Vec::new(),
+                windows: 3,
+                uptime: String::new(),
+                agent_state: None,
+                agents: Vec::new(),
+                event_timestamps: Vec::new(),
+                metadata: None,
+            }],
+            focused_session: Some("project".to_string()),
+            current_session: Some("project".to_string()),
+            visible_sidebar_pane_ids: Vec::new(),
+            theme: None,
+            transparent_background: false,
+            session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
+            sidebar_width: 36,
+            detail_panel_height: 10,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 0,
+        });
+        apply_ui_key(&mut app, UiKey::Char('W'));
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::RequestWindows {
+                session: "project".to_string()
+            }]
+        );
+        app.apply_server_message(ServerMessage::WindowList {
+            session: "project".to_string(),
+            windows: vec![
+                WindowData {
+                    id: "@1".to_string(),
+                    index: 0,
+                    name: "active".to_string(),
+                    active: true,
+                    pane_commands: vec!["amp".to_string()],
+                },
+                WindowData {
+                    id: "@2".to_string(),
+                    index: 1,
+                    name: "regression".to_string(),
+                    active: false,
+                    pane_commands: vec!["zsh".to_string()],
+                },
+                WindowData {
+                    id: "@3".to_string(),
+                    index: 2,
+                    name: "ssh".to_string(),
+                    active: false,
+                    pane_commands: vec!["ssh".to_string()],
+                },
+            ],
+        });
+        app
+    }
+
+    #[test]
+    fn theme_picker_toggles_background_independently_from_palette() {
+        let mut app = app_with_windows();
+        app.theme = Some("electric-fusion".to_string());
+        app.open_theme_picker();
+
+        apply_ui_key(&mut app, UiKey::Left);
+        assert!(app.transparent_background);
+        apply_ui_key(&mut app, UiKey::Right);
+        assert!(!app.transparent_background);
+        apply_ui_key(&mut app, UiKey::Left);
+        apply_ui_key(&mut app, UiKey::Enter);
+
+        assert_eq!(app.theme.as_deref(), Some("electric-fusion"));
+        assert!(app.transparent_background);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetTheme {
+                theme: "electric-fusion".to_string(),
+                transparent_background: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn enter_switches_to_highlighted_window_when_nothing_is_marked() {
+        let mut app = app_with_windows();
+
+        apply_ui_key(&mut app, UiKey::Down);
+        apply_ui_key(&mut app, UiKey::Enter);
+
+        assert_eq!(app.modal, Modal::None);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchWindow {
+                session: "project".to_string(),
+                window_id: "@2".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn arrows_mark_only_inactive_windows_and_enter_requires_confirmation() {
+        let mut app = app_with_windows();
+
+        apply_ui_key(&mut app, UiKey::Right);
+        apply_ui_key(&mut app, UiKey::Down);
+        apply_ui_key(&mut app, UiKey::Right);
+        apply_ui_key(&mut app, UiKey::Down);
+        apply_ui_key(&mut app, UiKey::Right);
+        apply_ui_key(&mut app, UiKey::Enter);
+
+        assert!(matches!(
+            app.modal,
+            Modal::WindowManager {
+                confirming: true,
+                ref marked,
+                ..
+            } if marked.len() == 2 && !marked.contains("@1")
+        ));
+        assert!(app.drain_commands().is_empty());
+
+        apply_ui_key(&mut app, UiKey::Enter);
+
+        assert_eq!(app.modal, Modal::None);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::KillWindows {
+                session: "project".to_string(),
+                window_ids: vec!["@2".to_string(), "@3".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn escape_returns_from_confirmation_before_closing_window_manager() {
+        let mut app = app_with_windows();
+        apply_ui_key(&mut app, UiKey::Down);
+        apply_ui_key(&mut app, UiKey::Right);
+        apply_ui_key(&mut app, UiKey::Enter);
+
+        apply_ui_key(&mut app, UiKey::Esc);
+        assert!(matches!(
+            app.modal,
+            Modal::WindowManager {
+                confirming: false,
+                ..
+            }
+        ));
+
+        apply_ui_key(&mut app, UiKey::Esc);
+        assert_eq!(app.modal, Modal::None);
     }
 }
