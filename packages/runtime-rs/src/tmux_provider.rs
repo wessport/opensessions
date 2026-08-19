@@ -257,6 +257,10 @@ impl TmuxClient {
         ]);
     }
 
+    pub fn kill_window(&self, window_id: &str) {
+        self.run(&["kill-window", "-t", window_id]);
+    }
+
     pub fn kill_pane(&self, target: &str) {
         self.run(&["kill-pane", "-t", target]);
     }
@@ -772,10 +776,9 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn kill_windows(&self, session_name: &str, window_ids: &[String]) {
-        let windows = self
-            .client
-            .list_windows()
-            .into_iter()
+        let all_windows = self.client.list_windows();
+        let windows = all_windows
+            .iter()
             .filter(|window| window.session_name == session_name)
             .collect::<Vec<_>>();
         if !windows.iter().any(|window| window.active) {
@@ -784,7 +787,16 @@ impl MuxProvider for TmuxProvider {
         let requested = window_ids.iter().collect::<HashSet<_>>();
         for window in windows {
             if !window.active && requested.contains(&window.id) {
-                self.client.unlink_window(session_name, &window.id);
+                if all_windows
+                    .iter()
+                    .filter(|candidate| candidate.id == window.id)
+                    .count()
+                    > 1
+                {
+                    self.client.unlink_window(session_name, &window.id);
+                } else {
+                    self.client.kill_window(&window.id);
+                }
             }
         }
     }
@@ -1281,7 +1293,9 @@ mod tests {
                 Some("list-windows") => concat!(
                     "@1\t$1\tproject\t0\tcvm\t1\t2\n",
                     "@2\t$1\tproject\t1\tregression\t0\t2\n",
-                    "@3\t$2\tother\t0\tzsh\t1\t1"
+                    "@4\t$1\tproject\t2\tnotes\t0\t1\n",
+                    "@2\t$2\tother\t0\tshared-regression\t1\t2\n",
+                    "@3\t$2\tother\t1\tzsh\t0\t1"
                 ),
                 Some("list-panes") => concat!(
                     "%1\tproject\t@1\t0\t0\t1\t/dev/ttys1\t10\t/tmp\tamp\tAgent\t80\t24\t0\t79\n",
@@ -1424,13 +1438,25 @@ mod tests {
                     active: false,
                     pane_commands: vec!["zsh".to_string()],
                 },
+                MuxWindowInfo {
+                    id: "@4".to_string(),
+                    index: 2,
+                    name: "notes".to_string(),
+                    active: false,
+                    pane_commands: Vec::new(),
+                },
             ]
         );
 
         provider.switch_window("project", "@2", Some("/dev/ttys001"));
         provider.kill_windows(
             "project",
-            &["@1".to_string(), "@2".to_string(), "@3".to_string()],
+            &[
+                "@1".to_string(),
+                "@2".to_string(),
+                "@3".to_string(),
+                "@4".to_string(),
+            ],
         );
 
         let calls = runner.calls.lock().unwrap();
@@ -1449,9 +1475,16 @@ mod tests {
                 .iter()
                 .any(|call| call == &["unlink-window", "-t", "project:@2"])
         );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == &["kill-window", "-t", "@4"])
+        );
         assert!(!calls.iter().any(|call| {
-            call.first().map(String::as_str) == Some("unlink-window")
-                && call.last().map(String::as_str) != Some("project:@2")
+            matches!(
+                call.first().map(String::as_str),
+                Some("unlink-window" | "kill-window")
+            ) && !matches!(call.last().map(String::as_str), Some("project:@2" | "@4"))
         }));
     }
 

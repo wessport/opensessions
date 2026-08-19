@@ -303,7 +303,8 @@ impl App {
                     .unwrap_or(false);
                 if !from_this_pane
                     && self.confirmed_local_session_name() == Some(name.as_str())
-                    && previous_activated.as_deref() != Some(name.as_str())
+                    && (source_pane_id.is_some()
+                        || previous_activated.as_deref() != Some(name.as_str()))
                 {
                     self.confirm_local_session(name, true);
                 }
@@ -1519,6 +1520,37 @@ mod tests {
             collapsed_worktree_groups: Vec::new(),
             ts: 0,
         }
+    }
+
+    #[test]
+    fn repeated_switch_intent_rehomes_every_destination_sidebar() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("opensessions", "/tmp/opensessions", false),
+            session("effect-ts", "/tmp/effect-ts", false),
+        ];
+        state.current_session = Some("opensessions".to_string());
+        let mut app = App::from_state(state);
+        app.set_pane_identity(
+            "%destination".to_string(),
+            "opensessions".to_string(),
+            Some("@0".to_string()),
+        );
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "opensessions".to_string(),
+            source_pane_id: None,
+        });
+        app.sidebar_focus = Some(SidebarFocus::Session("effect-ts".to_string()));
+
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "opensessions".to_string(),
+            source_pane_id: Some("%source".to_string()),
+        });
+
+        assert_eq!(
+            app.sidebar_focus,
+            Some(SidebarFocus::Session("opensessions".to_string()))
+        );
     }
 
     #[test]

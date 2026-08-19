@@ -915,6 +915,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
+                self.ensure_sidebar_for_session(provider.as_ref(), name);
                 provider.switch_session(name, client_tty);
                 None
             }
@@ -1792,7 +1793,6 @@ impl ReadOnlyMuxStateSource {
 
     fn ensure_sidebar(&self, body: &str) -> bool {
         let context = parse_context(body);
-        let width = self.current_sidebar_width_u16();
         if !self.is_sidebar_visible() {
             debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
             return false;
@@ -1817,28 +1817,52 @@ impl ReadOnlyMuxStateSource {
             let (Some(session_name), Some(window_id)) = (session_name, window_id) else {
                 continue;
             };
-            if provider
-                .list_sidebar_panes(Some(&session_name))
-                .iter()
-                .any(|pane| pane.window_id == window_id)
-            {
-                continue;
-            }
-            let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
-            self.sidebar_coordinator
-                .lock()
-                .unwrap()
-                .begin_warmup_until(warmup_until);
-            provider.spawn_sidebar(
-                &session_name,
-                &window_id,
-                width,
-                SidebarPosition::Left,
-                SIDEBAR_SCRIPTS_DIR,
-            );
-            spawned = true;
+            spawned |= self.ensure_sidebar_in_window(provider.as_ref(), &session_name, &window_id);
         }
         spawned
+    }
+
+    fn ensure_sidebar_for_session(&self, provider: &dyn MuxProvider, session_name: &str) -> bool {
+        if !self.is_sidebar_visible() || !provider.is_full_sidebar_capable() {
+            return false;
+        }
+        let Some(window_id) = provider
+            .list_windows(session_name)
+            .into_iter()
+            .find(|window| window.active)
+            .map(|window| window.id)
+        else {
+            return false;
+        };
+        self.ensure_sidebar_in_window(provider, session_name, &window_id)
+    }
+
+    fn ensure_sidebar_in_window(
+        &self,
+        provider: &dyn MuxProvider,
+        session_name: &str,
+        window_id: &str,
+    ) -> bool {
+        if provider
+            .list_sidebar_panes(Some(session_name))
+            .iter()
+            .any(|pane| pane.window_id == window_id)
+        {
+            return false;
+        }
+        let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .begin_warmup_until(warmup_until);
+        provider.spawn_sidebar(
+            session_name,
+            window_id,
+            self.current_sidebar_width_u16(),
+            SidebarPosition::Left,
+            SIDEBAR_SCRIPTS_DIR,
+        );
+        true
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
@@ -1847,6 +1871,7 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
+        self.ensure_sidebar_for_session(provider.as_ref(), &name);
         provider.switch_session(&name, client_tty);
         None
     }
