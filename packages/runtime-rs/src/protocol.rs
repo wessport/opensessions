@@ -18,6 +18,10 @@ pub struct ProtocolHello {
 pub enum ServerMessage {
     Hello(ProtocolHello),
     State(ServerState),
+    WindowList {
+        session: String,
+        windows: Vec<WindowData>,
+    },
     Quit,
     YourSession {
         name: String,
@@ -41,6 +45,8 @@ pub struct ServerState {
     pub visible_sidebar_pane_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    #[serde(default)]
+    pub transparent_background: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
     #[serde(default)]
@@ -84,6 +90,16 @@ pub struct SessionData {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowData {
+    pub id: String,
+    pub index: u32,
+    pub name: String,
+    pub active: bool,
+    pub pane_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -259,6 +275,17 @@ pub enum ClientCommand {
     KillSession {
         name: String,
     },
+    RequestWindows {
+        session: String,
+    },
+    SwitchWindow {
+        session: String,
+        window_id: String,
+    },
+    KillWindows {
+        session: String,
+        window_ids: Vec<String>,
+    },
     ReorderSession {
         name: String,
         delta: i8,
@@ -279,6 +306,7 @@ pub enum ClientCommand {
     },
     SetTheme {
         theme: String,
+        transparent_background: bool,
     },
     SetSidebarWidth {
         width: u32,
@@ -323,4 +351,61 @@ pub enum ClientCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         pane_id: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn window_cleanup_messages_use_stable_window_ids() {
+        assert_eq!(
+            serde_json::to_value(ClientCommand::RequestWindows {
+                session: "project".to_string(),
+            })
+            .unwrap(),
+            json!({"type": "request-windows", "session": "project"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientCommand::SwitchWindow {
+                session: "project".to_string(),
+                window_id: "@2".to_string(),
+            })
+            .unwrap(),
+            json!({
+                "type": "switch-window",
+                "session": "project",
+                "windowId": "@2"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientCommand::KillWindows {
+                session: "project".to_string(),
+                window_ids: vec!["@2".to_string(), "@4".to_string()],
+            })
+            .unwrap(),
+            json!({
+                "type": "kill-windows",
+                "session": "project",
+                "windowIds": ["@2", "@4"]
+            })
+        );
+
+        let message = ServerMessage::WindowList {
+            session: "project".to_string(),
+            windows: vec![WindowData {
+                id: "@2".to_string(),
+                index: 1,
+                name: "regression".to_string(),
+                active: false,
+                pane_commands: vec!["zsh".to_string()],
+            }],
+        };
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&encoded).unwrap(),
+            message
+        );
+    }
 }

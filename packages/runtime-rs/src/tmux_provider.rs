@@ -3,11 +3,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::mux::{
-    ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
+    ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, MuxWindowInfo, SidebarPane,
+    SidebarPosition,
 };
 use crate::tmux_scripting::{
-    hook_context_format, http_hook_command, pane_died_hook_command, pane_exited_hook_command,
-    resized_pane_width_repair_command,
+    SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION, hook_context_format, http_hook_command,
+    pane_died_hook_command, pane_exited_hook_command, resized_pane_width_repair_command,
+    sidebar_mouse_resize_marker_script, sidebar_mouse_resize_report_script,
 };
 
 const SEP: &str = "\t";
@@ -247,6 +249,18 @@ impl TmuxClient {
         self.run(&["kill-session", "-t", target]);
     }
 
+    pub fn unlink_window(&self, session_name: &str, window_id: &str) {
+        self.run(&[
+            "unlink-window",
+            "-t",
+            &format!("{session_name}:{window_id}"),
+        ]);
+    }
+
+    pub fn kill_window(&self, window_id: &str) {
+        self.run(&["kill-window", "-t", window_id]);
+    }
+
     pub fn kill_pane(&self, target: &str) {
         self.run(&["kill-pane", "-t", target]);
     }
@@ -462,6 +476,58 @@ impl TmuxClient {
     pub fn unset_global_option(&self, name: &str) {
         self.run(&["set-option", "-gu", name]);
     }
+
+    pub fn setup_sidebar_mouse_resize_binding(&self, server_base: &str, token_file: &str) {
+        let current = self.run(&["list-keys", "-T", "root", "MouseDrag1Border"]);
+        let is_default = current.ok()
+            && current.stdout.ends_with("resize-pane -M")
+            && !current.stdout.contains("\\;");
+        let is_ours = current.stdout.contains(SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION)
+            && current.stdout.contains("/set-sidebar-width");
+        if !is_default && !is_ours {
+            return;
+        }
+
+        let args = vec![
+            "bind-key".to_string(),
+            "-T".to_string(),
+            "root".to_string(),
+            "MouseDrag1Border".to_string(),
+            "run-shell".to_string(),
+            sidebar_mouse_resize_marker_script(),
+            "\\;".to_string(),
+            "resize-pane".to_string(),
+            "-M".to_string(),
+            "\\;".to_string(),
+            "run-shell".to_string(),
+            "-b".to_string(),
+            sidebar_mouse_resize_report_script(server_base, token_file),
+        ];
+        let output = self.runner.run(&args);
+        if !output.ok() {
+            eprintln!(
+                "opensessions: failed to install tmux mouse resize binding: status={} stderr={}",
+                output.exit_code, output.stderr,
+            );
+        }
+    }
+
+    pub fn cleanup_sidebar_mouse_resize_binding(&self) {
+        let current = self.run(&["list-keys", "-T", "root", "MouseDrag1Border"]);
+        if current.stdout.contains(SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION)
+            && current.stdout.contains("/set-sidebar-width")
+        {
+            self.run(&[
+                "bind-key",
+                "-T",
+                "root",
+                "MouseDrag1Border",
+                "resize-pane",
+                "-M",
+            ]);
+        }
+        self.unset_global_option(SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION);
+    }
 }
 
 pub enum PaneScope<'a> {
@@ -592,11 +658,14 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("after-resize-pane", &resized_pane_width_repair_command());
         self.client
             .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
+        self.client
+            .setup_sidebar_mouse_resize_binding(&base, token_file);
         self.client.set_remain_on_exit_for_sidebar_windows(true);
     }
 
     fn cleanup_hooks(&self) {
         self.client.set_remain_on_exit_for_sidebar_windows(false);
+        self.client.cleanup_sidebar_mouse_resize_binding();
         for hook in [
             "client-session-changed",
             "after-select-pane",
@@ -619,6 +688,13 @@ impl MuxProvider for TmuxProvider {
     fn set_sidebar_width_hint(&self, width: u16) {
         self.client
             .set_global_option("@opensessions_width", &width.to_string());
+    }
+
+    fn is_sidebar_mouse_resize_active(&self, window_id: &str) -> bool {
+        self.client
+            .run(&["show-option", "-gqv", SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION])
+            .stdout
+            == window_id
     }
 
     fn is_window_capable(&self) -> bool {
@@ -656,6 +732,73 @@ impl MuxProvider for TmuxProvider {
         }
 
         windows
+    }
+
+    fn list_windows(&self, session_name: &str) -> Vec<MuxWindowInfo> {
+        let panes = self.client.list_panes(PaneScope::Session(session_name));
+        self.client
+            .list_windows()
+            .into_iter()
+            .filter(|window| window.session_name == session_name)
+            .map(|window| {
+                let mut pane_commands = panes
+                    .iter()
+                    .filter(|pane| {
+                        pane.window_id == window.id && pane.title != "opensessions-sidebar"
+                    })
+                    .map(|pane| pane.command.clone())
+                    .filter(|command| !command.is_empty())
+                    .collect::<Vec<_>>();
+                pane_commands.sort();
+                pane_commands.dedup();
+                MuxWindowInfo {
+                    id: window.id,
+                    index: window.index,
+                    name: window.name,
+                    active: window.active,
+                    pane_commands,
+                }
+            })
+            .collect()
+    }
+
+    fn switch_window(&self, session_name: &str, window_id: &str, client_tty: Option<&str>) {
+        let is_session_window = self
+            .client
+            .list_windows()
+            .iter()
+            .any(|window| window.session_name == session_name && window.id == window_id);
+        if !is_session_window {
+            return;
+        }
+        self.client.switch_client(session_name, client_tty);
+        self.client.select_window(window_id);
+    }
+
+    fn kill_windows(&self, session_name: &str, window_ids: &[String]) {
+        let all_windows = self.client.list_windows();
+        let windows = all_windows
+            .iter()
+            .filter(|window| window.session_name == session_name)
+            .collect::<Vec<_>>();
+        if !windows.iter().any(|window| window.active) {
+            return;
+        }
+        let requested = window_ids.iter().collect::<HashSet<_>>();
+        for window in windows {
+            if !window.active && requested.contains(&window.id) {
+                if all_windows
+                    .iter()
+                    .filter(|candidate| candidate.id == window.id)
+                    .count()
+                    > 1
+                {
+                    self.client.unlink_window(session_name, &window.id);
+                } else {
+                    self.client.kill_window(&window.id);
+                }
+            }
+        }
     }
 
     fn get_current_window_id(&self) -> Option<String> {
@@ -863,7 +1006,7 @@ impl MuxProvider for TmuxProvider {
 
     fn spawn_sidebar(
         &self,
-        _session_name: &str,
+        session_name: &str,
         window_id: &str,
         width: u16,
         position: SidebarPosition,
@@ -879,8 +1022,10 @@ impl MuxProvider for TmuxProvider {
         // workspace (e.g. tmux sessions whose default cwd is `$HOME`). Falls
         // back to the literal path if the env is unset.
         let command = format!(
-            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={window_id} REFOCUS_WINDOW={window_id} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
-            target.session_name,
+            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={} REFOCUS_WINDOW={} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
+            shell_quote(session_name),
+            shell_quote(window_id),
+            shell_quote(window_id),
         );
         let new_pane = self.client.split_sidebar_pane(
             &target.id,
@@ -1109,6 +1254,64 @@ mod tests {
         calls: Mutex<Vec<Vec<String>>>,
     }
 
+    #[derive(Default)]
+    struct WindowRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    struct MouseBindingRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+        binding: String,
+    }
+
+    impl MouseBindingRunner {
+        fn new(binding: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                binding: binding.to_string(),
+            }
+        }
+    }
+
+    impl CommandRunner for MouseBindingRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            CommandOutput {
+                exit_code: 0,
+                stdout: (args.first().map(String::as_str) == Some("list-keys"))
+                    .then(|| self.binding.clone())
+                    .unwrap_or_default(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    impl CommandRunner for WindowRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            let stdout = match args.first().map(String::as_str) {
+                Some("list-windows") => concat!(
+                    "@1\t$1\tproject\t0\tcvm\t1\t2\n",
+                    "@2\t$1\tproject\t1\tregression\t0\t2\n",
+                    "@4\t$1\tproject\t2\tnotes\t0\t1\n",
+                    "@2\t$2\tother\t0\tshared-regression\t1\t2\n",
+                    "@3\t$2\tother\t1\tzsh\t0\t1"
+                ),
+                Some("list-panes") => concat!(
+                    "%1\tproject\t@1\t0\t0\t1\t/dev/ttys1\t10\t/tmp\tamp\tAgent\t80\t24\t0\t79\n",
+                    "%2\tproject\t@1\t0\t1\t0\t/dev/ttys2\t11\t/tmp\tbun\topensessions-sidebar\t36\t24\t0\t35\n",
+                    "%3\tproject\t@2\t1\t0\t1\t/dev/ttys3\t12\t/tmp\tzsh\tzsh\t80\t24\t0\t79"
+                ),
+                _ => "",
+            };
+            CommandOutput {
+                exit_code: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            }
+        }
+    }
+
     impl CommandRunner for VisibilityRunner {
         fn run(&self, args: &[String]) -> CommandOutput {
             self.calls.lock().unwrap().push(args.to_vec());
@@ -1166,6 +1369,123 @@ mod tests {
                 "#{pane_id}".to_string(),
             ]],
         );
+    }
+
+    #[test]
+    fn default_mouse_border_drag_reports_explicit_sidebar_width_intent() {
+        let runner = Arc::new(MouseBindingRunner::new(
+            "bind-key -T root MouseDrag1Border resize-pane -M",
+        ));
+        let client = TmuxClient::new(runner.clone());
+
+        client
+            .setup_sidebar_mouse_resize_binding("http://127.0.0.1:1234", "/tmp/opensessions.token");
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let binding = &calls[1];
+        assert_eq!(
+            &binding[..6],
+            [
+                "bind-key",
+                "-T",
+                "root",
+                "MouseDrag1Border",
+                "run-shell",
+                "tmux -S #{socket_path} set-option -gq @opensessions_mouse_resize_window '#{mouse_window}'",
+            ]
+        );
+        assert!(binding.contains(&"resize-pane".to_string()));
+        assert!(binding.contains(&"-M".to_string()));
+        assert!(binding.last().is_some_and(|script| {
+            script.contains("-X POST http://127.0.0.1:1234/set-sidebar-width")
+                && script.contains("-d \"$width\"")
+        }));
+    }
+
+    #[test]
+    fn custom_mouse_border_binding_is_not_overridden() {
+        let runner = Arc::new(MouseBindingRunner::new(
+            "bind-key -T root MouseDrag1Border display-message custom",
+        ));
+        let client = TmuxClient::new(runner.clone());
+
+        client
+            .setup_sidebar_mouse_resize_binding("http://127.0.0.1:1234", "/tmp/opensessions.token");
+
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn window_manager_switches_by_stable_id_and_never_kills_active_window() {
+        let runner = Arc::new(WindowRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert_eq!(
+            provider.list_windows("project"),
+            vec![
+                MuxWindowInfo {
+                    id: "@1".to_string(),
+                    index: 0,
+                    name: "cvm".to_string(),
+                    active: true,
+                    pane_commands: vec!["amp".to_string()],
+                },
+                MuxWindowInfo {
+                    id: "@2".to_string(),
+                    index: 1,
+                    name: "regression".to_string(),
+                    active: false,
+                    pane_commands: vec!["zsh".to_string()],
+                },
+                MuxWindowInfo {
+                    id: "@4".to_string(),
+                    index: 2,
+                    name: "notes".to_string(),
+                    active: false,
+                    pane_commands: Vec::new(),
+                },
+            ]
+        );
+
+        provider.switch_window("project", "@2", Some("/dev/ttys001"));
+        provider.kill_windows(
+            "project",
+            &[
+                "@1".to_string(),
+                "@2".to_string(),
+                "@3".to_string(),
+                "@4".to_string(),
+            ],
+        );
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| { call == &["switch-client", "-c", "/dev/ttys001", "-t", "project",] })
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == &["select-window", "-t", "@2"])
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == &["unlink-window", "-t", "project:@2"])
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == &["kill-window", "-t", "@4"])
+        );
+        assert!(!calls.iter().any(|call| {
+            matches!(
+                call.first().map(String::as_str),
+                Some("unlink-window" | "kill-window")
+            ) && !matches!(call.last().map(String::as_str), Some("project:@2" | "@4"))
+        }));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,10 +15,10 @@ use std::time::{Instant, SystemTime};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
-    AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl,
-    codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
-    droid_snapshot_from_jsonl, opencode_snapshot_from_row, parse_codex_session_index,
-    pi_snapshot_from_jsonl,
+    AgentWatcherSnapshot, amp_snapshot_from_log_jsonl, amp_snapshot_from_thread_json,
+    claude_code_snapshot_from_jsonl, codex_snapshot_from_jsonl, codex_thread_id_from_path,
+    decode_claude_project_dir, droid_snapshot_from_jsonl, opencode_snapshot_from_row,
+    parse_codex_session_index, pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::config::{
     OpensessionsConfig, load_config_from_home, save_config_to_home,
@@ -33,7 +33,7 @@ use opensessions_runtime::project_dir_session::{
 };
 use opensessions_runtime::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
-    SessionFilterMode,
+    SessionFilterMode, WindowData,
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
@@ -47,7 +47,7 @@ use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
@@ -76,6 +76,7 @@ const SIDEBAR_LIFECYCLE_POLL_MS: u64 = 500;
 const SIDEBAR_WIDTH_REPAIR_SETTLE_MS: u64 = 50;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
+const AMP_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
 const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
@@ -392,6 +393,7 @@ pub struct ReadOnlyMuxStateSource {
     focused_pane_by_session: Mutex<HashMap<String, String>>,
     focused_client_tty: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
+    transparent_background: Mutex<bool>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
     session_order: Mutex<SessionOrder>,
@@ -416,6 +418,25 @@ pub fn default_state_source_from_env(
             .map(|home| load_config_from_home(&home));
         if let Some(width) = config.as_ref().and_then(|config| config.sidebar_width) {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
+        }
+        if let Some(theme) = config
+            .as_ref()
+            .and_then(|config| config.theme.as_ref())
+            .and_then(Value::as_str)
+        {
+            if theme == "transparent" {
+                source = source
+                    .with_theme("catppuccin-mocha")
+                    .with_transparent_background(true);
+            } else {
+                source = source.with_theme(theme);
+            }
+        }
+        if let Some(transparent) = config
+            .as_ref()
+            .and_then(|config| config.transparent_background)
+        {
+            source = source.with_transparent_background(transparent);
         }
         if let Some(height) = config.and_then(|config| config.detail_panel_height) {
             source = source.with_detail_panel_height(height);
@@ -442,6 +463,7 @@ impl ReadOnlyMuxStateSource {
             focused_pane_by_session: Mutex::new(HashMap::new()),
             focused_client_tty: Mutex::new(None),
             theme: Mutex::new(None),
+            transparent_background: Mutex::new(false),
             session_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
             session_order: Mutex::new(SessionOrder::new(None)),
@@ -460,6 +482,16 @@ impl ReadOnlyMuxStateSource {
 
     pub fn with_detail_panel_height(mut self, height: u16) -> Self {
         self.detail_panel_height = Mutex::new(clamp_detail_panel_height(height));
+        self
+    }
+
+    pub fn with_theme(mut self, theme: impl Into<String>) -> Self {
+        self.theme = Mutex::new(Some(theme.into()));
+        self
+    }
+
+    pub fn with_transparent_background(mut self, transparent: bool) -> Self {
+        self.transparent_background = Mutex::new(transparent);
         self
     }
 
@@ -518,6 +550,19 @@ impl ReadOnlyMuxStateSource {
         }
     }
 
+    fn set_sidebar_width(&self, width: u16) {
+        let width = clamp_sidebar_width(width);
+        self.persist_sidebar_width(width);
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .set_width(u32::from(width));
+        for provider in &self.providers {
+            provider.set_sidebar_width_hint(width);
+        }
+        self.request_sidebar_width_repair();
+    }
+
     fn persist_detail_panel_height(&self, height: u16) {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             debug_log("set-detail-panel-height: skipped config save because HOME is unset");
@@ -533,6 +578,23 @@ impl ReadOnlyMuxStateSource {
             debug_log(format!(
                 "set-detail-panel-height: failed to save detailPanelHeight={height}: {err}"
             ));
+        }
+    }
+
+    fn persist_theme(&self, theme: &str, transparent_background: bool) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            debug_log("set-theme: skipped config save because HOME is unset");
+            return;
+        };
+        if let Err(err) = save_config_to_home(
+            &home,
+            OpensessionsConfig {
+                theme: Some(Value::String(theme.to_string())),
+                transparent_background: Some(transparent_background),
+                ..OpensessionsConfig::default()
+            },
+        ) {
+            debug_log(format!("set-theme: failed to save config: {err}"));
         }
     }
 
@@ -804,6 +866,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             current_session_override: None,
             visible_sidebar_pane_ids,
             theme: self.theme.lock().unwrap().clone(),
+            transparent_background: *self.transparent_background.lock().unwrap(),
             session_filter: *self.session_filter.lock().unwrap(),
             agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
             collapsed_worktree_groups: self
@@ -852,6 +915,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
+                self.ensure_sidebar_for_session(provider.as_ref(), name);
                 provider.switch_session(name, client_tty);
                 None
             }
@@ -871,6 +935,25 @@ impl StateSource for ReadOnlyMuxStateSource {
                 }
                 provider.kill_session(name);
                 Some(self.snapshot_json())
+            }
+            "kill-windows" => {
+                let session = command.get("session")?.as_str()?;
+                let window_ids = command
+                    .get("windowIds")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                provider.kill_windows(session, &window_ids);
+                Some(self.snapshot_json())
+            }
+            "switch-window" => {
+                let session = command.get("session")?.as_str()?;
+                let window_id = command.get("windowId")?.as_str()?;
+                let client_tty = context.and_then(|context| context.client_tty.as_deref());
+                provider.switch_window(session, window_id, client_tty);
+                None
             }
             "hide-session" => {
                 let name = command.get("name")?.as_str()?;
@@ -899,21 +982,18 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
-                *self.theme.lock().unwrap() = Some(theme);
+                let transparent_background = command
+                    .get("transparentBackground")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                *self.theme.lock().unwrap() = Some(theme.clone());
+                *self.transparent_background.lock().unwrap() = transparent_background;
+                self.persist_theme(&theme, transparent_background);
                 Some(self.snapshot_json())
             }
             "set-sidebar-width" => {
                 let width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
-                let width = clamp_sidebar_width(width);
-                self.persist_sidebar_width(width);
-                self.sidebar_coordinator
-                    .lock()
-                    .unwrap()
-                    .set_width(u32::from(width));
-                for provider in &self.providers {
-                    provider.set_sidebar_width_hint(width);
-                }
-                self.request_sidebar_width_repair();
+                self.set_sidebar_width(width);
                 Some(self.snapshot_json())
             }
             "set-detail-panel-height" => {
@@ -1006,6 +1086,27 @@ impl StateSource for ReadOnlyMuxStateSource {
         command: &Value,
         context: &mut ClientConnectionContext,
     ) -> Option<String> {
+        if command.get("type").and_then(Value::as_str)? == "request-windows" {
+            let session = command.get("session")?.as_str()?;
+            let windows = self
+                .providers
+                .first()?
+                .list_windows(session)
+                .into_iter()
+                .map(|window| WindowData {
+                    id: window.id,
+                    index: window.index,
+                    name: window.name,
+                    active: window.active,
+                    pane_commands: window.pane_commands,
+                })
+                .collect();
+            return serde_json::to_string(&ServerMessage::WindowList {
+                session: session.to_string(),
+                windows,
+            })
+            .ok();
+        }
         if command.get("type").and_then(Value::as_str)? != "identify-pane" {
             return None;
         }
@@ -1189,6 +1290,11 @@ impl StateSource for ReadOnlyMuxStateSource {
                     self.request_sidebar_width_repair();
                 }
                 None
+            }
+            "/set-sidebar-width" => {
+                let width = body.trim().parse::<u16>().ok()?;
+                self.set_sidebar_width(width);
+                Some(self.snapshot_json())
             }
             _ => None,
         }
@@ -1439,6 +1545,14 @@ impl ReadOnlyMuxStateSource {
         context: Option<&ClientConnectionContext>,
         width: u16,
     ) -> bool {
+        let window_id = context.and_then(|context| context.window_id.as_deref());
+        if window_id.is_some_and(|window_id| {
+            self.providers
+                .iter()
+                .any(|provider| provider.is_sidebar_mouse_resize_active(window_id))
+        }) {
+            return true;
+        }
         let Some(pane_id) = context.and_then(|context| context.pane_id.as_deref()) else {
             return false;
         };
@@ -1533,11 +1647,16 @@ impl ReadOnlyMuxStateSource {
         let session_names = visible_session_names
             .map(|names| names.to_vec())
             .unwrap_or_else(|| self.sorted_session_names());
-        if let Some(cached) = self.port_snapshot_cache.lock().unwrap().clone()
+        // Keep cache lookup and refresh under one lock. Initial websocket
+        // connections arrive in a burst when the sidebar opens in many
+        // windows; without single-flight ownership every connection can miss
+        // the empty cache and launch its own ps/lsof discovery.
+        let mut cache = self.port_snapshot_cache.lock().unwrap();
+        if let Some(cached) = cache.as_ref()
             && cached.session_names == session_names
             && !force_refresh
         {
-            return Some(cached.ports_by_session);
+            return Some(cached.ports_by_session.clone());
         }
 
         if session_names.is_empty() {
@@ -1574,13 +1693,10 @@ impl ReadOnlyMuxStateSource {
                 lsof_fields: &lsof_fields,
             })
         };
-        self.port_snapshot_cache
-            .lock()
-            .unwrap()
-            .replace(CachedPortSnapshot {
-                session_names,
-                ports_by_session: ports_by_session.clone(),
-            });
+        cache.replace(CachedPortSnapshot {
+            session_names,
+            ports_by_session: ports_by_session.clone(),
+        });
         Some(ports_by_session)
     }
 
@@ -1677,7 +1793,6 @@ impl ReadOnlyMuxStateSource {
 
     fn ensure_sidebar(&self, body: &str) -> bool {
         let context = parse_context(body);
-        let width = self.current_sidebar_width_u16();
         if !self.is_sidebar_visible() {
             debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
             return false;
@@ -1702,28 +1817,52 @@ impl ReadOnlyMuxStateSource {
             let (Some(session_name), Some(window_id)) = (session_name, window_id) else {
                 continue;
             };
-            if provider
-                .list_sidebar_panes(Some(&session_name))
-                .iter()
-                .any(|pane| pane.window_id == window_id)
-            {
-                continue;
-            }
-            let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
-            self.sidebar_coordinator
-                .lock()
-                .unwrap()
-                .begin_warmup_until(warmup_until);
-            provider.spawn_sidebar(
-                &session_name,
-                &window_id,
-                width,
-                SidebarPosition::Left,
-                SIDEBAR_SCRIPTS_DIR,
-            );
-            spawned = true;
+            spawned |= self.ensure_sidebar_in_window(provider.as_ref(), &session_name, &window_id);
         }
         spawned
+    }
+
+    fn ensure_sidebar_for_session(&self, provider: &dyn MuxProvider, session_name: &str) -> bool {
+        if !self.is_sidebar_visible() || !provider.is_full_sidebar_capable() {
+            return false;
+        }
+        let Some(window_id) = provider
+            .list_windows(session_name)
+            .into_iter()
+            .find(|window| window.active)
+            .map(|window| window.id)
+        else {
+            return false;
+        };
+        self.ensure_sidebar_in_window(provider, session_name, &window_id)
+    }
+
+    fn ensure_sidebar_in_window(
+        &self,
+        provider: &dyn MuxProvider,
+        session_name: &str,
+        window_id: &str,
+    ) -> bool {
+        if provider
+            .list_sidebar_panes(Some(session_name))
+            .iter()
+            .any(|pane| pane.window_id == window_id)
+        {
+            return false;
+        }
+        let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .begin_warmup_until(warmup_until);
+        provider.spawn_sidebar(
+            session_name,
+            window_id,
+            self.current_sidebar_width_u16(),
+            SidebarPosition::Left,
+            SIDEBAR_SCRIPTS_DIR,
+        );
+        true
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
@@ -1732,6 +1871,7 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
+        self.ensure_sidebar_for_session(provider.as_ref(), &name);
         provider.switch_session(&name, client_tty);
         None
     }
@@ -1820,7 +1960,12 @@ async fn run_sidebar_lifecycle_loop(
                 };
                 if changed {
                     debug_log("sidebar_lifecycle_loop: lifecycle changed, broadcasting fresh state");
-                    let _ = state_updates.send(source.snapshot_json());
+                    let snapshot_source = source.clone();
+                    if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
+                        snapshot_source.snapshot_json()
+                    }).await {
+                        let _ = state_updates.send(snapshot);
+                    }
                 }
             }
         }
@@ -2014,7 +2159,12 @@ async fn run_tmux_state_poll_loop(
                 last_fingerprint = Some(fingerprint);
                 unchanged_polls = 0;
                 debug_log("tmux_state_poll_loop: state changed, broadcasting");
-                let _ = state_updates.send(source.snapshot_json());
+                let snapshot_source = source.clone();
+                if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
+                    snapshot_source.snapshot_json()
+                }).await {
+                    let _ = state_updates.send(snapshot);
+                }
             }
         }
     }
@@ -2063,7 +2213,12 @@ async fn run_agent_watcher_loop(
                             "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
                         ));
                         last_seen.insert(key, fingerprint);
-                        let _ = state_updates.send(source.snapshot_json());
+                        let snapshot_source = source.clone();
+                        if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
+                            snapshot_source.snapshot_json()
+                        }).await {
+                            let _ = state_updates.send(snapshot);
+                        }
                         changed = true;
                     } else {
                         debug_log(format!(
@@ -2119,6 +2274,7 @@ fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
     };
 
     scan_amp_threads(&home, now_ms, &mut snapshots);
+    scan_amp_logs(&home, now_ms, &mut snapshots);
     scan_claude_code_projects(&home, now_ms, &mut snapshots);
     scan_codex_sessions(&home, now_ms, &mut snapshots);
     scan_opencode_sessions(&home, now_ms, &mut snapshots);
@@ -2151,6 +2307,55 @@ fn scan_amp_threads(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSn
             snapshots.push(snapshot);
         }
     }
+}
+
+fn scan_amp_logs(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+    let logs_dir = home.join(".cache/amp/logs/threads");
+    let Ok(entries) = fs::read_dir(logs_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        let Some(mtime_ms) = file_mtime_ms(&path) else {
+            continue;
+        };
+        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
+            continue;
+        }
+        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(raw) = read_file_tail(&path, AMP_LOG_TAIL_BYTES) else {
+            continue;
+        };
+        let Some(snapshot) = amp_snapshot_from_log_jsonl(thread_id, &raw, mtime_ms) else {
+            continue;
+        };
+        if let Some(existing) = snapshots.iter_mut().find(|existing| {
+            existing.agent == "amp" && existing.thread_id.as_deref() == Some(thread_id)
+        }) {
+            if snapshot.ts > existing.ts {
+                *existing = snapshot;
+            }
+        } else {
+            snapshots.push(snapshot);
+        }
+    }
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > max_bytes {
+        file.seek(SeekFrom::Start(len - max_bytes)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn scan_claude_code_projects(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
@@ -2761,6 +2966,7 @@ async fn run_accept_loop(
     auth_token: String,
 ) -> Result<(), ServerError> {
     let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let state_operation_lock = Arc::new(AsyncMutex::new(()));
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -2778,6 +2984,7 @@ async fn run_accept_loop(
                 let connection_state_updates = state_updates.clone();
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 let connection_auth_token = auth_token.clone();
+                let connection_state_operation_lock = Arc::clone(&state_operation_lock);
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let _ = handle_connection(
@@ -2787,6 +2994,7 @@ async fn run_accept_loop(
                         connection_state_updates,
                         connection_shutdown_announcement,
                         connection_auth_token,
+                        connection_state_operation_lock,
                     )
                     .await;
                 });
@@ -2819,6 +3027,28 @@ fn request_shutdown(
     let _ = shutdown.send(());
 }
 
+async fn run_state_source_blocking<R, F>(
+    state_source: &Option<Arc<dyn StateSource>>,
+    state_operation_lock: &AsyncMutex<()>,
+    operation: F,
+) -> Result<Option<R>, ServerError>
+where
+    R: Send + 'static,
+    F: FnOnce(&dyn StateSource) -> R + Send + 'static,
+{
+    let Some(state_source) = state_source.clone() else {
+        return Ok(None);
+    };
+    // StateSource was intentionally synchronous and connection handling used
+    // to serialize its tmux mutations on the runtime thread. Preserve that
+    // ordering while moving the work itself to the blocking pool.
+    let _operation_guard = state_operation_lock.lock().await;
+    tokio::task::spawn_blocking(move || operation(state_source.as_ref()))
+        .await
+        .map(Some)
+        .map_err(ServerError::from)
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: broadcast::Sender<()>,
@@ -2826,6 +3056,7 @@ async fn handle_connection(
     state_updates: broadcast::Sender<String>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
+    state_operation_lock: Arc<AsyncMutex<()>>,
 ) -> Result<(), ServerError> {
     let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
         .await
@@ -2865,8 +3096,14 @@ async fn handle_connection(
     }
 
     if parsed.method == "POST" && parsed.path == "/refresh" {
-        if let Some(state_source) = &state_source {
-            let _ = state_updates.send(state_source.snapshot_json());
+        if let Some(snapshot) = run_state_source_blocking(
+            &state_source,
+            &state_operation_lock,
+            StateSource::snapshot_json,
+        )
+        .await?
+        {
+            let _ = state_updates.send(snapshot);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -2876,10 +3113,13 @@ async fn handle_connection(
     }
 
     if parsed.method == "POST" && parsed.path == "/focus" {
-        let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(payload) = state_source
-            .as_ref()
-            .and_then(|state_source| state_source.handle_http_text(&parsed.path, &body))
+        let path = parsed.path.clone();
+        let body = String::from_utf8_lossy(http_body(&request)).into_owned();
+        if let Some(Some(payload)) =
+            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+                source.handle_http_text(&path, &body)
+            })
+            .await?
         {
             let _ = state_updates.send(payload);
         }
@@ -2901,10 +3141,11 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(state_source) = &state_source {
-            let _ = state_source.handle_switch_index(index, &body);
-        }
+        let body = String::from_utf8_lossy(http_body(&request)).into_owned();
+        let _ = run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+            source.handle_switch_index(index, &body)
+        })
+        .await?;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             .await?;
@@ -2913,11 +3154,15 @@ async fn handle_connection(
     }
 
     if parsed.method == "POST" && is_ok_hook_path(&parsed.path) {
-        let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(state_source) = &state_source {
-            if let Some(payload) = state_source.handle_http_hook(&parsed.path, &body) {
-                let _ = state_updates.send(payload);
-            }
+        let path = parsed.path.clone();
+        let body = String::from_utf8_lossy(http_body(&request)).into_owned();
+        if let Some(Some(payload)) =
+            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+                source.handle_http_hook(&path, &body)
+            })
+            .await?
+        {
+            let _ = state_updates.send(payload);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -2934,11 +3179,13 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        match state_source
-            .as_ref()
-            .ok_or(AgentEventError::CouldNotResolveSession)
-            .and_then(|state_source| state_source.handle_agent_event_json(&body))
-        {
+        let result =
+            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+                source.handle_agent_event_json(&body)
+            })
+            .await?
+            .unwrap_or(Err(AgentEventError::CouldNotResolveSession));
+        match result {
             Ok(payload) => {
                 let _ = state_updates.send(payload);
                 stream
@@ -2970,8 +3217,11 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source
-            && let Err(err) = state_source.handle_pi_runtime_upsert(&body)
+        if let Some(Err(err)) =
+            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+                source.handle_pi_runtime_upsert(&body)
+            })
+            .await?
         {
             let body = err.body();
             stream
@@ -3001,8 +3251,11 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source
-            && let Err(err) = state_source.handle_pi_runtime_delete(&body)
+        if let Some(Err(err)) =
+            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+                source.handle_pi_runtime_delete(&body)
+            })
+            .await?
         {
             let body = err.body();
             stream
@@ -3033,9 +3286,12 @@ async fn handle_connection(
             write_http_response(&mut stream, "400 Bad Request", "missing session").await?;
             return Ok(());
         }
-        let Some(payload) = state_source
-            .as_ref()
-            .and_then(|state_source| state_source.handle_http_json(&parsed.path, &body))
+        let path = parsed.path.clone();
+        let Some(Some(payload)) =
+            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+                source.handle_http_json(&path, &body)
+            })
+            .await?
         else {
             write_http_response(&mut stream, "400 Bad Request", "invalid payload").await?;
             return Ok(());
@@ -3084,10 +3340,14 @@ async fn handle_connection(
         let mut websocket = ServerBuilder::new().serve(stream);
         debug_log("ws: client connected, sending hello + initial state");
         websocket.send(Message::text(HELLO_JSON)).await?;
-        if let Some(state_source) = &state_source {
-            websocket
-                .send(Message::text(state_source.snapshot_json()))
-                .await?;
+        if let Some(snapshot) = run_state_source_blocking(
+            &state_source,
+            &state_operation_lock,
+            StateSource::snapshot_json,
+        )
+        .await?
+        {
+            websocket.send(Message::text(snapshot)).await?;
         }
 
         let mut connection_shutdown = shutdown.subscribe();
@@ -3119,16 +3379,34 @@ async fn handle_connection(
                                 return Ok(());
                             }
                             if is_command_type(&message, "refresh")
-                                && let Some(state_source) = &state_source
+                                && let Some(snapshot) = run_state_source_blocking(
+                                    &state_source,
+                                    &state_operation_lock,
+                                    StateSource::snapshot_json,
+                                ).await?
                             {
-                                let _ = state_updates.send(state_source.snapshot_json());
+                                let _ = state_updates.send(snapshot);
                             }
                             if let Some(command) = parse_command(&message) {
-                                if let Some(reply) = state_source
-                                    .as_ref()
-                                    .and_then(|state_source| state_source.handle_sender_command_with_context(&command, &mut client_context))
+                                let sender_command = command.clone();
+                                let sender_context = client_context.clone();
+                                if let Some((reply, updated_context)) = run_state_source_blocking(
+                                    &state_source,
+                                    &state_operation_lock,
+                                    move |source| {
+                                        let mut context = sender_context;
+                                        let reply = source.handle_sender_command_with_context(
+                                            &sender_command,
+                                            &mut context,
+                                        );
+                                        (reply, context)
+                                    },
+                                ).await?
                                 {
-                                    websocket.send(Message::text(reply)).await?;
+                                    client_context = updated_context;
+                                    if let Some(reply) = reply {
+                                        websocket.send(Message::text(reply)).await?;
+                                    }
                                 }
                                 if let Some(name) = switch_session_target(&command) {
                                     let _ = state_updates.send(activate_session_json(
@@ -3137,9 +3415,16 @@ async fn handle_connection(
                                     ));
                                     tokio::task::yield_now().await;
                                 }
-                                if let Some(payload) = state_source
-                                    .as_ref()
-                                    .and_then(|state_source| state_source.handle_client_command_with_context(&command, Some(&client_context)))
+                                let command_for_handler = command.clone();
+                                let context_for_handler = client_context.clone();
+                                if let Some(Some(payload)) = run_state_source_blocking(
+                                    &state_source,
+                                    &state_operation_lock,
+                                    move |source| source.handle_client_command_with_context(
+                                        &command_for_handler,
+                                        Some(&context_for_handler),
+                                    ),
+                                ).await?
                                 {
                                     if is_client_view_command(&command) {
                                         websocket.send(Message::text(payload)).await?;
@@ -3333,7 +3618,12 @@ fn is_metadata_path(path: &str) -> bool {
 fn is_ok_hook_path(path: &str) -> bool {
     matches!(
         path,
-        "/pane-exited" | "/pane-layout-changed" | "/client-resized" | "/ensure-sidebar" | "/toggle"
+        "/pane-exited"
+            | "/pane-layout-changed"
+            | "/client-resized"
+            | "/ensure-sidebar"
+            | "/set-sidebar-width"
+            | "/toggle"
     )
 }
 
@@ -3418,6 +3708,160 @@ mod tests {
     static NEXT_SERVER_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
+    fn state_source_loads_persisted_theme() {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-theme-config-test-{}-{}",
+            process::id(),
+            NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let config_dir = home.join(".config/opensessions");
+        fs::create_dir_all(&config_dir).expect("create config directory");
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"theme":"electric-fusion","transparentBackground":true}"#,
+        )
+        .expect("write config");
+
+        let source = default_state_source_from_env(|key| match key {
+            "TMUX" => Some("/tmp/opensessions-theme-test,1,1".to_string()),
+            "HOME" => Some(home.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .expect("tmux state source");
+
+        assert_eq!(
+            source.theme.lock().unwrap().as_deref(),
+            Some("electric-fusion")
+        );
+        assert!(*source.transparent_background.lock().unwrap());
+        fs::remove_dir_all(home).expect("remove config directory");
+    }
+
+    #[test]
+    fn legacy_transparent_theme_becomes_a_background_option() {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-transparent-theme-config-test-{}-{}",
+            process::id(),
+            NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let config_dir = home.join(".config/opensessions");
+        fs::create_dir_all(&config_dir).expect("create config directory");
+        fs::write(config_dir.join("config.json"), r#"{"theme":"transparent"}"#)
+            .expect("write config");
+
+        let source = default_state_source_from_env(|key| match key {
+            "TMUX" => Some("/tmp/opensessions-transparent-theme-test,1,1".to_string()),
+            "HOME" => Some(home.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .expect("tmux state source");
+
+        assert_eq!(
+            source.theme.lock().unwrap().as_deref(),
+            Some("catppuccin-mocha")
+        );
+        assert!(*source.transparent_background.lock().unwrap());
+        fs::remove_dir_all(home).expect("remove config directory");
+    }
+
+    #[test]
+    fn amp_log_scanner_reads_current_cloud_thread_logs() {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-amp-log-test-{}-{}",
+            process::id(),
+            NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let logs = home.join(".cache/amp/logs/threads");
+        fs::create_dir_all(&logs).expect("create Amp log directory");
+        fs::write(
+            logs.join("T-current.log"),
+            r#"{"message":"onToolLease","data":{"args":{"workdir":"/repo"}}}
+{"type":"agent_state","direction":"receive","subtype":"idle"}
+"#,
+        )
+        .expect("write Amp log");
+
+        let mut snapshots = Vec::new();
+        scan_amp_logs(&home, current_time_ms(), &mut snapshots);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].thread_id.as_deref(), Some("T-current"));
+        assert_eq!(snapshots[0].project_dir.as_deref(), Some("/repo"));
+        assert_eq!(snapshots[0].status, AgentStatus::Done);
+        fs::remove_dir_all(home).expect("remove Amp log directory");
+    }
+
+    #[derive(Clone)]
+    struct SlowSnapshotSource {
+        snapshot_count: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl StateSource for SlowSnapshotSource {
+        fn snapshot_json(&self) -> String {
+            self.snapshot_count.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            "{}".to_string()
+        }
+    }
+
+    struct PortTestProvider;
+
+    impl MuxProvider for PortTestProvider {
+        fn name(&self) -> &str {
+            "port-test"
+        }
+
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            vec![opensessions_runtime::mux::MuxSessionInfo {
+                name: "session".to_string(),
+                created_at: 0,
+                dir: String::new(),
+                windows: 1,
+            }]
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("session".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_session_pane_pids(&self, _name: &str) -> Vec<u32> {
+            vec![10]
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    struct CountingPortRunner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PortCommandRunner for CountingPortRunner {
+        fn process_rows(&self) -> Vec<(u32, u32)> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(25));
+            vec![(10, 1)]
+        }
+
+        fn lsof_fields(&self) -> String {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(25));
+            "p10\nn8080\n".to_string()
+        }
+    }
+
+    #[test]
     fn idle_polling_backs_off_and_resets_after_activity() {
         assert_eq!(adaptive_poll_delay_ms(0, 2_000, 30_000), 2_000);
         assert_eq!(adaptive_poll_delay_ms(1, 2_000, 30_000), 4_000);
@@ -3428,6 +3872,37 @@ mod tests {
         assert!(agent_status_needs_fast_polling(AgentStatus::Waiting));
         assert!(!agent_status_needs_fast_polling(AgentStatus::Done));
         assert!(!agent_status_needs_fast_polling(AgentStatus::Stale));
+    }
+
+    #[test]
+    fn concurrent_port_snapshots_share_one_discovery() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(
+            ReadOnlyMuxStateSource::new(vec![Arc::new(PortTestProvider)]).with_port_command_runner(
+                Arc::new(CountingPortRunner {
+                    calls: Arc::clone(&calls),
+                }),
+            ),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let source = Arc::clone(&source);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    source.discover_live_ports(Some(&["session".to_string()]), false)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            assert_eq!(
+                worker.join().expect("port discovery worker"),
+                Some(HashMap::from([("session".to_string(), Vec::new())]))
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     async fn send_raw_request(request: &[u8]) -> Vec<u8> {
@@ -3505,6 +3980,54 @@ mod tests {
             result.expect("read response");
         }
         response
+    }
+
+    #[tokio::test]
+    async fn slow_state_snapshot_does_not_block_server_liveness() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-slow-snapshot-{}-{id}", process::id()));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(SlowSnapshotSource {
+                    snapshot_count: Arc::clone(&snapshot_count),
+                    delay: Duration::from_millis(300),
+                }),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let addr = server.addr();
+        let started = Instant::now();
+        let refresh = tokio::spawn(request_at(
+            addr,
+            format!(
+                "POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+                token.trim()
+            ),
+        ));
+
+        while snapshot_count.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the runtime was blocked by synchronous snapshot work"
+        );
+
+        let liveness = request_at(
+            addr,
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+        )
+        .await;
+        assert!(liveness.starts_with(b"HTTP/1.1 200 OK"));
+
+        let _ = refresh.await;
+        server.shutdown().await.expect("stop server");
     }
 
     #[tokio::test]

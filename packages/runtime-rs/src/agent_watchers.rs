@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::agent_parsers::{
     determine_amp_message_status, determine_claude_code_status, determine_codex_status,
-    determine_opencode_status,
+    determine_opencode_status, map_amp_state,
 };
 use crate::protocol::AgentStatus;
 
@@ -48,6 +48,43 @@ pub fn amp_snapshot_from_thread_json(raw: &str, ts: u64) -> Option<AgentWatcherS
         last_user_prompt,
         project_dir,
         status,
+        ts,
+    })
+}
+
+pub fn amp_snapshot_from_log_jsonl(
+    thread_id: &str,
+    raw: &str,
+    ts: u64,
+) -> Option<AgentWatcherSnapshot> {
+    let mut project_dir = None;
+    let mut status = None;
+
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(workdir) = entry.pointer("/data/args/workdir").and_then(Value::as_str) {
+            project_dir = Some(workdir.to_string());
+        }
+        if entry.get("type").and_then(Value::as_str) == Some("agent_state")
+            && entry.get("direction").and_then(Value::as_str) == Some("receive")
+            && let Some(next_status) = entry
+                .get("subtype")
+                .and_then(Value::as_str)
+                .and_then(map_amp_state)
+        {
+            status = Some(next_status);
+        }
+    }
+
+    Some(AgentWatcherSnapshot {
+        agent: "amp",
+        thread_id: Some(thread_id.to_string()),
+        thread_name: None,
+        last_user_prompt: None,
+        project_dir,
+        status: status?,
         ts,
     })
 }
@@ -708,6 +745,26 @@ fn is_uuid(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amp_log_snapshot_reads_project_and_latest_agent_status() {
+        let running = r#"
+{"type":"agent_state","direction":"receive","subtype":"streaming","threadId":"thread"}
+{"message":"onToolLease","data":{"args":{"workdir":"/repo"}},"threadId":"thread"}
+{"type":"agent_state","direction":"receive","subtype":"running_tools","threadId":"thread"}
+"#;
+        let snapshot = amp_snapshot_from_log_jsonl("thread", running, 1_000).expect("snapshot");
+        assert_eq!(snapshot.thread_id.as_deref(), Some("thread"));
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo"));
+        assert_eq!(snapshot.status, AgentStatus::Running);
+
+        let done = format!(
+            "{running}{{\"type\":\"agent_state\",\"direction\":\"receive\",\"subtype\":\"idle\",\"threadId\":\"thread\"}}\n"
+        );
+        let snapshot = amp_snapshot_from_log_jsonl("thread", &done, 2_000).expect("snapshot");
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo"));
+        assert_eq!(snapshot.status, AgentStatus::Done);
+    }
 
     #[test]
     fn claude_code_snapshot_tracks_latest_real_user_prompt() {
