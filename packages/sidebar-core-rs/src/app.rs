@@ -128,6 +128,7 @@ pub struct App {
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
     pending_theme_intent: Option<(String, bool)>,
+    client_tty: Option<String>,
     pending_sidebar_width_intent: Option<u16>,
     pending_detail_panel_height_intent: Option<usize>,
     pending_agent_panel_scope_intent: Option<AgentPanelScope>,
@@ -178,6 +179,7 @@ impl App {
             terminal_width: None,
             pane_identity: None,
             pending_theme_intent: None,
+            client_tty: None,
             pending_sidebar_width_intent: None,
             pending_detail_panel_height_intent: None,
             pending_agent_panel_scope_intent: None,
@@ -284,7 +286,8 @@ impl App {
                 self.clear_background_pending_switch(server_current.as_deref());
                 self.clamp_session_scroll_offset(0);
             }
-            ServerMessage::YourSession { name, .. } => {
+            ServerMessage::YourSession { name, client_tty } => {
+                self.client_tty = client_tty;
                 self.confirm_local_session(name, true);
             }
             ServerMessage::ActivateSession {
@@ -878,7 +881,10 @@ impl App {
         };
         self.modal = Modal::None;
         for name in self.kill_target_session_names(&target) {
-            self.commands.push(ClientCommand::KillSession { name });
+            self.commands.push(ClientCommand::KillSession {
+                name,
+                client_tty: self.client_tty.clone(),
+            });
         }
     }
 
@@ -1794,6 +1800,28 @@ mod tests {
     }
 
     #[test]
+    fn kill_session_routes_the_command_to_the_identified_tmux_client() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("feature-a", "/repo/feature-a", false)];
+        let mut app = App::from_state(state);
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "feature-a".to_string(),
+            client_tty: Some("/dev/ttys025".to_string()),
+        });
+
+        app.handle_key_char('x');
+        app.confirm_kill_target();
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::KillSession {
+                name: "feature-a".to_string(),
+                client_tty: Some("/dev/ttys025".to_string()),
+            }]
+        );
+    }
+
+    #[test]
     fn confirming_worktree_group_kill_resolves_current_group_members() {
         let mut state = empty_state(10);
         state.sessions = vec![
@@ -1812,13 +1840,16 @@ mod tests {
             app.drain_commands(),
             vec![
                 ClientCommand::KillSession {
-                    name: "feature-a".to_string()
+                    name: "feature-a".to_string(),
+                    client_tty: None,
                 },
                 ClientCommand::KillSession {
-                    name: "feature-b".to_string()
+                    name: "feature-b".to_string(),
+                    client_tty: None,
                 },
                 ClientCommand::KillSession {
-                    name: "feature-c".to_string()
+                    name: "feature-c".to_string(),
+                    client_tty: None,
                 },
             ]
         );

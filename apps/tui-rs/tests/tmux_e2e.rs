@@ -107,6 +107,142 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
 }
 
 #[test]
+fn tmux_sidebar_concurrent_ensure_keeps_one_sidebar_per_window() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-concurrent-ensure");
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let port = lab.port.to_string();
+    let pid_file = lab.root.join("server.pid");
+    lab.tmux_ok([
+        "set-environment",
+        "-g",
+        "OPENSESSIONS_DIR",
+        workspace_root.to_str().unwrap(),
+    ]);
+    lab.tmux_ok(["set-environment", "-g", "OPENSESSIONS_PORT", &port]);
+    lab.tmux_ok([
+        "set-environment",
+        "-g",
+        "OPENSESSIONS_PID_FILE",
+        pid_file.to_str().unwrap(),
+    ]);
+
+    lab.tmux_ok([
+        "new-session",
+        "-d",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "-s",
+        "on-demand",
+        "sh",
+    ]);
+    let window_id = lab.tmux(["display-message", "-p", "-t", "on-demand", "#{window_id}"]);
+    let pane_id = lab.tmux(["display-message", "-p", "-t", "on-demand", "#{pane_id}"]);
+    let context = format!("|on-demand|{window_id}|{pane_id}|1");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(12));
+    let token = lab.auth_token();
+    let requests = (0..12)
+        .map(|_| {
+            let start = start.clone();
+            let context = context.clone();
+            let token = token.clone();
+            let port = lab.port;
+            std::thread::spawn(move || {
+                start.wait();
+                post_body(port, "/ensure-sidebar", "text/plain", &context, &token);
+            })
+        })
+        .collect::<Vec<_>>();
+    for request in requests {
+        request.join().expect("join concurrent ensure request");
+    }
+
+    let sidebars = lab
+        .tmux([
+            "list-panes",
+            "-t",
+            "on-demand",
+            "-F",
+            "#{pane_id}\t#{pane_title}",
+        ])
+        .lines()
+        .filter(|line| line.ends_with("\topensessions-sidebar"))
+        .count();
+    assert_eq!(
+        sidebars,
+        1,
+        "concurrent ensure requests must not create duplicate sidebars in {window_id}\n{}",
+        lab.tmux([
+            "list-panes",
+            "-t",
+            "on-demand",
+            "-F",
+            "#{pane_id} #{pane_title} #{pane_start_command}",
+        ]),
+    );
+}
+
+#[test]
+fn tmux_sidebars_are_ready_before_switching_across_many_background_sessions() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-background-session-ready");
+    lab.wait_for_sidebar_mode("ready");
+    let snapshots_before = lab.debug_log_occurrences("snapshot_json mode=");
+    let background_sessions = (0..14)
+        .map(|index| format!("background-ready-{index}"))
+        .collect::<Vec<_>>();
+    for session in &background_sessions {
+        lab.tmux_ok([
+            "new-session",
+            "-d",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            "-s",
+            session,
+            "sh",
+        ]);
+    }
+
+    let sidebars = background_sessions
+        .iter()
+        .map(|session| {
+            let sidebar = lab.wait_for_sidebar_pane(session);
+            lab.wait_for_capture_pane(&sidebar, |text| text.contains("sessions"));
+            (session, sidebar)
+        })
+        .collect::<Vec<_>>();
+    let snapshots_during_warmup = lab
+        .debug_log_occurrences("snapshot_json mode=")
+        .saturating_sub(snapshots_before);
+    assert!(
+        snapshots_during_warmup <= background_sessions.len(),
+        "background sidebar warmup recomputed {snapshots_during_warmup} snapshots for {} new sessions",
+        background_sessions.len(),
+    );
+    let (target, sidebar) = sidebars.last().expect("background target");
+    lab.tmux_ok(["switch-client", "-t", target]);
+    lab.wait_for_client_session(target);
+
+    assert_eq!(
+        lab.sidebar_pane(target),
+        *sidebar,
+        "session switching must reuse the pre-spawned sidebar"
+    );
+    assert_eq!(
+        lab.sidebar_panes()
+            .iter()
+            .filter(|pane| pane.session == target.as_str())
+            .count(),
+        1,
+        "new background session must have exactly one sidebar"
+    );
+}
+
+#[test]
 fn tmux_sidebar_x_on_expanded_worktree_child_opens_child_kill_confirm() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-worktree-child-kill");
@@ -145,6 +281,17 @@ fn tmux_sidebar_x_on_active_worktree_child_kills_that_child_after_confirm() {
     let lab = started_lab("opensessions-e2e-active-worktree-child-kill");
 
     let source = lab.sidebar_pane("os-demo-feat-agent-panel");
+    let session_names = lab.session_names();
+    let target_index = session_names
+        .iter()
+        .position(|name| name == "os-demo-feat-agent-panel")
+        .expect("active worktree child should be present");
+    let expected_fallback = target_index
+        .checked_sub(1)
+        .and_then(|index| session_names.get(index))
+        .or_else(|| session_names.get(target_index + 1))
+        .cloned()
+        .expect("active worktree child should have a fallback session");
     lab.tmux_ok(["switch-client", "-t", "os-demo-feat-agent-panel"]);
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     lab.wait_for_client_session("os-demo-feat-agent-panel");
@@ -159,6 +306,7 @@ fn tmux_sidebar_x_on_active_worktree_child_kills_that_child_after_confirm() {
 
     lab.send_sidebar_key(&source, "y");
     lab.wait_for_session_absent("os-demo-feat-agent-panel");
+    lab.wait_for_client_session(&expected_fallback);
 }
 
 #[test]
@@ -233,44 +381,29 @@ fn tmux_sidebar_click_spawns_live_sidebar_for_session_with_spaces() {
 }
 
 #[test]
-fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
+fn tmux_sidebar_reorders_worktree_group_as_block() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-reorder-worktree-group");
-    let source = lab.sidebar_pane("opensessions");
-    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
-    lab.wait_for_capture_pane(&source, |text| {
-        row_with(text, "os-demo-worktrees").is_some()
-            && row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
-    });
+    let initial_order = lab.session_names();
+    let first = position(&initial_order, "os-demo-feat-agent-panel")
+        .expect("first worktree session should be present");
+    let second = position(&initial_order, "os-demo-preview")
+        .expect("second worktree session should be present");
+    assert_eq!(
+        second,
+        first + 1,
+        "worktree sessions should begin as one contiguous block: {initial_order:?}"
+    );
+    assert!(first > 0, "worktree block must have a preceding block");
+    let mut expected_up = initial_order.clone();
+    let members = expected_up.drain(first..=second).collect::<Vec<_>>();
+    expected_up.splice(first - 1..first - 1, members);
 
-    lab.click_session_row(&source, "os-demo-worktrees");
-    lab.wait_for_capture_pane(&source, |text| {
-        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
-    });
-    lab.send_sidebar_key(&source, "M-Up");
-    lab.wait_for_session_order(|names| {
-        position(names, "os-demo-feat-agent-panel").is_some_and(|first| {
-            position(names, "os-demo-preview").is_some_and(|second| {
-                position(names, "opensessions")
-                    .is_some_and(|opensessions| first + 1 == second && second < opensessions)
-            })
-        })
-    });
+    lab.reorder_worktree_group(-1);
+    lab.wait_for_session_order(|names| names == expected_up);
 
-    lab.click_session_row(&source, "os-demo-worktrees");
-    lab.wait_for_capture_pane(&source, |text| {
-        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
-    });
-    lab.send_sidebar_key(&source, "M-Down");
-    lab.wait_for_session_order(|names| {
-        position(names, "opensessions").is_some_and(|opensessions| {
-            position(names, "os-demo-feat-agent-panel").is_some_and(|first| {
-                position(names, "os-demo-preview")
-                    .is_some_and(|second| opensessions < first && first + 1 == second)
-            })
-        })
-    });
+    lab.reorder_worktree_group(1);
+    lab.wait_for_session_order(|names| names == initial_order);
 }
 
 #[test]
@@ -563,42 +696,42 @@ fn tmux_sidebar_width_slider_and_mouse_drag_are_width_authors() {
     let mut lab = started_lab("opensessions-e2e-width-slider");
     let source = lab.sidebar_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     lab.wait_for_all_sidebar_widths(36);
+    lab.wait_for_capture_pane(&source, |text| text.contains("sessions"));
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
+    lab.send_sidebar_key(&source, "w");
     lab.wait_for_capture_pane(&source, |text| text.contains("Sidebar width"));
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Right"]);
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Right"]);
+    lab.send_sidebar_key(&source, "Right");
+    lab.send_sidebar_key(&source, "Right");
     lab.wait_for_all_sidebar_widths(38);
     assert_eq!(
         lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
         "38"
     );
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+    lab.send_sidebar_key(&source, "Enter");
 
     lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "50"]);
     lab.wait_for_all_sidebar_widths(38);
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
+    lab.send_sidebar_key(&source, "w");
     lab.wait_for_capture_pane(&source, |text| text.contains("Sidebar width"));
     for _ in 0..4 {
-        lab.tmux_ok(["send-keys", "-t", source.as_str(), "H"]);
+        lab.send_sidebar_key(&source, "H");
     }
     lab.wait_for_all_sidebar_widths(20);
     assert_eq!(
         lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
         "20"
     );
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+    lab.send_sidebar_key(&source, "Enter");
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
+    lab.send_sidebar_key(&source, "w");
     lab.wait_for_capture_pane(&source, |text| {
         text.contains("Sidebar width") && text.contains("20 columns")
     });
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Right"]);
+    lab.send_sidebar_key(&source, "Right");
     lab.wait_for_all_sidebar_widths(21);
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Esc"]);
+    lab.send_sidebar_key(&source, "Esc");
 
     lab.wait_for_config_sidebar_width(21);
 
@@ -663,9 +796,9 @@ fn tmux_sidebar_quit_closes_the_server_and_every_sidebar_client() {
     let mut lab = started_lab("opensessions-e2e-quit");
     let source = lab.sidebar_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("sessions"));
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "q"]);
+    lab.send_sidebar_key(&source, "q");
 
     lab.wait_for_server_exit();
     lab.wait_for_no_sidebar_processes();
@@ -715,6 +848,11 @@ fn tmux_sidebar_multiple_clients_keep_independent_active_rows() {
     lab.wait_for_capture_pane(&effect_pane, |capture| {
         row_with(capture, "effect-ts").is_some_and(|row| row.contains("▌"))
     });
+    let opensessions = lab.capture_pane(&opensessions_pane);
+    let effect = lab.capture_pane(&effect_pane);
+
+    assert_active_row(&opensessions, "opensessions");
+    assert_active_row(&effect, "effect-ts");
 }
 
 #[test]
@@ -1238,6 +1376,13 @@ fn post_body(port: u16, path: &str, content_type: &str, body: &str, token: &str)
     );
 }
 
+fn assert_active_row(capture: &str, session: &str) {
+    assert!(
+        row_with(capture, session).is_some_and(|row| row.contains("▌")),
+        "expected {session} to be the active row; got:\n{capture}",
+    );
+}
+
 fn free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("bind ephemeral e2e port")
@@ -1371,6 +1516,25 @@ impl Lab {
             ]);
         }
 
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        self.tmux_ok([
+            "set-environment",
+            "-g",
+            "OPENSESSIONS_DIR",
+            workspace_root.to_str().unwrap(),
+        ]);
+        self.tmux_ok([
+            "set-environment",
+            "-g",
+            "OPENSESSIONS_PORT",
+            &self.port.to_string(),
+        ]);
+        self.tmux_ok([
+            "set-environment",
+            "-g",
+            "OPENSESSIONS_PID_FILE",
+            self.root.join("server.pid").to_str().unwrap(),
+        ]);
         self.spawn_attached_client_for("opensessions");
         self.wait_for_client_session("opensessions");
         self.tmux_ok([
@@ -1485,45 +1649,9 @@ for _ in range(3000):
     }
 
     fn spawn_sidebars(&self) {
-        let sidebar = self.sidebar_bin();
-        for session in SIDEBAR_SESSIONS {
-            let command = format!(
-                "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_TOKEN_FILE={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
-                self.port,
-                shell_quote(&self.token_file().to_string_lossy()),
-                shell_quote(&self.root.join("debug.log").to_string_lossy()),
-                sidebar.display(),
-                shell_quote(
-                    &self
-                        .root
-                        .join(format!("sidebar-{session}.stderr.log"))
-                        .to_string_lossy()
-                ),
-            );
-            let pane = self.tmux([
-                "split-window",
-                "-h",
-                "-b",
-                "-l",
-                W,
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-t",
-                *session,
-                &command,
-            ]);
-            self.tmux_ok([
-                "select-pane",
-                "-t",
-                pane.as_str(),
-                "-T",
-                "opensessions-sidebar",
-            ]);
-        }
-        for session in SIDEBAR_SESSIONS {
-            self.wait_for_text(session, "sessions");
-        }
+        post_hook(self.port, "/toggle", &self.auth_token());
+        self.wait_for_sidebar_pane_count(SIDEBAR_SESSIONS.len());
+        self.wait_for_sidebar_connections();
     }
 
     fn spawn_window_with_sidebar(&self, session: &str, window_name: &str) -> String {
@@ -1934,7 +2062,6 @@ for _ in range(3000):
     }
 
     fn send_sidebar_key(&self, pane: &str, key: &str) {
-        self.tmux_ok(["select-pane", "-t", pane]);
         self.tmux_ok(["send-keys", "-t", pane, key]);
         sleep(Duration::from_millis(100));
     }
@@ -2011,6 +2138,43 @@ for _ in range(3000):
         });
     }
 
+    fn reorder_worktree_group(&self, delta: i8) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws_path_with_token(
+                "127.0.0.1",
+                self.port,
+                "/",
+                &self.auth_token(),
+            )
+            .await
+            .expect("connect worktree reorder ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let _ = ws
+                .next()
+                .await
+                .expect("read ws initial state")
+                .expect("ws initial state");
+            let command = serde_json::json!({
+                "type": "reorder-worktree-group",
+                "key": fs::canonicalize(self.root.join("os-demo-worktrees"))
+                    .expect("canonicalize worktree group path")
+                    .to_string_lossy(),
+                "delta": delta,
+            });
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send reorder-worktree-group command");
+            ws.close().await.expect("close worktree reorder ws client");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+    }
+
     fn wait_for_session_order<F>(&self, predicate: F)
     where
         F: Fn(&[String]) -> bool,
@@ -2064,6 +2228,64 @@ for _ in range(3000):
         })
     }
 
+    fn wait_for_sidebar_mode(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let log = fs::read_to_string(self.root.join("debug.log")).unwrap_or_default();
+            if log.contains(&format!("snapshot_json mode={expected}")) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for sidebar mode {expected}; logs:\n{}",
+            self.logs()
+        );
+    }
+
+    fn debug_log_occurrences(&self, needle: &str) -> usize {
+        fs::read_to_string(self.root.join("debug.log"))
+            .unwrap_or_default()
+            .matches(needle)
+            .count()
+    }
+
+    fn wait_for_sidebar_connections(&self) {
+        let panes = self.sidebar_panes();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let log = fs::read_to_string(self.root.join("debug.log")).unwrap_or_default();
+            if panes.iter().all(|pane| {
+                log.lines().any(|line| {
+                    line.contains("identify-pane")
+                        && line.contains(&format!("pane=Some(\"{}\")", pane.pane))
+                })
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for sidebar connections; panes={panes:?}\nlogs:\n{}",
+            self.logs()
+        );
+    }
+
+    fn wait_for_sidebar_pane_count(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.sidebar_panes().len() >= expected {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for at least {expected} sidebar panes; panes={:?}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.logs(),
+        );
+    }
+
     fn wait_for_no_sidebar_processes(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -2073,8 +2295,14 @@ for _ in range(3000):
             sleep(Duration::from_millis(100));
         }
         panic!(
-            "timed out waiting for all sidebar panes to exit; panes={:?}\nlogs:\n{}",
+            "timed out waiting for all sidebar panes to exit; panes={:?}\nall panes:\n{}\nlogs:\n{}",
             self.sidebar_panes(),
+            self.tmux([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id} session=#{session_name} title=#{pane_title} command=#{pane_current_command} dead=#{pane_dead} start=#{pane_start_command}"
+            ]),
             self.logs(),
         );
     }
@@ -2144,6 +2372,25 @@ for _ in range(3000):
                 .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
+    }
+
+    fn wait_for_sidebar_pane(&self, session: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(pane) = self
+                .sidebar_panes()
+                .into_iter()
+                .find(|pane| pane.session == session)
+            {
+                return pane.pane;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for sidebar in {session}; panes={:?}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.logs(),
+        );
     }
 
     fn active_pane(&self) -> String {

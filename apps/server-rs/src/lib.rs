@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime};
 
@@ -37,7 +38,7 @@ use opensessions_runtime::protocol::{
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
-use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
+use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarLifecycle};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
@@ -387,6 +388,10 @@ pub struct ReadOnlyMuxStateSource {
     // mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
     sidebar_width_repairs: Arc<SidebarWidthRepairScheduler>,
+    // Presence checks and pane spawning must be atomic across concurrent tmux
+    // hooks. Otherwise two ensure requests can both observe a missing sidebar
+    // and split duplicate panes into the same window.
+    sidebar_presence: Mutex<()>,
     detail_panel_height: Mutex<u16>,
     agent_panel_scope: Mutex<AgentPanelScope>,
     focused_session: Mutex<Option<String>>,
@@ -457,6 +462,7 @@ impl ReadOnlyMuxStateSource {
             git_info_cache: Mutex::new(HashMap::new()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
             sidebar_width_repairs: Arc::new(SidebarWidthRepairScheduler::default()),
+            sidebar_presence: Mutex::new(()),
             detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
             agent_panel_scope: Mutex::new(AgentPanelScope::Current),
             focused_session: Mutex::new(None),
@@ -530,6 +536,11 @@ impl ReadOnlyMuxStateSource {
         let mut hasher = DefaultHasher::new();
         fingerprints.hash(&mut hasher);
         Some(hasher.finish())
+    }
+
+    fn should_ensure_sidebar(&self) -> bool {
+        let state = self.sidebar_coordinator.lock().unwrap().state();
+        state.visible && state.lifecycle != SidebarLifecycle::Closing
     }
 
     fn persist_sidebar_width(&self, width: u16) {
@@ -727,6 +738,14 @@ impl StateSource for ReadOnlyMuxStateSource {
             provider.set_sidebar_width_hint(width);
             provider.setup_hooks(server_host, server_port, token_file);
         }
+        if self
+            .providers
+            .iter()
+            .any(|provider| !provider.list_sidebar_panes(None).is_empty())
+        {
+            self.sidebar_coordinator.lock().unwrap().mark_ready();
+            self.ensure_all_sidebars();
+        }
     }
 
     fn cleanup_mux_hooks(&self) {
@@ -915,7 +934,6 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                self.ensure_sidebar_for_session(provider.as_ref(), name);
                 provider.switch_session(name, client_tty);
                 None
             }
@@ -925,12 +943,20 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "kill-session" => {
                 let name = command.get("name")?.as_str()?;
-                if provider.get_current_session().as_deref() == Some(name)
+                let client_tty = command
+                    .get("clientTty")
+                    .and_then(Value::as_str)
+                    .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
+                let current_session = provider
+                    .get_client_focus(client_tty)
+                    .map(|focus| focus.session_name)
+                    .or_else(|| provider.get_current_session());
+                if current_session.as_deref() == Some(name)
                     && let Some(next) = self
                         .session_before(name)
                         .or_else(|| self.session_after(name))
                 {
-                    provider.switch_session(&next, None);
+                    provider.switch_session(&next, client_tty);
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
                 provider.kill_session(name);
@@ -1127,10 +1153,15 @@ impl StateSource for ReadOnlyMuxStateSource {
             "identify-pane session={:?} pane={:?} window={:?} -> acknowledge_sidebar_connected",
             context.session_name, context.pane_id, context.window_id,
         ));
-        self.sidebar_coordinator
-            .lock()
-            .unwrap()
-            .acknowledge_sidebar_connected();
+        let became_visible = {
+            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+            let was_visible = coordinator.state().visible;
+            coordinator.acknowledge_sidebar_connected();
+            !was_visible && coordinator.state().visible
+        };
+        if became_visible {
+            self.ensure_all_sidebars();
+        }
         if let Some(window_id) = context.window_id.as_deref() {
             for provider in &self.providers {
                 provider.prepare_sidebar_window(window_id);
@@ -1264,6 +1295,10 @@ impl StateSource for ReadOnlyMuxStateSource {
                 parse_context_session(body)
                     .map(|name| activate_session_json(name, None))
                     .or_else(|| spawned.then(|| self.snapshot_json()))
+            }
+            "/ensure-sidebars" => {
+                self.ensure_all_sidebars();
+                None
             }
             "/pane-exited" => {
                 let fallback_sessions = self
@@ -1729,6 +1764,7 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn toggle_sidebar(&self) {
+        let _presence_guard = self.sidebar_presence.lock().unwrap();
         let providers = self
             .providers
             .iter()
@@ -1792,9 +1828,10 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn ensure_sidebar(&self, body: &str) -> bool {
+        let _presence_guard = self.sidebar_presence.lock().unwrap();
         let context = parse_context(body);
-        if !self.is_sidebar_visible() {
-            debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
+        if !self.should_ensure_sidebar() {
+            debug_log("ensure_sidebar: ignored spawn while sidebar is hidden or closing");
             return false;
         }
         // A window switch / new window can make tmux proportionally redistribute
@@ -1822,21 +1859,6 @@ impl ReadOnlyMuxStateSource {
         spawned
     }
 
-    fn ensure_sidebar_for_session(&self, provider: &dyn MuxProvider, session_name: &str) -> bool {
-        if !self.is_sidebar_visible() || !provider.is_full_sidebar_capable() {
-            return false;
-        }
-        let Some(window_id) = provider
-            .list_windows(session_name)
-            .into_iter()
-            .find(|window| window.active)
-            .map(|window| window.id)
-        else {
-            return false;
-        };
-        self.ensure_sidebar_in_window(provider, session_name, &window_id)
-    }
-
     fn ensure_sidebar_in_window(
         &self,
         provider: &dyn MuxProvider,
@@ -1855,14 +1877,69 @@ impl ReadOnlyMuxStateSource {
             .lock()
             .unwrap()
             .begin_warmup_until(warmup_until);
-        provider.spawn_sidebar(
-            session_name,
-            window_id,
-            self.current_sidebar_width_u16(),
-            SidebarPosition::Left,
-            SIDEBAR_SCRIPTS_DIR,
-        );
-        true
+        provider
+            .spawn_sidebar(
+                session_name,
+                window_id,
+                self.current_sidebar_width_u16(),
+                SidebarPosition::Left,
+                SIDEBAR_SCRIPTS_DIR,
+            )
+            .is_some()
+    }
+
+    fn ensure_all_sidebars(&self) -> bool {
+        let _presence_guard = self.sidebar_presence.lock().unwrap();
+        if !self.should_ensure_sidebar() {
+            return false;
+        }
+        let width = self.current_sidebar_width_u16();
+        let mut spawned = false;
+        for provider in &self.providers {
+            if !provider.is_full_sidebar_capable() {
+                continue;
+            }
+            let existing = provider
+                .list_sidebar_panes(None)
+                .into_iter()
+                .map(|pane| pane.window_id)
+                .collect::<HashSet<_>>();
+            let mut visited = HashSet::new();
+            for window in provider.list_active_windows() {
+                if !visited.insert(window.id.clone()) || existing.contains(&window.id) {
+                    continue;
+                }
+                if !spawned {
+                    let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+                    self.sidebar_coordinator
+                        .lock()
+                        .unwrap()
+                        .begin_warmup_until(warmup_until);
+                }
+                debug_log(format!(
+                    "ensure_all_sidebars: spawning in session={} window={} width={width}",
+                    window.session_name, window.id,
+                ));
+                if provider
+                    .spawn_sidebar(
+                        &window.session_name,
+                        &window.id,
+                        width,
+                        SidebarPosition::Left,
+                        SIDEBAR_SCRIPTS_DIR,
+                    )
+                    .is_some()
+                {
+                    spawned = true;
+                } else {
+                    debug_log(format!(
+                        "ensure_all_sidebars: failed to spawn in session={} window={}",
+                        window.session_name, window.id,
+                    ));
+                }
+            }
+        }
+        spawned
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
@@ -1871,7 +1948,6 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
-        self.ensure_sidebar_for_session(provider.as_ref(), &name);
         provider.switch_session(&name, client_tty);
         None
     }
@@ -2895,6 +2971,27 @@ fn owns_identity_generation(pid_file: &Path, token_file: &Path, token: &str) -> 
         && fs::read_to_string(token_file).is_ok_and(|current| current.trim() == token)
 }
 
+async fn cache_latest_state(
+    mut state_updates: broadcast::Receiver<String>,
+    mut shutdown: broadcast::Receiver<()>,
+    latest_state: Arc<RwLock<Option<String>>>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => return,
+            update = state_updates.recv() => match update {
+                Ok(update) => {
+                    if update != QUIT_JSON && !is_immediate_server_message(&update) {
+                        *latest_state.write().unwrap() = Some(update);
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+            },
+        }
+    }
+}
+
 pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerError> {
     let bind_addr = (config.host.as_str(), config.port)
         .to_socket_addrs()?
@@ -2912,8 +3009,15 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
     let (state_updates, _) = broadcast::channel(16);
+    let latest_state = Arc::new(RwLock::new(None));
+    let state_cache_task = tokio::spawn(cache_latest_state(
+        state_updates.subscribe(),
+        shutdown.subscribe(),
+        Arc::clone(&latest_state),
+    ));
     let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
     if let Some(source) = config.state_source.clone() {
+        *latest_state.write().unwrap() = Some(source.snapshot_json());
         let _background_tasks = source
             .clone()
             .start_background_tasks(state_updates.clone(), shutdown.clone());
@@ -2930,10 +3034,12 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             shutdown_rx,
             state_source,
             state_updates,
+            latest_state,
             loop_shutdown_announcement,
             token.clone(),
         )
         .await;
+        state_cache_task.abort();
         if owns_identity_generation(&config.pid_file, &token_file, &token)
             && let Some(source) = cleanup_state_source.as_ref()
             && source.mux_namespace_available()
@@ -2962,6 +3068,7 @@ async fn run_accept_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
+    latest_state: Arc<RwLock<Option<String>>>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
 ) -> Result<(), ServerError> {
@@ -2982,6 +3089,7 @@ async fn run_accept_loop(
                 let connection_shutdown = shutdown.clone();
                 let connection_state_source = state_source.clone();
                 let connection_state_updates = state_updates.clone();
+                let connection_latest_state = Arc::clone(&latest_state);
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 let connection_auth_token = auth_token.clone();
                 let connection_state_operation_lock = Arc::clone(&state_operation_lock);
@@ -2992,6 +3100,7 @@ async fn run_accept_loop(
                         connection_shutdown,
                         connection_state_source,
                         connection_state_updates,
+                        connection_latest_state,
                         connection_shutdown_announcement,
                         connection_auth_token,
                         connection_state_operation_lock,
@@ -3054,6 +3163,7 @@ async fn handle_connection(
     shutdown: broadcast::Sender<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
+    latest_state: Arc<RwLock<Option<String>>>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
     state_operation_lock: Arc<AsyncMutex<()>>,
@@ -3340,14 +3450,19 @@ async fn handle_connection(
         let mut websocket = ServerBuilder::new().serve(stream);
         debug_log("ws: client connected, sending hello + initial state");
         websocket.send(Message::text(HELLO_JSON)).await?;
-        if let Some(snapshot) = run_state_source_blocking(
-            &state_source,
-            &state_operation_lock,
-            StateSource::snapshot_json,
-        )
-        .await?
-        {
-            websocket.send(Message::text(snapshot)).await?;
+        let initial_state = latest_state.read().unwrap().clone();
+        let initial_state = if initial_state.is_some() {
+            initial_state
+        } else {
+            run_state_source_blocking(
+                &state_source,
+                &state_operation_lock,
+                StateSource::snapshot_json,
+            )
+            .await?
+        };
+        if let Some(initial_state) = initial_state {
+            websocket.send(Message::text(initial_state)).await?;
         }
 
         let mut connection_shutdown = shutdown.subscribe();
@@ -3622,6 +3737,7 @@ fn is_ok_hook_path(path: &str) -> bool {
             | "/pane-layout-changed"
             | "/client-resized"
             | "/ensure-sidebar"
+            | "/ensure-sidebars"
             | "/set-sidebar-width"
             | "/toggle"
     )

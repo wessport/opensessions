@@ -16,6 +16,7 @@ echo "opensessions: uninstalling..."
 for hook in \
   client-session-changed \
   session-created \
+  after-new-session \
   session-closed \
   client-resized \
   after-select-window \
