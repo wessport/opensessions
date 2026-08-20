@@ -3528,7 +3528,15 @@ async fn handle_connection(
                                         name,
                                         client_context.pane_id.as_deref(),
                                     ));
-                                    tokio::task::yield_now().await;
+                                    // Pre-home every destination sidebar before tmux makes it
+                                    // visible. A scheduler yield does not guarantee that the
+                                    // broadcast reaches the sidebar and renders; reserving one
+                                    // frame prevents the old local selection flashing after a
+                                    // session switch.
+                                    tokio::time::sleep(Duration::from_millis(
+                                        RENDERED_SIDEBAR_FRAME_MS,
+                                    ))
+                                    .await;
                                 }
                                 let command_for_handler = command.clone();
                                 let context_for_handler = client_context.clone();
