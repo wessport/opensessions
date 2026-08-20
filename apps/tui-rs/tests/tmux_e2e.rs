@@ -1640,7 +1640,10 @@ for _ in range(3000):
     fn wait_for_server(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            let listening = TcpStream::connect(("127.0.0.1", self.port)).is_ok();
+            let token_ready =
+                fs::read_to_string(self.token_file()).is_ok_and(|token| !token.trim().is_empty());
+            if listening && token_ready {
                 return;
             }
             sleep(Duration::from_millis(100));
