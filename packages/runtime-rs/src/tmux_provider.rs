@@ -623,7 +623,6 @@ impl MuxProvider for TmuxProvider {
         let base = format!("http://{server_host}:{server_port}");
         let hook_context = hook_context_format();
         let focus_cmd = http_hook_command(&base, "/focus", Some(hook_context), true, token_file);
-        let refresh_cmd = http_hook_command(&base, "/refresh", None, true, token_file);
         let ensure_cmd = http_hook_command(
             &base,
             "/ensure-sidebar",
@@ -631,6 +630,7 @@ impl MuxProvider for TmuxProvider {
             true,
             token_file,
         );
+        let ensure_all_cmd = http_hook_command(&base, "/ensure-sidebars", None, true, token_file);
         let pane_exited_cmd = pane_exited_hook_command(&base, token_file);
         let pane_died_cmd = pane_died_hook_command(&base, token_file);
         let client_resized_cmd =
@@ -643,7 +643,11 @@ impl MuxProvider for TmuxProvider {
             &format!("{focus_cmd} ; {ensure_cmd}"),
         );
         self.client.set_global_hook("after-select-pane", &focus_cmd);
-        self.client.set_global_hook("session-created", &refresh_cmd);
+        self.client
+            .set_global_hook("session-created", &ensure_all_cmd);
+        self.client
+            .set_global_hook("after-new-session", &ensure_all_cmd);
+        let refresh_cmd = http_hook_command(&base, "/refresh", None, true, token_file);
         self.client.set_global_hook("session-closed", &refresh_cmd);
         self.client
             .set_global_hook("after-select-window", &ensure_cmd);
@@ -670,6 +674,7 @@ impl MuxProvider for TmuxProvider {
             "client-session-changed",
             "after-select-pane",
             "session-created",
+            "after-new-session",
             "session-closed",
             "after-select-window",
             "after-new-window",

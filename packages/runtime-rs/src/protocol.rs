@@ -274,6 +274,8 @@ pub enum ClientCommand {
     ShowAllSessions,
     KillSession {
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_tty: Option<String>,
     },
     RequestWindows {
         session: String,

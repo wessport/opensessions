@@ -21,7 +21,12 @@ ensure_server || exit 0
 
 CTX="$(tmux display-message -p '#{client_tty}|#{session_name}|#{window_id}|#{pane_id}|#{pane_active}' 2>/dev/null)"
 
-curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H "Authorization: Bearer $(auth_token)" -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"
+if tmux list-panes -a -F '#{pane_title}' 2>/dev/null | grep -q '^opensessions-sidebar$'; then
+  ENDPOINT="ensure-sidebar"
+else
+  ENDPOINT="toggle"
+fi
+curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H "Authorization: Bearer $(auth_token)" -X POST "http://${HOST}:${PORT}/${ENDPOINT}" -d "$CTX"
 
 attempt=0
 while [ "$attempt" -lt 20 ]; do

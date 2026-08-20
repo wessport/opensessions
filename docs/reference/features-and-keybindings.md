@@ -64,7 +64,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 | `1`-`9` | Switch to session by visible index |
 | `Alt+Up` | Move focused session up in persisted order |
 | `Alt+Down` | Move focused session down in persisted order |
-| `n`, `c` | Create a new session |
+| `n`, `c` | Open the directory picker to create or switch to a session |
 | `d`, `x` | Open kill-session confirmation for focused session |
 | `t` | Open theme picker |
 | `r` | Refresh state |
@@ -88,6 +88,8 @@ Clicking a detected port opens `http://localhost:<port>`.
 - The TUI uses a tmux popup sessionizer when it is running inside tmux.
 - The bundled sessionizer searches directories listed in `SESSIONIZER_DIR` (colon-separated, e.g. `$HOME/Code:$HOME/.config`) or `$HOME/Documents` if unset. The variable is also read from the tmux global environment (`tmux set-environment -g`) as a fallback.
 - Search depth is controlled by `SESSIONIZER_MAXDEPTH` (defaults to `3`).
+- A typed valid directory, including a `~/...` path, takes priority over the currently highlighted fuzzy match.
+- Choosing a directory whose derived session name already exists switches to that session instead of creating a duplicate.
 - If `fzf` is unavailable, the tmux sessionizer exits with a prompt explaining that dependency.
 
 ## Session Switching Behavior

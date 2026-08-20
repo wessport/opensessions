@@ -23,10 +23,14 @@ pub enum PanelFocus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchTarget {
+    /// Open the fuzzy directory picker used to create or switch sessions.
+    Sessionizer,
     /// Open lazydiffs in a tmux popup.
     LazydiffTmux { session_name: Option<String> },
     /// Open lazydiff in a new terminal window.
     LazydiffTerminal { session_name: Option<String> },
+    /// Open a session directory in the platform file browser.
+    Directory { path: String },
 }
 
 impl LaunchTarget {
@@ -35,6 +39,7 @@ impl LaunchTarget {
             Self::LazydiffTmux { session_name } | Self::LazydiffTerminal { session_name } => {
                 session_name.as_deref()
             }
+            Self::Sessionizer | Self::Directory { .. } => None,
         }
     }
 }
@@ -128,6 +133,7 @@ pub struct App {
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
     pending_theme_intent: Option<(String, bool)>,
+    client_tty: Option<String>,
     pending_sidebar_width_intent: Option<u16>,
     pending_detail_panel_height_intent: Option<usize>,
     pending_agent_panel_scope_intent: Option<AgentPanelScope>,
@@ -178,6 +184,7 @@ impl App {
             terminal_width: None,
             pane_identity: None,
             pending_theme_intent: None,
+            client_tty: None,
             pending_sidebar_width_intent: None,
             pending_detail_panel_height_intent: None,
             pending_agent_panel_scope_intent: None,
@@ -284,7 +291,8 @@ impl App {
                 self.clear_background_pending_switch(server_current.as_deref());
                 self.clamp_session_scroll_offset(0);
             }
-            ServerMessage::YourSession { name, .. } => {
+            ServerMessage::YourSession { name, client_tty } => {
+                self.client_tty = client_tty;
                 self.confirm_local_session(name, true);
             }
             ServerMessage::ActivateSession {
@@ -556,7 +564,7 @@ impl App {
                 self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
             }
             'r' => self.commands.push(ClientCommand::Refresh),
-            'n' | 'c' => self.commands.push(ClientCommand::NewSession),
+            'n' | 'c' => self.pending_launches.push(LaunchTarget::Sessionizer),
             'u' => self.commands.push(ClientCommand::ShowAllSessions),
             'd' => {
                 if self.panel_focus == PanelFocus::Agents {
@@ -764,6 +772,9 @@ impl App {
                 self.set_sidebar_focus(SidebarFocus::WorktreeGroup(key.clone()));
                 self.toggle_worktree_group(&key);
             }
+            HitTarget::Directory(path) => {
+                self.pending_launches.push(LaunchTarget::Directory { path });
+            }
             HitTarget::DiffCount(name) => {
                 self.pending_launches.push(LaunchTarget::LazydiffTmux {
                     session_name: Some(name),
@@ -878,7 +889,10 @@ impl App {
         };
         self.modal = Modal::None;
         for name in self.kill_target_session_names(&target) {
-            self.commands.push(ClientCommand::KillSession { name });
+            self.commands.push(ClientCommand::KillSession {
+                name,
+                client_tty: self.client_tty.clone(),
+            });
         }
     }
 
@@ -1523,6 +1537,30 @@ mod tests {
     }
 
     #[test]
+    fn directory_click_queues_the_exact_path_for_the_platform_opener() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.activate_hit_target(HitTarget::Directory("/tmp/project with spaces".to_string()));
+
+        assert_eq!(
+            app.drain_launches(),
+            vec![LaunchTarget::Directory {
+                path: "/tmp/project with spaces".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn new_session_key_opens_the_directory_picker_instead_of_creating_blindly() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.handle_key_char('n');
+
+        assert_eq!(app.drain_launches(), vec![LaunchTarget::Sessionizer]);
+        assert!(app.drain_commands().is_empty());
+    }
+
+    #[test]
     fn repeated_switch_intent_rehomes_every_destination_sidebar() {
         let mut state = empty_state(10);
         state.sessions = vec![
@@ -1794,6 +1832,28 @@ mod tests {
     }
 
     #[test]
+    fn kill_session_routes_the_command_to_the_identified_tmux_client() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("feature-a", "/repo/feature-a", false)];
+        let mut app = App::from_state(state);
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "feature-a".to_string(),
+            client_tty: Some("/dev/ttys025".to_string()),
+        });
+
+        app.handle_key_char('x');
+        app.confirm_kill_target();
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::KillSession {
+                name: "feature-a".to_string(),
+                client_tty: Some("/dev/ttys025".to_string()),
+            }]
+        );
+    }
+
+    #[test]
     fn confirming_worktree_group_kill_resolves_current_group_members() {
         let mut state = empty_state(10);
         state.sessions = vec![
@@ -1812,13 +1872,16 @@ mod tests {
             app.drain_commands(),
             vec![
                 ClientCommand::KillSession {
-                    name: "feature-a".to_string()
+                    name: "feature-a".to_string(),
+                    client_tty: None,
                 },
                 ClientCommand::KillSession {
-                    name: "feature-b".to_string()
+                    name: "feature-b".to_string(),
+                    client_tty: None,
                 },
                 ClientCommand::KillSession {
-                    name: "feature-c".to_string()
+                    name: "feature-c".to_string(),
+                    client_tty: None,
                 },
             ]
         );
