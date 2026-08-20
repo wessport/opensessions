@@ -29,6 +29,7 @@ pub fn render_app(frame: &mut Frame<'_>, app: &App) {
 pub enum HitTarget {
     Session(String),
     Group(String),
+    Directory(String),
     DiffCount(String),
     Agent(usize),
     AgentPane(AgentPaneTarget),
@@ -1033,10 +1034,13 @@ fn build_session_detail_row(
     let bg = if flashed { Some(palette.surface1) } else { bg };
     let has_ports = !session.ports.is_empty();
     let has_diff_stats = session.insertions > 0 || session.deletions > 0;
-    let detail_text = if !session.branch.is_empty() {
-        Some(Cow::Borrowed(session.branch.as_str()))
+    let (detail_text, directory_hit) = if !session.branch.is_empty() {
+        (Some(Cow::Borrowed(session.branch.as_str())), None)
     } else {
-        dir_name(session)
+        (
+            dir_name(session),
+            focused.then(|| HitTarget::Directory(session.dir.clone())),
+        )
     };
     let branch_color = if focused {
         palette.pink
@@ -1063,7 +1067,18 @@ fn build_session_detail_row(
     }
     if let Some(detail_text) = detail_text {
         let available = width.saturating_sub(line.width() + suffix_width);
-        line.push(truncate_right(&detail_text, available), branch_color);
+        let detail_text = truncate_right(&detail_text, available);
+        if let Some(directory_hit) = directory_hit {
+            let hovered = app.hover_target.as_ref() == Some(&directory_hit);
+            line.push_hit_with_bg(
+                detail_text,
+                branch_color,
+                hovered.then_some(palette.surface2),
+                directory_hit,
+            );
+        } else {
+            line.push(detail_text, branch_color);
+        }
     }
     if has_ports {
         let port_text = if session.ports.len() == 1 {
@@ -1164,7 +1179,14 @@ fn render_detail(
 
     let mut path = StyledLine::blank();
     path.push(" ", palette.white);
-    path.push(truncate_left(&session.dir, 24), palette.overlay0);
+    let path_hit = HitTarget::Directory(session.dir.clone());
+    let hovered = app.hover_target.as_ref() == Some(&path_hit);
+    path.push_hit_with_bg(
+        truncate_left(&session.dir, 24),
+        palette.overlay0,
+        hovered.then_some(palette.surface2),
+        path_hit,
+    );
     lines.push(path.end(CellStyle::fg(palette.white)));
 
     for (i, link) in session.local_links.iter().enumerate() {
@@ -3336,6 +3358,78 @@ mod tests {
         assert_eq!(
             compute_hit_target(&app, width - 1, detail_row, width, height),
             Some(HitTarget::DiffCount("opensessions".to_string()))
+        );
+    }
+
+    #[test]
+    fn focused_directory_text_has_its_own_finder_hit_target() {
+        let mut app = app_from_sessions(vec![session(
+            "opensessions",
+            "/tmp/project with spaces",
+            "",
+        )]);
+        app.sidebar_focus = Some(crate::app::SidebarFocus::Session(
+            "opensessions".to_string(),
+        ));
+        let width = 40u16;
+        let height = 24u16;
+        let model = build_model(&app, width as usize, height as usize);
+        let (row, line) = model
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.parts
+                    .iter()
+                    .any(|part| part.text.contains("project with spaces"))
+            })
+            .expect("rendered directory row");
+        let x = line
+            .parts
+            .iter()
+            .take_while(|part| !part.text.contains("project with spaces"))
+            .map(|part| part.text.width())
+            .sum::<usize>();
+
+        assert_eq!(
+            compute_hit_target(&app, x as u16, row as u16, width, height),
+            Some(HitTarget::Directory("/tmp/project with spaces".to_string()))
+        );
+    }
+
+    #[test]
+    fn detail_panel_path_has_a_finder_hit_target_when_branch_is_present() {
+        let mut app = app_from_sessions(vec![session(
+            "opensessions",
+            "/tmp/project with spaces",
+            "main",
+        )]);
+        app.sidebar_focus = Some(crate::app::SidebarFocus::Session(
+            "opensessions".to_string(),
+        ));
+        let width = 40u16;
+        let height = 24u16;
+        let model = build_model(&app, width as usize, height as usize);
+        let (row, line) = model
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.parts
+                    .iter()
+                    .any(|part| part.text.contains("project with spaces"))
+            })
+            .expect("rendered detail-panel path");
+        let x = line
+            .parts
+            .iter()
+            .take_while(|part| !part.text.contains("project with spaces"))
+            .map(|part| part.text.width())
+            .sum::<usize>();
+
+        assert_eq!(
+            compute_hit_target(&app, x as u16, row as u16, width, height),
+            Some(HitTarget::Directory("/tmp/project with spaces".to_string()))
         );
     }
 

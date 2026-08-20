@@ -30,6 +30,7 @@ printf '%s\\n' "$@" > "$FZF_ARGS"
     join(bin, "tmux"),
     `#!/bin/sh
 printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "$1" = has-session ] && [ "$TMUX_HAS_SESSION" = 1 ] && exit 0
 [ "$1" = has-session ] && exit 1
 exit 0
 `,
@@ -73,6 +74,27 @@ describe("sessionizer path selection", () => {
     expect(readFileSync(files.tmuxLog, "utf8")).not.toContain(`-c ${match}`);
   });
 
+  test("expands a typed home-relative directory", () => {
+    const { root, search, files, env } = fixture();
+    const typed = join(root, "repos", "project");
+    const match = join(search, "highlighted");
+    mkdirSync(typed, { recursive: true });
+    mkdirSync(match);
+
+    const result = Bun.spawnSync([sessionizer], {
+      env: {
+        ...env,
+        HOME: root,
+        FZF_QUERY: "~/repos/project",
+        FZF_MATCH: match,
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(files.tmuxLog, "utf8")).toContain(`new-session -d -s project -c ${typed}`);
+    expect(readFileSync(files.tmuxLog, "utf8")).not.toContain(`-c ${match}`);
+  });
+
   test("excludes hidden directories from fzf candidates", () => {
     const { search, files, env } = fixture();
     const visible = join(search, "visible");
@@ -102,6 +124,27 @@ describe("sessionizer path selection", () => {
 
     expect(result.exitCode).toBe(0);
     expect(readFileSync(files.tmuxLog, "utf8")).toContain(`new-session -d -s matched -c ${match}`);
+  });
+
+  test("switches to an existing same-named session instead of duplicating it", () => {
+    const { search, files, env } = fixture();
+    const match = join(search, "existing");
+    mkdirSync(match);
+
+    const result = Bun.spawnSync([sessionizer], {
+      env: {
+        ...env,
+        FZF_QUERY: "existing",
+        FZF_MATCH: match,
+        TMUX_HAS_SESSION: "1",
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    const tmuxLog = readFileSync(files.tmuxLog, "utf8");
+    expect(tmuxLog).toContain("has-session -t =existing");
+    expect(tmuxLog).toContain("switch-client -t existing");
+    expect(tmuxLog).not.toContain("new-session");
   });
 
   test("preserves colon-separated roots and max depth without creating an empty selection", () => {

@@ -23,7 +23,7 @@ use opensessions_sidebar::runtime_context::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
@@ -248,16 +248,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     for launch in app.drain_launches() {
-                        let target_session = launch
-                            .session_name()
-                            .or_else(|| app.focused_session_name());
-                        let session = app
-                            .sessions
-                            .iter()
-                            .find(|s| Some(s.name.as_str()) == target_session);
-                        let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
-                        let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
-                        maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
+                        handle_launch(launch, app, &mut last_lazydiff_launch);
                     }
                 } else if let Event::Resize(width, _) = event {
                     if let Some(app) = &mut app {
@@ -285,16 +276,7 @@ async fn main() -> Result<()> {
                         send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
                     }
                     for launch in app.drain_launches() {
-                        let target_session = launch
-                            .session_name()
-                            .or_else(|| app.focused_session_name());
-                        let session = app
-                            .sessions
-                            .iter()
-                            .find(|s| Some(s.name.as_str()) == target_session);
-                        let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
-                        let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
-                        maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
+                        handle_launch(launch, app, &mut last_lazydiff_launch);
                     }
                 }
             }
@@ -565,22 +547,16 @@ fn do_startup_refocus(pane_id: &str) {
 }
 
 fn launch_lazydiff(target: LaunchTarget, dir: &str, branch: &str) {
-    let command = lazydiffs_command(branch);
+    let command = popup_lazydiff_command(&lazydiffs_command(branch));
     match target {
         LaunchTarget::LazydiffTmux { .. } => {
-            let _ = std::process::Command::new("tmux")
-                .args([
-                    "display-popup",
-                    "-d",
-                    dir,
-                    "-h",
-                    "90%",
-                    "-w",
-                    "90%",
-                    "-E",
-                    &command,
-                ])
-                .output();
+            let mut args = vec!["display-popup", "-d", dir, "-h", "90%", "-w", "90%"];
+            let pane = std::env::var("TMUX_PANE").ok();
+            if let Some(pane) = pane.as_deref() {
+                args.extend(["-t", pane]);
+            }
+            args.extend(["-E", &command]);
+            let _ = std::process::Command::new("tmux").args(args).output();
         }
         LaunchTarget::LazydiffTerminal { .. } => {
             #[cfg(target_os = "macos")]
@@ -618,7 +594,114 @@ fn launch_lazydiff(target: LaunchTarget, dir: &str, branch: &str) {
                 }
             }
         }
+        LaunchTarget::Sessionizer | LaunchTarget::Directory { .. } => {}
     }
+}
+
+fn handle_launch(
+    target: LaunchTarget,
+    app: &App,
+    last_lazydiff_launch: &mut Option<std::time::Instant>,
+) {
+    match target {
+        LaunchTarget::Sessionizer => {
+            launch_sessionizer();
+            return;
+        }
+        LaunchTarget::Directory { path } => {
+            open_directory(&path);
+            return;
+        }
+        _ => {}
+    }
+    let target_session = target.session_name().or_else(|| app.focused_session_name());
+    let session = app
+        .sessions
+        .iter()
+        .find(|session| Some(session.name.as_str()) == target_session);
+    let dir = session.map(|session| session.dir.as_str()).unwrap_or(".");
+    let branch = session
+        .map(|session| session.branch.as_str())
+        .unwrap_or_default();
+    maybe_launch_lazydiff(target, dir, branch, last_lazydiff_launch);
+}
+
+fn launch_sessionizer() {
+    let script = resolve_sessionizer_script();
+    let pane = std::env::var("TMUX_PANE").ok();
+    let args = sessionizer_popup_args(&script, pane.as_deref());
+    let _ = std::process::Command::new("tmux").args(args).output();
+}
+
+fn sessionizer_popup_args(script: &Path, pane: Option<&str>) -> Vec<String> {
+    let command = format!(
+        "bash {}; status=$?; if [ \"$status\" -ne 0 ]; then printf '\\nsession picker failed (exit %s). Press Enter to close.\\n' \"$status\"; IFS= read -r _; fi; exit \"$status\"",
+        shell_quote(&script.to_string_lossy()),
+    );
+    let mut args = vec![
+        "display-popup".to_string(),
+        "-T".to_string(),
+        " new session ".to_string(),
+        "-h".to_string(),
+        "60%".to_string(),
+        "-w".to_string(),
+        "60%".to_string(),
+    ];
+    if let Some(pane) = pane {
+        args.extend(["-t".to_string(), pane.to_string()]);
+    }
+    args.extend(["-E".to_string(), command]);
+    args
+}
+
+fn resolve_sessionizer_script() -> PathBuf {
+    resolve_sessionizer_script_from(
+        std::env::var("OPENSESSIONS_DIR").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        Path::exists,
+    )
+}
+
+fn resolve_sessionizer_script_from(
+    opensessions_dir: Option<&str>,
+    current_exe: Option<&Path>,
+    current_dir: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let relative = Path::new("apps")
+        .join("tui")
+        .join("scripts")
+        .join("sessionizer.sh");
+    let configured = opensessions_dir
+        .map(Path::new)
+        .map(|root| root.join(&relative));
+    let beside_install = current_exe
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|root| root.join(&relative));
+    let beside_local_build = current_exe
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|root| root.join(&relative));
+    let from_working_dir = current_dir.map(|root| root.join(&relative));
+
+    configured
+        .into_iter()
+        .chain(beside_install)
+        .chain(beside_local_build)
+        .chain(from_working_dir)
+        .find(|path| exists(path))
+        .unwrap_or(relative)
+}
+
+fn open_directory(path: &str) {
+    #[cfg(target_os = "macos")]
+    let command = "open";
+    #[cfg(not(target_os = "macos"))]
+    let command = "xdg-open";
+    let _ = std::process::Command::new(command).arg(path).spawn();
 }
 
 fn maybe_launch_lazydiff(
@@ -639,17 +722,32 @@ fn maybe_launch_lazydiff(
 
 fn lazydiffs_command(branch: &str) -> String {
     let lazydiff = shell_quote(&resolve_lazydiff_binary());
-    if branch.is_empty() {
-        lazydiff
+    let lazydiff_command = if branch.is_empty() {
+        lazydiff.clone()
     } else {
         format!("{lazydiff} --branch")
-    }
+    };
+    let git_diff = if branch.is_empty() {
+        "git -c color.ui=always diff --no-ext-diff"
+    } else {
+        "git -c color.ui=always diff --no-ext-diff HEAD"
+    };
+    format!(
+        "if command -v {lazydiff} >/dev/null 2>&1 || [ -x {lazydiff} ]; then {lazydiff_command}; else {git_diff} | less -R; fi"
+    )
+}
+
+fn popup_lazydiff_command(command: &str) -> String {
+    format!(
+        "{command}; status=$?; if [ \"$status\" -ne 0 ]; then printf '\\nlazydiff failed (exit %s). Press Enter to close.\\n' \"$status\"; IFS= read -r _; fi; exit \"$status\""
+    )
 }
 
 fn resolve_lazydiff_binary() -> String {
     resolve_lazydiff_binary_from(
         std::env::current_exe().ok().as_deref(),
         std::env::var("OPENSESSIONS_LAZYDIFF").ok().as_deref(),
+        std::env::var("OPENSESSIONS_DIR").ok().as_deref(),
         Path::exists,
     )
 }
@@ -657,6 +755,7 @@ fn resolve_lazydiff_binary() -> String {
 fn resolve_lazydiff_binary_from(
     current_exe: Option<&Path>,
     env_override: Option<&str>,
+    opensessions_dir: Option<&str>,
     exists: impl Fn(&Path) -> bool,
 ) -> String {
     if let Some(path) = env_override.map(str::trim).filter(|path| !path.is_empty()) {
@@ -666,6 +765,14 @@ fn resolve_lazydiff_binary_from(
     if let Some(path) = current_exe
         .and_then(Path::parent)
         .map(|dir| dir.join(lazydiff_binary_name()))
+        .filter(|path| exists(path))
+    {
+        return path.to_string_lossy().into_owned();
+    }
+
+    if let Some(path) = opensessions_dir
+        .map(Path::new)
+        .map(|dir| dir.join("bin").join(lazydiff_binary_name()))
         .filter(|path| exists(path))
     {
         return path.to_string_lossy().into_owned();
@@ -709,7 +816,7 @@ mod tests {
         let current = Path::new("/opt/opensessions/bin/opensessions-sidebar");
 
         assert_eq!(
-            resolve_lazydiff_binary_from(Some(current), Some("/custom/lazydiff"), |_| true),
+            resolve_lazydiff_binary_from(Some(current), Some("/custom/lazydiff"), None, |_| true,),
             "/custom/lazydiff"
         );
     }
@@ -720,8 +827,84 @@ mod tests {
         let expected = PathBuf::from("/opt/opensessions/bin").join(lazydiff_binary_name());
 
         assert_eq!(
-            resolve_lazydiff_binary_from(Some(current), None, |path| path == expected),
+            resolve_lazydiff_binary_from(Some(current), None, None, |path| path == expected),
             expected.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn lazydiff_resolution_finds_the_release_bundle_for_a_local_sidebar_build() {
+        let current = Path::new("/opt/opensessions/target/release/opensessions-sidebar");
+        let expected = PathBuf::from("/opt/opensessions/bin").join(lazydiff_binary_name());
+
+        assert_eq!(
+            resolve_lazydiff_binary_from(
+                Some(current),
+                None,
+                Some("/opt/opensessions"),
+                |path| path == expected,
+            ),
+            expected.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn sessionizer_resolution_prefers_the_configured_install_root() {
+        let expected = PathBuf::from("/opt/opensessions/apps/tui/scripts/sessionizer.sh");
+
+        assert_eq!(
+            resolve_sessionizer_script_from(
+                Some("/opt/opensessions"),
+                Some(Path::new("/other/bin/opensessions-sidebar")),
+                Some(Path::new("/working")),
+                |path| path == expected,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn sessionizer_popup_targets_the_originating_sidebar_and_keeps_errors_visible() {
+        let args = sessionizer_popup_args(
+            Path::new("/tmp/project with spaces/sessionizer.sh"),
+            Some("%42"),
+        );
+
+        assert_eq!(
+            &args[..7],
+            [
+                "display-popup",
+                "-T",
+                " new session ",
+                "-h",
+                "60%",
+                "-w",
+                "60%"
+            ]
+        );
+        assert!(args.windows(2).any(|values| values == ["-t", "%42"]));
+        assert_eq!(args[args.len() - 2], "-E");
+        assert!(args.last().is_some_and(|command| {
+            command.contains("'/tmp/project with spaces/sessionizer.sh'")
+                && command.contains("session picker failed")
+                && command.contains("read -r")
+        }));
+    }
+
+    #[test]
+    fn sessionizer_resolution_supports_local_release_builds() {
+        let expected = PathBuf::from("/opt/opensessions/apps/tui/scripts/sessionizer.sh");
+
+        assert_eq!(
+            resolve_sessionizer_script_from(
+                None,
+                Some(Path::new(
+                    "/opt/opensessions/target/release/opensessions-sidebar",
+                )),
+                None,
+                |path| path == expected,
+            ),
+            expected
         );
     }
 
@@ -730,9 +913,26 @@ mod tests {
         let current = Path::new("/opt/opensessions/bin/opensessions-sidebar");
 
         assert_eq!(
-            resolve_lazydiff_binary_from(Some(current), None, |_| false),
+            resolve_lazydiff_binary_from(Some(current), None, None, |_| false),
             lazydiff_binary_name()
         );
+    }
+
+    #[test]
+    fn popup_command_keeps_launch_errors_visible() {
+        let command = popup_lazydiff_command("'/missing/lazydiff' --branch");
+
+        assert!(command.starts_with("'/missing/lazydiff' --branch"));
+        assert!(command.contains("lazydiff failed"));
+        assert!(command.contains("read -r"));
+    }
+
+    #[test]
+    fn lazydiff_command_falls_back_to_an_interactive_git_diff() {
+        let command = lazydiffs_command("main");
+
+        assert!(command.contains("command -v"));
+        assert!(command.contains("git -c color.ui=always diff --no-ext-diff HEAD | less -R"));
     }
 }
 

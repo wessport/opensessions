@@ -90,6 +90,7 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 ## Development Guidelines
 
 - **TDD**: Red-green-refactor, vertical slices, one test at a time. Tests verify behavior through public interfaces.
+- **Preserve fork-maintained UX**: before upstream syncs or runtime/UI migrations, read `docs/reference/fork-maintained-ux.md` and retain its protected workflows and regression coverage.
 - **Sync tmux calls**: keep mux provider methods synchronous unless the architecture changes deliberately.
 - **Preserve optimizations**: batched tmux calls, git cache with HEAD watchers, lightweight focus-only broadcasts, fixed-width sidebar repair, and per-client focus state.
 - **Sidebar resize work**: before changing sidebar spawning, width sync, tmux resize handling, or `sidebar-coordinator`, read `docs/explanation/sidebar-behavior.md` and preserve those invariants unless you update the doc in the same change.

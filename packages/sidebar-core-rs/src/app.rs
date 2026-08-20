@@ -23,10 +23,14 @@ pub enum PanelFocus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchTarget {
+    /// Open the fuzzy directory picker used to create or switch sessions.
+    Sessionizer,
     /// Open lazydiffs in a tmux popup.
     LazydiffTmux { session_name: Option<String> },
     /// Open lazydiff in a new terminal window.
     LazydiffTerminal { session_name: Option<String> },
+    /// Open a session directory in the platform file browser.
+    Directory { path: String },
 }
 
 impl LaunchTarget {
@@ -35,6 +39,7 @@ impl LaunchTarget {
             Self::LazydiffTmux { session_name } | Self::LazydiffTerminal { session_name } => {
                 session_name.as_deref()
             }
+            Self::Sessionizer | Self::Directory { .. } => None,
         }
     }
 }
@@ -559,7 +564,7 @@ impl App {
                 self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
             }
             'r' => self.commands.push(ClientCommand::Refresh),
-            'n' | 'c' => self.commands.push(ClientCommand::NewSession),
+            'n' | 'c' => self.pending_launches.push(LaunchTarget::Sessionizer),
             'u' => self.commands.push(ClientCommand::ShowAllSessions),
             'd' => {
                 if self.panel_focus == PanelFocus::Agents {
@@ -766,6 +771,9 @@ impl App {
             HitTarget::Group(key) => {
                 self.set_sidebar_focus(SidebarFocus::WorktreeGroup(key.clone()));
                 self.toggle_worktree_group(&key);
+            }
+            HitTarget::Directory(path) => {
+                self.pending_launches.push(LaunchTarget::Directory { path });
             }
             HitTarget::DiffCount(name) => {
                 self.pending_launches.push(LaunchTarget::LazydiffTmux {
@@ -1526,6 +1534,30 @@ mod tests {
             collapsed_worktree_groups: Vec::new(),
             ts: 0,
         }
+    }
+
+    #[test]
+    fn directory_click_queues_the_exact_path_for_the_platform_opener() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.activate_hit_target(HitTarget::Directory("/tmp/project with spaces".to_string()));
+
+        assert_eq!(
+            app.drain_launches(),
+            vec![LaunchTarget::Directory {
+                path: "/tmp/project with spaces".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn new_session_key_opens_the_directory_picker_instead_of_creating_blindly() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.handle_key_char('n');
+
+        assert_eq!(app.drain_launches(), vec![LaunchTarget::Sessionizer]);
+        assert!(app.drain_commands().is_empty());
     }
 
     #[test]

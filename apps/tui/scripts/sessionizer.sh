@@ -45,6 +45,14 @@ fzf_output=$(find "${valid_dirs[@]}" -mindepth 1 -maxdepth "$MAXDEPTH" -type d -
 query=$(printf '%s\n' "$fzf_output" | sed -n '1p')
 match=$(printf '%s\n' "$fzf_output" | sed -n '2p')
 
+# Bash does not expand a quoted tilde. Expand the two useful home-directory
+# forms explicitly before validating a typed path.
+if [ "$query" = "~" ]; then
+  query="$HOME"
+elif [[ "$query" == "~/"* ]]; then
+  query="$HOME/${query#\~/}"
+fi
+
 # fzf can return a highlighted match even when the user entered an explicit
 # directory, so prefer a non-empty, valid typed path.
 if [ -n "$query" ] && [ -d "$query" ]; then
