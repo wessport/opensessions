@@ -142,6 +142,7 @@ That means:
 - the destination session/window should already have a sidebar at the current global width
 - switching must not trigger visible layout jumps
 - switching must not reset the width to an older value
+- when a stale flat window expands on return, restoring Fixed Sidebar Width must preserve the relative widths of its content panes rather than giving all reclaimed space to the sidebar's nearest neighbor
 - transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
 - switching immediately after a slider or managed divider change converges to its new Fixed Sidebar Width; unrelated tmux resize observations are not adopted
 - switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane

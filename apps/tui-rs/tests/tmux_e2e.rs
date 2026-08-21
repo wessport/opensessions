@@ -1100,6 +1100,55 @@ fn tmux_sidebar_width_survives_flat_three_pane_layout_churn() {
 }
 
 #[test]
+fn tmux_sidebar_preserves_even_content_panes_when_returning_to_stale_session() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-stale-three-pane-layout");
+    let target = "effect-ts";
+    let main = lab.main_pane(target);
+
+    lab.tmux_ok(["switch-client", "-t", target]);
+    lab.wait_for_client_session(target);
+    lab.tmux_ok(["split-window", "-h", "-t", main.as_str(), "sh"]);
+    lab.wait_for_non_sidebar_pane_count(target, 2);
+    lab.tmux_ok(["select-layout", "-t", target, "even-horizontal"]);
+    lab.wait_for_sidebar_width(target, 36);
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.wait_for_client_session("opensessions");
+    lab.tmux_ok(["resize-window", "-t", target, "-x", "100", "-y", "40"]);
+    lab.tmux_ok(["set-window-option", "-t", target, "window-size", "latest"]);
+
+    lab.tmux_ok(["switch-client", "-t", target]);
+    lab.wait_for_client_session(target);
+    lab.wait_for_sidebar_width(target, 36);
+
+    let widths = lab
+        .tmux([
+            "list-panes",
+            "-t",
+            &exact_session_target(target),
+            "-f",
+            "#{!=:#{pane_title},opensessions-sidebar}",
+            "-F",
+            "#{pane_width}",
+        ])
+        .lines()
+        .map(|width| width.parse::<u16>().expect("content pane width"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        widths.len(),
+        2,
+        "expected two content panes; got {widths:?}"
+    );
+    assert!(
+        widths[0].abs_diff(widths[1]) <= 2,
+        "returning to a stale session must preserve evenly split content panes; widths={widths:?}\nlayout={}\nlogs:\n{}",
+        lab.tmux(["display-message", "-p", "-t", target, "#{window_layout}"]),
+        lab.logs(),
+    );
+}
+
+#[test]
 fn tmux_sidebar_client_resize_never_persists_a_smaller_sidebar_width() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-client-resize-fixed-width");
@@ -2594,8 +2643,9 @@ for _ in range(3000):
         );
         assert!(
             hooks.contains("after-resize-pane")
-                && hooks.contains("-t '#{pane_id}' -x '#{@opensessions_width}'"),
-            "width repair hook must read the target width at execution time; hooks:\n{hooks}"
+                && hooks.contains("/repair-sidebar-width")
+                && hooks.contains("#{pane_id}"),
+            "width repair hook must target the resized pane through the server-owned width repair path; hooks:\n{hooks}"
         );
         assert!(
             !hooks.contains("case  in") && !hooks.contains("[ -n  ]") && !hooks.contains("-t  -x"),

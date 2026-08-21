@@ -1342,6 +1342,22 @@ impl StateSource for ReadOnlyMuxStateSource {
                 }
                 None
             }
+            "/repair-sidebar-width" => {
+                if self.is_sidebar_visible()
+                    && let Some(context) = parse_context(body)
+                    && let Some(pane_id) = context.pane_id
+                    && !self
+                        .providers
+                        .iter()
+                        .any(|provider| provider.is_sidebar_mouse_resize_active(&context.window_id))
+                {
+                    let width = self.current_sidebar_width_u16();
+                    for provider in &self.providers {
+                        provider.resize_sidebar_pane(&pane_id, width);
+                    }
+                }
+                None
+            }
             "/set-sidebar-width" => {
                 let width = body.trim().parse::<u16>().ok()?;
                 self.set_sidebar_width(width);
@@ -3793,6 +3809,7 @@ fn is_ok_hook_path(path: &str) -> bool {
         "/pane-exited"
             | "/pane-layout-changed"
             | "/client-resized"
+            | "/repair-sidebar-width"
             | "/ensure-sidebar"
             | "/ensure-sidebars"
             | "/set-sidebar-width"
