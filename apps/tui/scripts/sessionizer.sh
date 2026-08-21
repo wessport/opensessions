@@ -63,8 +63,14 @@ else
   exit 0
 fi
 
-# Derive session name from directory basename, replacing dots with underscores
-session_name=$(basename "$selected" | tr '.' '_')
+# Offer the directory basename as a default while allowing the new session to
+# have a more descriptive name. An empty response preserves the quick path for
+# users who are happy with the derived name.
+default_session_name=$(basename "$selected" | tr '.' '_')
+printf '\nSession name [%s]: ' "$default_session_name"
+IFS= read -r entered_session_name || entered_session_name=""
+session_name="${entered_session_name:-$default_session_name}"
+session_name=$(printf '%s' "$session_name" | tr '.:' '__')
 
 # If session already exists, just switch to it
 if tmux has-session -t "=$session_name" 2>/dev/null; then

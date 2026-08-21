@@ -74,6 +74,39 @@ describe("sessionizer path selection", () => {
     expect(readFileSync(files.tmuxLog, "utf8")).not.toContain(`-c ${match}`);
   });
 
+  test("creates the selected directory with an explicitly entered session name", () => {
+    const { search, files, env } = fixture();
+    const match = join(search, "project-directory");
+    mkdirSync(match);
+
+    const result = Bun.spawnSync([sessionizer], {
+      env: { ...env, FZF_QUERY: "", FZF_MATCH: match },
+      stdin: Buffer.from("descriptive session name\n"),
+    });
+
+    expect(result.exitCode).toBe(0);
+    const tmuxLog = readFileSync(files.tmuxLog, "utf8");
+    expect(tmuxLog).toContain("has-session -t =descriptive session name");
+    expect(tmuxLog).toContain(`new-session -d -s descriptive session name -c ${match}`);
+    expect(tmuxLog).toContain("switch-client -t descriptive session name");
+  });
+
+  test("normalizes tmux separators in an explicitly entered session name", () => {
+    const { search, files, env } = fixture();
+    const match = join(search, "project-directory");
+    mkdirSync(match);
+
+    const result = Bun.spawnSync([sessionizer], {
+      env: { ...env, FZF_QUERY: "", FZF_MATCH: match },
+      stdin: Buffer.from("team:project.v2\n"),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(files.tmuxLog, "utf8")).toContain(
+      `new-session -d -s team_project_v2 -c ${match}`,
+    );
+  });
+
   test("expands a typed home-relative directory", () => {
     const { root, search, files, env } = fixture();
     const typed = join(root, "repos", "project");
@@ -144,6 +177,28 @@ describe("sessionizer path selection", () => {
     const tmuxLog = readFileSync(files.tmuxLog, "utf8");
     expect(tmuxLog).toContain("has-session -t =existing");
     expect(tmuxLog).toContain("switch-client -t existing");
+    expect(tmuxLog).not.toContain("new-session");
+  });
+
+  test("switches to an existing explicitly named session instead of duplicating it", () => {
+    const { search, files, env } = fixture();
+    const match = join(search, "project-directory");
+    mkdirSync(match);
+
+    const result = Bun.spawnSync([sessionizer], {
+      env: {
+        ...env,
+        FZF_QUERY: "",
+        FZF_MATCH: match,
+        TMUX_HAS_SESSION: "1",
+      },
+      stdin: Buffer.from("existing custom name\n"),
+    });
+
+    expect(result.exitCode).toBe(0);
+    const tmuxLog = readFileSync(files.tmuxLog, "utf8");
+    expect(tmuxLog).toContain("has-session -t =existing custom name");
+    expect(tmuxLog).toContain("switch-client -t existing custom name");
     expect(tmuxLog).not.toContain("new-session");
   });
 
