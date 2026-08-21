@@ -249,6 +249,11 @@ impl TmuxClient {
         self.run(&["kill-session", "-t", target]);
     }
 
+    pub fn rename_session(&self, target: &str, new_name: &str) -> bool {
+        self.run(&["rename-session", "-t", &format!("={target}"), new_name])
+            .ok()
+    }
+
     pub fn unlink_window(&self, session_name: &str, window_id: &str) {
         self.run(&[
             "unlink-window",
@@ -609,6 +614,10 @@ impl MuxProvider for TmuxProvider {
 
     fn create_session(&self, name: Option<&str>, dir: Option<&str>) {
         self.client.new_session(name, dir);
+    }
+
+    fn rename_session(&self, name: &str, new_name: &str) -> bool {
+        self.client.rename_session(name, new_name)
     }
 
     fn kill_session(&self, name: &str) {
@@ -1353,6 +1362,24 @@ mod tests {
                 "-p".to_string(),
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn rename_session_uses_an_exact_tmux_target() {
+        let runner = Arc::new(RecordingRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert!(provider.rename_session("draft", "descriptive name"));
+
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "rename-session".to_string(),
+                "-t".to_string(),
+                "=draft".to_string(),
+                "descriptive name".to_string(),
+            ]]
         );
     }
 

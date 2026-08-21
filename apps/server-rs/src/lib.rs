@@ -928,6 +928,22 @@ impl StateSource for ReadOnlyMuxStateSource {
                 provider.create_session(None, None);
                 Some(self.snapshot_json())
             }
+            "rename-session" => {
+                let name = command.get("name")?.as_str()?;
+                let new_name = command.get("newName")?.as_str()?.trim();
+                if new_name.is_empty() || new_name == name {
+                    return None;
+                }
+                if !provider.rename_session(name, new_name) {
+                    return Some(self.snapshot_json());
+                }
+                self.rename_session_references(name, new_name);
+                serde_json::to_string(&ServerMessage::ReIdentify {
+                    old_name: name.to_string(),
+                    new_name: new_name.to_string(),
+                })
+                .ok()
+            }
             "switch-session" => {
                 let name = command.get("name")?.as_str()?;
                 let client_tty = command
@@ -1342,6 +1358,29 @@ impl StateSource for ReadOnlyMuxStateSource {
 }
 
 impl ReadOnlyMuxStateSource {
+    fn rename_session_references(&self, name: &str, new_name: &str) {
+        self.session_order.lock().unwrap().rename(name, new_name);
+        self.metadata_store
+            .lock()
+            .unwrap()
+            .rename_session(name, new_name);
+        self.agent_tracker
+            .lock()
+            .unwrap()
+            .rename_session(name, new_name);
+
+        let mut focused_session = self.focused_session.lock().unwrap();
+        if focused_session.as_deref() == Some(name) {
+            *focused_session = Some(new_name.to_string());
+        }
+        drop(focused_session);
+
+        let mut focused_panes = self.focused_pane_by_session.lock().unwrap();
+        if let Some(pane_id) = focused_panes.remove(name) {
+            focused_panes.insert(new_name.to_string(), pane_id);
+        }
+    }
+
     fn apply_agent_event(&self, body: &Value) -> Result<(), AgentEventError> {
         let agent = body
             .get("agent")
@@ -3555,6 +3594,16 @@ async fn handle_connection(
                                         let _ = state_updates.send(payload);
                                     }
                                 }
+                                if command.get("type").and_then(Value::as_str)
+                                    == Some("rename-session")
+                                    && let Some(snapshot) = run_state_source_blocking(
+                                        &state_source,
+                                        &state_operation_lock,
+                                        StateSource::snapshot_json,
+                                    ).await?
+                                {
+                                    let _ = state_updates.send(snapshot);
+                                }
                             }
                         }
                         Some(Err(err)) => return Err(err.into()),
@@ -3813,7 +3862,7 @@ fn switch_session_target(command: &Value) -> Option<String> {
 }
 
 fn is_immediate_server_message(payload: &str) -> bool {
-    payload.contains(r#""type":"activate-session""#)
+    payload.contains(r#""type":"activate-session""#) || payload.contains(r#""type":"re-identify""#)
 }
 
 fn clamp_detail_panel_height(height: u16) -> u16 {
@@ -3965,6 +4014,90 @@ mod tests {
         fn kill_session(&self, _name: &str) {}
         fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
         fn cleanup_hooks(&self) {}
+    }
+
+    #[derive(Default)]
+    struct RenameTestProvider {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl MuxProvider for RenameTestProvider {
+        fn name(&self) -> &str {
+            "rename-test"
+        }
+
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            Vec::new()
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("draft".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn rename_session(&self, name: &str, new_name: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), new_name.to_string()));
+            true
+        }
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn rename_command_updates_tmux_and_requests_live_client_reidentification() {
+        let provider = Arc::new(RenameTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        *source.focused_session.lock().unwrap() = Some("draft".to_string());
+        source
+            .focused_pane_by_session
+            .lock()
+            .unwrap()
+            .insert("draft".to_string(), "%1".to_string());
+
+        let response = source.handle_client_command(&serde_json::json!({
+            "type": "rename-session",
+            "name": "draft",
+            "newName": "descriptive-name",
+        }));
+
+        assert_eq!(
+            provider.calls.lock().unwrap().as_slice(),
+            &[("draft".to_string(), "descriptive-name".to_string())]
+        );
+        assert_eq!(
+            response,
+            serde_json::to_string(&ServerMessage::ReIdentify {
+                old_name: "draft".to_string(),
+                new_name: "descriptive-name".to_string(),
+            })
+            .ok()
+        );
+        assert_eq!(
+            source.focused_session.lock().unwrap().as_deref(),
+            Some("descriptive-name")
+        );
+        assert_eq!(
+            source
+                .focused_pane_by_session
+                .lock()
+                .unwrap()
+                .get("descriptive-name")
+                .map(String::as_str),
+            Some("%1")
+        );
     }
 
     struct CountingPortRunner {

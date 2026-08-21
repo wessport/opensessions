@@ -107,6 +107,46 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
 }
 
 #[test]
+fn tmux_sidebar_renames_session_without_losing_connected_sidebars() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-rename-session");
+    let second_window = lab.spawn_window_with_sidebar("opensessions", "rename-second-sidebar");
+    let third_window = lab.spawn_window_with_sidebar("opensessions", "rename-third-sidebar");
+    let other = lab.sidebar_pane_in_window("opensessions", &third_window);
+    let source = lab.sidebar_pane_in_window("opensessions", &second_window);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-window", "-t", second_window.as_str()]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    sleep(Duration::from_millis(250));
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "r"]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("Rename session"));
+    for _ in 0.."opensessions".len() {
+        lab.tmux_ok(["send-keys", "-t", source.as_str(), "BSpace"]);
+    }
+    lab.tmux_ok([
+        "send-keys",
+        "-t",
+        source.as_str(),
+        "-l",
+        "renamed-opensessions",
+    ]);
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+
+    lab.wait_for_client_session("renamed-opensessions");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "renamed-opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    lab.wait_for_capture_pane(&other, |text| {
+        row_with(text, "renamed-opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    assert!(
+        lab.tmux(["has-session", "-t", "=renamed-opensessions"])
+            .is_empty()
+    );
+}
+
+#[test]
 fn tmux_sidebar_concurrent_ensure_keeps_one_sidebar_per_window() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-concurrent-ensure");

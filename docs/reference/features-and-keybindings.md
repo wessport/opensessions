@@ -65,9 +65,10 @@ Clicking a detected port opens `http://localhost:<port>`.
 | `Alt+Up` | Move focused session up in persisted order |
 | `Alt+Down` | Move focused session down in persisted order |
 | `n`, `c` | Open the directory picker to create or switch to a session |
+| `r` (or `$`) | Rename the focused session |
 | `d`, `x` | Open kill-session confirmation for focused session |
 | `t` | Open theme picker |
-| `r` | Refresh state |
+| `R` | Refresh state |
 | `q` | Quit the server and all sidebar panes |
 | `Esc` | Close only the current sidebar client |
 

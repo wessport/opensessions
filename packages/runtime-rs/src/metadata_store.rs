@@ -90,6 +90,12 @@ impl SessionMetadataStore {
         }
     }
 
+    pub fn rename_session(&mut self, session: &str, new_name: &str) {
+        if let Some(metadata) = self.store.remove(session) {
+            self.store.insert(new_name.to_string(), metadata);
+        }
+    }
+
     pub fn prune_sessions(&mut self, valid_names: impl IntoIterator<Item = String>) {
         let valid = valid_names.into_iter().collect::<BTreeSet<_>>();
         self.store.retain(|name, _| valid.contains(name));
