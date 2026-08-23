@@ -106,11 +106,30 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
 
 fn apply_modal_key(app: &mut App, key: UiKey) {
     match &app.modal {
+        Modal::RenameSession { .. } => apply_rename_session_key(app, key),
         Modal::ThemePicker { .. } => apply_theme_picker_key(app, key),
         Modal::WidthSlider { .. } => apply_width_slider_key(app, key),
         Modal::KillConfirm { .. } => apply_kill_confirm_key(app, key),
         Modal::WindowManager { .. } => apply_window_manager_key(app, key),
         Modal::None => {}
+    }
+}
+
+fn apply_rename_session_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Esc => app.modal = Modal::None,
+        UiKey::Enter => app.confirm_rename_session(),
+        UiKey::Backspace => {
+            if let Modal::RenameSession { draft, .. } = &mut app.modal {
+                draft.pop();
+            }
+        }
+        UiKey::Char(ch) => {
+            if let Modal::RenameSession { draft, .. } = &mut app.modal {
+                draft.push(ch);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -399,6 +418,26 @@ mod tests {
             vec![ClientCommand::SetTheme {
                 theme: "electric-fusion".to_string(),
                 transparent_background: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn rename_dialog_submits_the_edited_session_name() {
+        let mut app = app_with_windows();
+        app.modal = Modal::RenameSession {
+            original_name: "project".to_string(),
+            draft: "renamed-project".to_string(),
+        };
+
+        apply_ui_key(&mut app, UiKey::Enter);
+
+        assert_eq!(app.modal, Modal::None);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::RenameSession {
+                name: "project".to_string(),
+                new_name: "renamed-project".to_string(),
             }]
         );
     }

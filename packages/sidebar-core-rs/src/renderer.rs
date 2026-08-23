@@ -1489,6 +1489,10 @@ fn render_modal_overlay(
     height: usize,
 ) {
     match &app.modal {
+        Modal::RenameSession {
+            original_name,
+            draft,
+        } => render_rename_session_overlay(palette, lines, width, height, original_name, draft),
         Modal::ThemePicker {
             query, selected, ..
         } => render_theme_picker_overlay(
@@ -1833,6 +1837,65 @@ fn render_theme_picker_overlay(
     bottom.push("╯", border_color);
     if row < lines.len() {
         lines[row] = bottom;
+    }
+}
+
+fn render_rename_session_overlay(
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+    original_name: &str,
+    draft: &str,
+) {
+    let desired_box_width = 34usize
+        .max(original_name.width() + 6)
+        .max(draft.width() + 6);
+    let max_box_width = width.saturating_sub(2);
+    let box_height = 7usize;
+    if height < box_height + 2 || max_box_width < 16 {
+        return;
+    }
+    let box_width = desired_box_width.min(max_box_width);
+    let inner_width = box_width - 2;
+    let start_y = (height.saturating_sub(box_height)) / 2;
+    let start_x = (width.saturating_sub(box_width)) / 2;
+    let border_color = palette.blue;
+
+    let border = |left: &str, right: &str| {
+        let mut line = StyledLine::blank();
+        line.push(" ".repeat(start_x), palette.white);
+        line.push(left, border_color);
+        line.push("─".repeat(inner_width), border_color);
+        line.push(right, border_color);
+        line
+    };
+    let framed = |content: &str, color: Rgb| {
+        let content = truncate_right(content, inner_width.saturating_sub(2));
+        let padding = inner_width.saturating_sub(content.width() + 1);
+        let mut line = StyledLine::blank();
+        line.push(" ".repeat(start_x), palette.white);
+        line.push("│", border_color);
+        line.push(" ", palette.white);
+        line.push(content, color);
+        line.push(" ".repeat(padding), palette.white);
+        line.push("│", border_color);
+        line
+    };
+
+    let rows = [
+        border("╭", "╮"),
+        framed("Rename session", palette.blue),
+        framed(original_name, palette.overlay0),
+        framed("", palette.white),
+        framed(&format!("> {draft}_"), palette.text),
+        framed("Enter save · Esc cancel", palette.overlay0),
+        border("╰", "╯"),
+    ];
+    for (offset, row) in rows.into_iter().enumerate() {
+        if let Some(target) = lines.get_mut(start_y + offset) {
+            *target = row;
+        }
     }
 }
 
@@ -2229,6 +2292,8 @@ fn footer(palette: &Palette, width: usize) -> [StyledLine; 2] {
         (" width  ", palette.overlay1),
         ("d", palette.overlay0),
         (" hide  ", palette.overlay1),
+        ("r", palette.overlay0),
+        (" rename  ", palette.overlay1),
         ("W", palette.overlay0),
         (" windows  ", palette.overlay1),
         ("x", palette.overlay0),
@@ -3290,6 +3355,38 @@ mod tests {
             "long kill target should be visibly truncated inside narrow modal\n{}",
             lines.join("\n")
         );
+    }
+
+    #[test]
+    fn rename_overlay_shows_a_prefilled_editable_name() {
+        let mut app = app_from_sessions(vec![session("draft", "/tmp/draft", "main")]);
+        app.modal = Modal::RenameSession {
+            original_name: "draft".to_string(),
+            draft: "descriptive-name".to_string(),
+        };
+
+        let lines = render_text(&app, 44, 24);
+
+        assert!(lines.iter().any(|line| line.contains("Rename session")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("> descriptive-name_"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Enter save · Esc cancel"))
+        );
+    }
+
+    #[test]
+    fn standard_width_footer_advertises_session_rename() {
+        let app = app_from_sessions(vec![session("draft", "/tmp/draft", "main")]);
+
+        let lines = render_text(&app, 36, 24);
+
+        assert!(lines.iter().any(|line| line.contains("r rename")));
     }
 
     #[test]

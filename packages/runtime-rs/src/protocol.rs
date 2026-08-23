@@ -32,7 +32,10 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         source_pane_id: Option<String>,
     },
-    ReIdentify,
+    ReIdentify {
+        old_name: String,
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -268,6 +271,10 @@ pub enum ClientCommand {
         client_tty: Option<String>,
     },
     NewSession,
+    RenameSession {
+        name: String,
+        new_name: String,
+    },
     HideSession {
         name: String,
     },

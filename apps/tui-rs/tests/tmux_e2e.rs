@@ -107,6 +107,46 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
 }
 
 #[test]
+fn tmux_sidebar_renames_session_without_losing_connected_sidebars() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-rename-session");
+    let second_window = lab.spawn_window_with_sidebar("opensessions", "rename-second-sidebar");
+    let third_window = lab.spawn_window_with_sidebar("opensessions", "rename-third-sidebar");
+    let other = lab.sidebar_pane_in_window("opensessions", &third_window);
+    let source = lab.sidebar_pane_in_window("opensessions", &second_window);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-window", "-t", second_window.as_str()]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    sleep(Duration::from_millis(250));
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "r"]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("Rename session"));
+    for _ in 0.."opensessions".len() {
+        lab.tmux_ok(["send-keys", "-t", source.as_str(), "BSpace"]);
+    }
+    lab.tmux_ok([
+        "send-keys",
+        "-t",
+        source.as_str(),
+        "-l",
+        "renamed-opensessions",
+    ]);
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+
+    lab.wait_for_client_session("renamed-opensessions");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "renamed-opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    lab.wait_for_capture_pane(&other, |text| {
+        row_with(text, "renamed-opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    assert!(
+        lab.tmux(["has-session", "-t", "=renamed-opensessions"])
+            .is_empty()
+    );
+}
+
+#[test]
 fn tmux_sidebar_concurrent_ensure_keeps_one_sidebar_per_window() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-concurrent-ensure");
@@ -1057,6 +1097,55 @@ fn tmux_sidebar_width_survives_flat_three_pane_layout_churn() {
 
     lab.wait_for_non_sidebar_pane_count("opensessions", 1);
     lab.wait_for_all_sidebar_widths(36);
+}
+
+#[test]
+fn tmux_sidebar_preserves_even_content_panes_when_returning_to_stale_session() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-stale-three-pane-layout");
+    let target = "effect-ts";
+    let main = lab.main_pane(target);
+
+    lab.tmux_ok(["switch-client", "-t", target]);
+    lab.wait_for_client_session(target);
+    lab.tmux_ok(["split-window", "-h", "-t", main.as_str(), "sh"]);
+    lab.wait_for_non_sidebar_pane_count(target, 2);
+    lab.tmux_ok(["select-layout", "-t", target, "even-horizontal"]);
+    lab.wait_for_sidebar_width(target, 36);
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.wait_for_client_session("opensessions");
+    lab.tmux_ok(["resize-window", "-t", target, "-x", "100", "-y", "40"]);
+    lab.tmux_ok(["set-window-option", "-t", target, "window-size", "latest"]);
+
+    lab.tmux_ok(["switch-client", "-t", target]);
+    lab.wait_for_client_session(target);
+    lab.wait_for_sidebar_width(target, 36);
+
+    let widths = lab
+        .tmux([
+            "list-panes",
+            "-t",
+            &exact_session_target(target),
+            "-f",
+            "#{!=:#{pane_title},opensessions-sidebar}",
+            "-F",
+            "#{pane_width}",
+        ])
+        .lines()
+        .map(|width| width.parse::<u16>().expect("content pane width"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        widths.len(),
+        2,
+        "expected two content panes; got {widths:?}"
+    );
+    assert!(
+        widths[0].abs_diff(widths[1]) <= 2,
+        "returning to a stale session must preserve evenly split content panes; widths={widths:?}\nlayout={}\nlogs:\n{}",
+        lab.tmux(["display-message", "-p", "-t", target, "#{window_layout}"]),
+        lab.logs(),
+    );
 }
 
 #[test]
@@ -2554,8 +2643,9 @@ for _ in range(3000):
         );
         assert!(
             hooks.contains("after-resize-pane")
-                && hooks.contains("-t '#{pane_id}' -x '#{@opensessions_width}'"),
-            "width repair hook must read the target width at execution time; hooks:\n{hooks}"
+                && hooks.contains("/repair-sidebar-width")
+                && hooks.contains("#{pane_id}"),
+            "width repair hook must target the resized pane through the server-owned width repair path; hooks:\n{hooks}"
         );
         assert!(
             !hooks.contains("case  in") && !hooks.contains("[ -n  ]") && !hooks.contains("-t  -x"),

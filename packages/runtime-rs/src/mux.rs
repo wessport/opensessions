@@ -86,6 +86,9 @@ pub trait MuxProvider: Send + Sync {
     fn get_pane_count(&self, name: &str) -> u32;
     fn get_client_tty(&self) -> String;
     fn create_session(&self, name: Option<&str>, dir: Option<&str>);
+    fn rename_session(&self, _name: &str, _new_name: &str) -> bool {
+        false
+    }
     fn kill_session(&self, name: &str);
     fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str);
     fn cleanup_hooks(&self);

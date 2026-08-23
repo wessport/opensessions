@@ -75,6 +75,10 @@ pub enum KillTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     None,
+    RenameSession {
+        original_name: String,
+        draft: String,
+    },
     ThemePicker {
         query: String,
         selected: usize,
@@ -317,15 +321,7 @@ impl App {
                     self.confirm_local_session(name, true);
                 }
             }
-            ServerMessage::ReIdentify => {
-                if let Some(identity) = self.pane_identity.clone() {
-                    self.commands.push(ClientCommand::IdentifyPane {
-                        pane_id: identity.pane_id,
-                        session_name: identity.session_name,
-                        window_id: identity.window_id,
-                    });
-                }
-            }
+            ServerMessage::ReIdentify { .. } => {}
             ServerMessage::WindowList {
                 session,
                 mut windows,
@@ -563,7 +559,8 @@ impl App {
                 self.commands.push(ClientCommand::Quit);
                 self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
             }
-            'r' => self.commands.push(ClientCommand::Refresh),
+            'R' => self.commands.push(ClientCommand::Refresh),
+            '$' | 'r' => self.open_rename_session(),
             'n' | 'c' => self.pending_launches.push(LaunchTarget::Sessionizer),
             'u' => self.commands.push(ClientCommand::ShowAllSessions),
             'd' => {
@@ -835,6 +832,35 @@ impl App {
 
     pub fn is_modal_open(&self) -> bool {
         !matches!(self.modal, Modal::None)
+    }
+
+    pub fn open_rename_session(&mut self) {
+        let Some(name) = self.focused_session_name().map(str::to_string) else {
+            return;
+        };
+        self.modal = Modal::RenameSession {
+            original_name: name.clone(),
+            draft: name,
+        };
+    }
+
+    pub fn confirm_rename_session(&mut self) {
+        let Modal::RenameSession {
+            original_name,
+            draft,
+        } = self.modal.clone()
+        else {
+            return;
+        };
+        self.modal = Modal::None;
+        let new_name = draft.trim();
+        if new_name.is_empty() || new_name == original_name {
+            return;
+        }
+        self.commands.push(ClientCommand::RenameSession {
+            name: original_name,
+            new_name: new_name.to_string(),
+        });
     }
 
     pub fn open_theme_picker(&mut self) {
@@ -1558,6 +1584,23 @@ mod tests {
 
         assert_eq!(app.drain_launches(), vec![LaunchTarget::Sessionizer]);
         assert!(app.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn rename_key_opens_a_prefilled_dialog_for_the_focused_session() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("new-session", "/tmp/new-session", false)];
+        let mut app = App::from_state(state);
+
+        app.handle_key_char('r');
+
+        assert_eq!(
+            app.modal,
+            Modal::RenameSession {
+                original_name: "new-session".to_string(),
+                draft: "new-session".to_string(),
+            }
+        );
     }
 
     #[test]

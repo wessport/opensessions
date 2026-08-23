@@ -154,13 +154,17 @@ fn tmux_double_quote(value: &str) -> String {
         .replace('$', "\\$")
 }
 
-pub fn resized_pane_width_repair_command() -> String {
+pub fn resized_pane_width_repair_command(base: &str, token_file: &str) -> String {
     run_shell_command(
         &format!(
-            "[ '{}' != 1 ] || tmux -S #{{socket_path}} resize-pane -t '{}' -x '{}'",
+            "[ '{}' != 1 ] || {}",
             sidebar_width_repair_filter().render(),
-            TmuxVar::PaneId.format().render(),
-            TmuxVar::SidebarWidthOption.format().render(),
+            http_hook_script(
+                base,
+                "/repair-sidebar-width",
+                Some(hook_context_format()),
+                token_file,
+            ),
         ),
         true,
     )
@@ -295,10 +299,12 @@ mod tests {
 
     #[test]
     fn renders_resized_pane_repair_without_a_global_scan() {
-        assert_eq!(
-            resized_pane_width_repair_command(),
-            "run-shell -b \"[ '#{&&:#{>:#{window_panes},1},#{&&:#{==:#{pane_title},opensessions-sidebar},#{&&:#{!=:#{pane_width},#{@opensessions_width}},#{!=:#{window_id},#{@opensessions_mouse_resize_window}}}}}' != 1 ] || tmux -S #{socket_path} resize-pane -t '#{pane_id}' -x '#{@opensessions_width}'\""
-        );
+        let command = resized_pane_width_repair_command("http://127.0.0.1:45123", "/tmp/token");
+
+        assert!(command.contains("#{==:#{pane_title},opensessions-sidebar}"));
+        assert!(command.contains("/repair-sidebar-width"));
+        assert!(command.contains("#{pane_id}"));
+        assert!(!command.contains("list-panes"));
     }
 
     #[test]

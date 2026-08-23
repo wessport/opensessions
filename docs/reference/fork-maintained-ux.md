@@ -8,10 +8,12 @@ not incidental implementation details.
 
 - `n` and `c` open the tmux sessionizer popup. They must not silently create a
   sequentially numbered session.
+- `r` opens a visible, prefilled dialog that renames the focused session and
+  keeps connected sidebars attached to the renamed session.
 - The sessionizer supports fuzzy selection, explicit valid paths (including
   `~/...`), colon-separated `SESSIONIZER_DIR` roots, configurable
-  `SESSIONIZER_MAXDEPTH`, hidden-directory filtering, and switching to an
-  existing same-named session.
+  `SESSIONIZER_MAXDEPTH`, hidden-directory filtering, an editable session name,
+  and switching to an existing same-named session.
 - Session rows retain inline agent state signals, including running and
   completed/waiting-for-feedback states.
 - Electric Fusion remains available as a theme. Palette choice and transparent

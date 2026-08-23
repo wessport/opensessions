@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     let auth_token = std::fs::read_to_string(&env.token_file)
         .with_context(|| format!("read opensessions token {}", env.token_file))?;
 
-    let identity = pane_identity_resolve(|key| std::env::var(key).ok(), tmux_display_message);
+    let mut identity = pane_identity_resolve(|key| std::env::var(key).ok(), tmux_display_message);
 
     debug_log(format!(
         "starting: connecting to ws://{server_host}:{server_port}/ identity={identity:?}"
@@ -324,6 +324,21 @@ async fn main() -> Result<()> {
                             ));
                             app.apply_server_message(ServerMessage::State(state));
                         }
+                        (
+                            Some(app),
+                            ServerMessage::ReIdentify { old_name, new_name },
+                        ) => {
+                            if let Some(refreshed) = identity.as_mut()
+                                && refreshed.session_name == old_name
+                            {
+                                refreshed.session_name = new_name;
+                                app.identify_pane(
+                                    refreshed.pane_id.clone(),
+                                    refreshed.session_name.clone(),
+                                    refreshed.window_id.clone(),
+                                );
+                            }
+                        }
                         (Some(app), message) => {
                             debug_log(format!("ws: received {message:?}"));
                             app.apply_server_message(message);
@@ -466,6 +481,9 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
 }
 
 fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('4') {
+        return Some(UiKey::Char('$'));
+    }
     if key.modifiers.contains(KeyModifiers::ALT) {
         return match key.code {
             KeyCode::Up => Some(UiKey::AltUp),
@@ -809,6 +827,14 @@ mod tests {
             &["%1".to_string(), "%2".to_string()],
         ));
         assert!(!sidebar_should_animate(None, &["%1".to_string()]));
+    }
+
+    #[test]
+    fn shifted_four_is_normalized_to_the_session_rename_key() {
+        assert_eq!(
+            ui_key_from_crossterm(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT)),
+            Some(UiKey::Char('$'))
+        );
     }
 
     #[test]

@@ -65,6 +65,25 @@ impl SessionOrder {
         let _ = self.save();
     }
 
+    pub fn rename(&mut self, name: &str, new_name: &str) {
+        let mut changed = false;
+        for candidate in &mut self.order {
+            if candidate == name {
+                *candidate = new_name.to_string();
+                changed = true;
+            }
+        }
+        for candidate in &mut self.hidden {
+            if candidate == name {
+                *candidate = new_name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.save();
+        }
+    }
+
     pub fn show(&mut self, name: &str) {
         let len_before = self.hidden.len();
         self.hidden.retain(|candidate| candidate != name);
@@ -156,4 +175,28 @@ fn strings_from_value_array(values: Vec<Value>) -> Vec<String> {
         .into_iter()
         .filter_map(|value| value.as_str().map(str::to_string))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_preserves_position_and_hidden_state() {
+        let mut order = SessionOrder::new(None);
+        order.sync(["first".to_string(), "draft".to_string(), "last".to_string()]);
+        order.hide("draft");
+
+        order.rename("draft", "named");
+
+        assert_eq!(
+            order.apply(["last".to_string(), "named".to_string(), "first".to_string()]),
+            vec!["first".to_string(), "last".to_string()]
+        );
+        order.show("named");
+        assert_eq!(
+            order.apply(["last".to_string(), "named".to_string(), "first".to_string()]),
+            vec!["first".to_string(), "named".to_string(), "last".to_string()]
+        );
+    }
 }

@@ -249,6 +249,11 @@ impl TmuxClient {
         self.run(&["kill-session", "-t", target]);
     }
 
+    pub fn rename_session(&self, target: &str, new_name: &str) -> bool {
+        self.run(&["rename-session", "-t", &format!("={target}"), new_name])
+            .ok()
+    }
+
     pub fn unlink_window(&self, session_name: &str, window_id: &str) {
         self.run(&[
             "unlink-window",
@@ -295,9 +300,15 @@ impl TmuxClient {
         if targets.is_empty() {
             return;
         }
-        let script = targets
+        let panes = self.list_panes(PaneScope::All);
+        let mut repairs = Vec::new();
+        for target in targets {
+            repairs.push((target.clone(), width));
+            repairs.extend(flat_content_width_repairs(&panes, target, width));
+        }
+        let script = repairs
             .iter()
-            .map(|target| {
+            .map(|(target, width)| {
                 format!(
                     "tmux resize-pane -t {} -x {width} >/dev/null 2>&1 || true",
                     shell_quote(target)
@@ -611,6 +622,10 @@ impl MuxProvider for TmuxProvider {
         self.client.new_session(name, dir);
     }
 
+    fn rename_session(&self, name: &str, new_name: &str) -> bool {
+        self.client.rename_session(name, new_name)
+    }
+
     fn kill_session(&self, name: &str) {
         self.client.kill_session(name);
     }
@@ -658,8 +673,10 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("after-kill-pane", &pane_exited_cmd);
         self.client.set_global_hook("pane-exited", &pane_exited_cmd);
         self.client.set_global_hook("pane-died", &pane_died_cmd);
-        self.client
-            .set_global_hook("after-resize-pane", &resized_pane_width_repair_command());
+        self.client.set_global_hook(
+            "after-resize-pane",
+            &resized_pane_width_repair_command(&base, token_file),
+        );
         self.client
             .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
         self.client
@@ -940,7 +957,8 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn resize_sidebar_pane(&self, pane_id: &str, width: u16) {
-        self.client.resize_pane_width(pane_id, width);
+        self.client
+            .resize_pane_widths(&[pane_id.to_string()], width);
     }
 
     fn resize_sidebar_panes(&self, pane_ids: &[String], width: u16) {
@@ -1063,6 +1081,59 @@ fn client_format() -> &'static str {
 
 fn pane_format() -> &'static str {
     "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
+}
+
+fn flat_content_width_repairs(
+    panes: &[PaneInfo],
+    sidebar_id: &str,
+    sidebar_width: u16,
+) -> Vec<(String, u16)> {
+    let Some(sidebar) = panes.iter().find(|pane| pane.id == sidebar_id) else {
+        return Vec::new();
+    };
+    if sidebar.width == sidebar_width {
+        return Vec::new();
+    }
+
+    let mut window_panes = panes
+        .iter()
+        .filter(|pane| pane.window_id == sidebar.window_id)
+        .collect::<Vec<_>>();
+    window_panes.sort_by_key(|pane| pane.left);
+    if window_panes.len() < 3
+        || window_panes
+            .iter()
+            .any(|pane| pane.height != sidebar.height)
+    {
+        return Vec::new();
+    }
+
+    let content = window_panes
+        .into_iter()
+        .filter(|pane| pane.id != sidebar_id)
+        .collect::<Vec<_>>();
+    let old_content_width = content
+        .iter()
+        .map(|pane| u32::from(pane.width))
+        .sum::<u32>();
+    let new_content_width =
+        old_content_width as i32 + i32::from(sidebar.width) - i32::from(sidebar_width);
+    if old_content_width == 0 || new_content_width < content.len() as i32 {
+        return Vec::new();
+    }
+
+    let mut remaining = new_content_width as u32;
+    let mut repairs = Vec::new();
+    for (index, pane) in content.iter().enumerate().take(content.len() - 1) {
+        let panes_after = (content.len() - index - 1) as u32;
+        let proportional = ((new_content_width as u32 * u32::from(pane.width))
+            + old_content_width / 2)
+            / old_content_width;
+        let pane_width = proportional.clamp(1, remaining.saturating_sub(panes_after));
+        repairs.push((pane.id.clone(), pane_width as u16));
+        remaining = remaining.saturating_sub(pane_width);
+    }
+    repairs
 }
 
 fn state_fingerprint_format() -> &'static str {
@@ -1357,6 +1428,24 @@ mod tests {
     }
 
     #[test]
+    fn rename_session_uses_an_exact_tmux_target() {
+        let runner = Arc::new(RecordingRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert!(provider.rename_session("draft", "descriptive name"));
+
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "rename-session".to_string(),
+                "-t".to_string(),
+                "=draft".to_string(),
+                "descriptive name".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
     fn visible_sidebars_require_an_attached_client_and_active_window() {
         let runner = Arc::new(VisibilityRunner::default());
         let provider = TmuxProvider::new(runner.clone());
@@ -1519,11 +1608,33 @@ mod tests {
 
         assert_eq!(
             runner.calls.lock().unwrap().as_slice(),
-            &[vec![
-                "run-shell".to_string(),
-                "-b".to_string(),
-                "tmux resize-pane -t '%1' -x 36 >/dev/null 2>&1 || true; tmux resize-pane -t '%2' -x 36 >/dev/null 2>&1 || true".to_string(),
-            ]],
+            &[
+                vec![
+                    "list-panes".to_string(),
+                    "-a".to_string(),
+                    "-F".to_string(),
+                    pane_format().to_string(),
+                ],
+                vec![
+                    "run-shell".to_string(),
+                    "-b".to_string(),
+                    "tmux resize-pane -t '%1' -x 36 >/dev/null 2>&1 || true; tmux resize-pane -t '%2' -x 36 >/dev/null 2>&1 || true".to_string(),
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn flat_content_width_repairs_preserve_content_proportions() {
+        let panes = parse_panes(concat!(
+            "%1\tproject\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\topensessions\topensessions-sidebar\t53\t39\t0\t52\n",
+            "%2\tproject\t@1\t0\t1\t1\t/dev/ttys2\t11\t/tmp\tamp\tAgent 1\t53\t39\t54\t106\n",
+            "%3\tproject\t@1\t0\t2\t0\t/dev/ttys3\t12\t/tmp\tamp\tAgent 2\t52\t39\t107\t158",
+        ));
+
+        assert_eq!(
+            flat_content_width_repairs(&panes, "%1", 36),
+            vec![("%2".to_string(), 62)],
         );
     }
 }

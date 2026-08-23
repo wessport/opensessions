@@ -65,9 +65,10 @@ Clicking a detected port opens `http://localhost:<port>`.
 | `Alt+Up` | Move focused session up in persisted order |
 | `Alt+Down` | Move focused session down in persisted order |
 | `n`, `c` | Open the directory picker to create or switch to a session |
+| `r` (or `$`) | Rename the focused session |
 | `d`, `x` | Open kill-session confirmation for focused session |
 | `t` | Open theme picker |
-| `r` | Refresh state |
+| `R` | Refresh state |
 | `q` | Quit the server and all sidebar panes |
 | `Esc` | Close only the current sidebar client |
 
@@ -89,7 +90,8 @@ Clicking a detected port opens `http://localhost:<port>`.
 - The bundled sessionizer searches directories listed in `SESSIONIZER_DIR` (colon-separated, e.g. `$HOME/Code:$HOME/.config`) or `$HOME/Documents` if unset. The variable is also read from the tmux global environment (`tmux set-environment -g`) as a fallback.
 - Search depth is controlled by `SESSIONIZER_MAXDEPTH` (defaults to `3`).
 - A typed valid directory, including a `~/...` path, takes priority over the currently highlighted fuzzy match.
-- Choosing a directory whose derived session name already exists switches to that session instead of creating a duplicate.
+- After choosing a directory, the popup prompts for a session name and offers the directory basename as the default. Tmux separators (`.` and `:`) are normalized to underscores.
+- Choosing a name that already exists switches to that session instead of creating a duplicate.
 - If `fzf` is unavailable, the tmux sessionizer exits with a prompt explaining that dependency.
 
 ## Session Switching Behavior

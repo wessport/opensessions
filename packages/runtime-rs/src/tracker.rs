@@ -84,6 +84,35 @@ impl AgentTracker {
             .unwrap_or_default()
     }
 
+    pub fn rename_session(&mut self, session: &str, new_name: &str) {
+        if let Some(mut instances) = self.instances.remove(session) {
+            for event in instances.values_mut() {
+                event.session = new_name.to_string();
+            }
+            self.instances.insert(new_name.to_string(), instances);
+        }
+        if let Some(timestamps) = self.event_timestamps.remove(session) {
+            self.event_timestamps
+                .insert(new_name.to_string(), timestamps);
+        }
+        let old_prefix = format!("{session}\0");
+        let renamed_unseen = self
+            .unseen_instances
+            .iter()
+            .filter_map(|key| {
+                key.strip_prefix(&old_prefix)
+                    .map(|suffix| (key.clone(), format!("{new_name}\0{suffix}")))
+            })
+            .collect::<Vec<_>>();
+        for (old_key, new_key) in renamed_unseen {
+            self.unseen_instances.remove(&old_key);
+            self.unseen_instances.insert(new_key);
+        }
+        if self.active.remove(session) {
+            self.active.insert(new_name.to_string());
+        }
+    }
+
     pub fn mark_seen(&mut self, session: &str) -> bool {
         let had_unseen = self.is_unseen(session);
         if !had_unseen {
@@ -912,6 +941,24 @@ mod tests {
         let stored = tracker.get_agents("work").pop().expect("tracked agent");
         assert!(stored.ts >= before);
         assert!(stored.ts < u64::MAX);
+    }
+
+    #[test]
+    fn rename_session_preserves_agent_state_and_unseen_status() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event(
+            "amp",
+            "draft",
+            Some("T-rename"),
+            Some("Rename"),
+            None,
+        ));
+
+        tracker.rename_session("draft", "named");
+
+        assert!(tracker.get_agents("draft").is_empty());
+        assert_eq!(tracker.get_agents("named")[0].session, "named");
+        assert!(tracker.is_unseen("named"));
     }
 
     #[test]
