@@ -350,6 +350,50 @@ fn tmux_sidebar_x_on_active_worktree_child_kills_that_child_after_confirm() {
 }
 
 #[test]
+fn tmux_sidebar_session_close_ignores_a_stale_cached_client_tty() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-stale-kill-client");
+    let target = "effect-ts";
+    let session_names = lab.session_names();
+    let target_index = session_names
+        .iter()
+        .position(|name| name == target)
+        .expect("target session should be present");
+    let expected_fallback = target_index
+        .checked_sub(1)
+        .and_then(|index| session_names.get(index))
+        .or_else(|| session_names.get(target_index + 1))
+        .cloned()
+        .expect("target session should have a fallback");
+    lab.tmux_ok(["switch-client", "-t", target]);
+    lab.wait_for_client_session(target);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("build e2e tokio runtime");
+    runtime.block_on(async {
+        let mut ws = opensessions_sidebar::client::connect_ws_path_with_token(
+            "127.0.0.1",
+            lab.port,
+            "/",
+            &lab.auth_token(),
+        )
+        .await
+        .expect("connect stale-client close websocket");
+        ws.send(Message::text(format!(
+            r#"{{"type":"kill-session","name":"{target}","clientTty":"/dev/stale"}}"#
+        )))
+        .await
+        .expect("send stale-client close command");
+    });
+
+    lab.wait_for_session_absent(target);
+    lab.wait_for_client_session(&expected_fallback);
+}
+
+#[test]
 fn tmux_sidebar_click_spawns_live_sidebar_for_session_with_spaces() {
     let _guard = e2e_serial_guard();
     let mut lab = Lab::new("opensessions-e2e-spaced-session");

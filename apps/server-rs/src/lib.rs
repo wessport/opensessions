@@ -963,16 +963,11 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                let current_session = provider
-                    .get_client_focus(client_tty)
-                    .map(|focus| focus.session_name)
-                    .or_else(|| provider.get_current_session());
-                if current_session.as_deref() == Some(name)
-                    && let Some(next) = self
-                        .session_before(name)
-                        .or_else(|| self.session_after(name))
+                if let Some(next) = self
+                    .session_before(name)
+                    .or_else(|| self.session_after(name))
+                    && provider.switch_clients_from_session(name, &next, client_tty)
                 {
-                    provider.switch_session(&next, client_tty);
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
                 provider.kill_session(name);
