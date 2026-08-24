@@ -78,6 +78,21 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>);
+    fn switch_clients_from_session(
+        &self,
+        session_name: &str,
+        fallback_session: &str,
+        preferred_client_tty: Option<&str>,
+    ) -> bool {
+        if self
+            .get_client_focus(preferred_client_tty)
+            .is_some_and(|focus| focus.session_name == session_name)
+        {
+            self.switch_session(fallback_session, preferred_client_tty);
+            return true;
+        }
+        false
+    }
     fn get_current_session(&self) -> Option<String>;
     fn get_session_dir(&self, name: &str) -> String;
     fn get_session_pane_pids(&self, _name: &str) -> Vec<u32> {

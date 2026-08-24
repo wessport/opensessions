@@ -593,6 +593,24 @@ impl MuxProvider for TmuxProvider {
         self.client.switch_client(name, client_tty);
     }
 
+    fn switch_clients_from_session(
+        &self,
+        session_name: &str,
+        fallback_session: &str,
+        _preferred_client_tty: Option<&str>,
+    ) -> bool {
+        let fallback_target = format!("={fallback_session}:");
+        let mut switched = false;
+        for client in self.client.list_clients() {
+            if client.session_name == session_name {
+                self.client
+                    .switch_client(&fallback_target, Some(&client.tty));
+                switched = true;
+            }
+        }
+        switched
+    }
+
     fn get_current_session(&self) -> Option<String> {
         self.client.get_current_session()
     }
@@ -1335,6 +1353,11 @@ mod tests {
         calls: Mutex<Vec<Vec<String>>>,
     }
 
+    #[derive(Default)]
+    struct ClientRoutingRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
     struct MouseBindingRunner {
         calls: Mutex<Vec<Vec<String>>>,
         binding: String,
@@ -1388,6 +1411,23 @@ mod tests {
         }
     }
 
+    impl CommandRunner for ClientRoutingRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            CommandOutput {
+                exit_code: 0,
+                stdout: (args.first().map(String::as_str) == Some("list-clients"))
+                    .then_some(concat!(
+                        "client-a\t/dev/ttys001\t10\ttarget\t160\t40\n",
+                        "client-b\t/dev/ttys002\t11\tother\t160\t40"
+                    ))
+                    .unwrap_or_default()
+                    .to_string(),
+                stderr: String::new(),
+            }
+        }
+    }
+
     impl CommandRunner for VisibilityRunner {
         fn run(&self, args: &[String]) -> CommandOutput {
             self.calls.lock().unwrap().push(args.to_vec());
@@ -1424,6 +1464,32 @@ mod tests {
                 "-p".to_string(),
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn session_close_rehomes_the_client_actually_attached_to_the_target() {
+        let runner = Arc::new(ClientRoutingRunner::default());
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert!(provider.switch_clients_from_session("target", "fallback", Some("/dev/stale")));
+
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[
+                vec![
+                    "list-clients".to_string(),
+                    "-F".to_string(),
+                    client_format().to_string(),
+                ],
+                vec![
+                    "switch-client".to_string(),
+                    "-c".to_string(),
+                    "/dev/ttys001".to_string(),
+                    "-t".to_string(),
+                    "=fallback:".to_string(),
+                ],
+            ]
         );
     }
 
