@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, sleep};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_websockets::Message;
@@ -19,6 +19,13 @@ const SIDEBAR_SESSIONS: &[&str] = &[
     "os-demo-feat-agent-panel",
     "os-demo-preview",
 ];
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[test]
 fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
@@ -1880,7 +1887,7 @@ for _ in range(3000):
             "threadId": thread_id,
             "threadName": thread_id,
             "paneId": pane_id,
-            "ts": 1,
+            "ts": current_time_ms(),
         })
         .to_string();
         post_body(
@@ -1906,7 +1913,7 @@ for _ in range(3000):
             "tmuxSession": session,
             "threadId": thread_id,
             "threadName": thread_name,
-            "ts": 1,
+            "ts": current_time_ms(),
         })
         .to_string();
         post_body(
