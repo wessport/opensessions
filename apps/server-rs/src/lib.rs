@@ -64,6 +64,7 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
+const IDENTITY_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
 const EXPENSIVE_DATA_POLL_MS: u64 = 10_000;
 const EXPENSIVE_DATA_IDLE_MAX_MS: u64 = 60_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
@@ -2998,7 +2999,18 @@ fn write_private_file(path: &Path, contents: &str, generation: &str) -> std::io:
     fs::rename(temporary, path)
 }
 
-fn publish_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+fn lock_identity(pid_file: &Path) -> std::io::Result<fs::File> {
+    let lock_file = pid_file.with_extension("identity.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_file)?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn publish_identity_locked(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
     // Token first, pid last: discovery treats the pid file as the publication
     // marker and can never observe a generation without its credential.
     let generation = &token[..16];
@@ -3010,7 +3022,13 @@ fn publish_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io:
     Ok(())
 }
 
+fn publish_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+    let _identity_lock = lock_identity(pid_file)?;
+    publish_identity_locked(pid_file, token_file, token)
+}
+
 fn cleanup_owned_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+    let _identity_lock = lock_identity(pid_file)?;
     if !owns_identity_generation(pid_file, token_file, token) {
         return Ok(());
     }
@@ -3029,6 +3047,54 @@ fn cleanup_owned_identity(pid_file: &Path, token_file: &Path, token: &str) -> st
 fn owns_identity_generation(pid_file: &Path, token_file: &Path, token: &str) -> bool {
     fs::read_to_string(pid_file).is_ok_and(|pid| pid.trim() == process::id().to_string())
         && fs::read_to_string(token_file).is_ok_and(|current| current.trim() == token)
+}
+
+fn repair_identity_if_missing(
+    pid_file: &Path,
+    token_file: &Path,
+    token: &str,
+) -> std::io::Result<bool> {
+    let _identity_lock = lock_identity(pid_file)?;
+    if owns_identity_generation(pid_file, token_file, token) {
+        return Ok(false);
+    }
+
+    let published_pid = fs::read_to_string(pid_file).ok();
+    let published_token = fs::read_to_string(token_file).ok();
+    let foreign_generation = published_pid
+        .as_deref()
+        .is_some_and(|pid| pid.trim() != process::id().to_string())
+        || published_token
+            .as_deref()
+            .is_some_and(|published| published.trim() != token);
+    if foreign_generation {
+        return Ok(false);
+    }
+
+    publish_identity_locked(pid_file, token_file, token)?;
+    Ok(true)
+}
+
+async fn maintain_server_identity(
+    pid_file: PathBuf,
+    token_file: PathBuf,
+    token: String,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(IDENTITY_REPAIR_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => return,
+            _ = interval.tick() => {
+                match repair_identity_if_missing(&pid_file, &token_file, &token) {
+                    Ok(true) => debug_log("server identity files were missing or stale; republished active generation"),
+                    Ok(false) => {}
+                    Err(error) => debug_log(format!("failed to repair server identity files: {error}")),
+                }
+            }
+        }
+    }
 }
 
 async fn cache_latest_state(
@@ -3068,6 +3134,12 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     publish_identity(&config.pid_file, &token_file, &token)?;
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
+    let identity_task = tokio::spawn(maintain_server_identity(
+        config.pid_file.clone(),
+        token_file.clone(),
+        token.clone(),
+        shutdown.subscribe(),
+    ));
     let (state_updates, _) = broadcast::channel(16);
     let latest_state = Arc::new(RwLock::new(None));
     let state_cache_task = tokio::spawn(cache_latest_state(
@@ -3099,6 +3171,8 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             token.clone(),
         )
         .await;
+        identity_task.abort();
+        let _ = identity_task.await;
         state_cache_task.abort();
         if owns_identity_generation(&config.pid_file, &token_file, &token)
             && let Some(source) = cleanup_state_source.as_ref()
@@ -4335,6 +4409,133 @@ mod tests {
         .await;
         assert!(accepted.starts_with(b"HTTP/1.1 101 Switching Protocols"));
         server.shutdown().await.expect("stop");
+    }
+
+    #[test]
+    fn stale_generation_cleanup_waits_for_identity_publication() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "opensessions-identity-handoff-{}-{id}",
+            process::id()
+        ));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let lock_file = root.with_extension("identity.lock");
+        let old_token = "a".repeat(64);
+        let new_token = "b".repeat(64);
+        publish_identity(&pid_file, &token_file, &old_token).expect("publish old identity");
+
+        let publication_lock = lock_identity(&pid_file).expect("hold publication lock");
+        let cleanup_pid = pid_file.clone();
+        let cleanup_token = token_file.clone();
+        let cleanup_old_token = old_token.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal cleanup start");
+            cleanup_owned_identity(&cleanup_pid, &cleanup_token, &cleanup_old_token)
+        });
+        started_rx.recv().expect("cleanup started");
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !cleanup.is_finished(),
+            "cleanup must not race identity publication"
+        );
+
+        write_private_file(&token_file, &new_token, &new_token[..16])
+            .expect("publish replacement token");
+        write_private_file(&pid_file, &process::id().to_string(), &new_token[..16])
+            .expect("publish replacement pid");
+        drop(publication_lock);
+        cleanup
+            .join()
+            .expect("join stale cleanup")
+            .expect("stale cleanup succeeds");
+
+        assert_eq!(
+            fs::read_to_string(&pid_file).expect("replacement pid"),
+            process::id().to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(&token_file).expect("replacement token"),
+            new_token
+        );
+        assert!(
+            !repair_identity_if_missing(&pid_file, &token_file, &old_token)
+                .expect("preserve replacement identity"),
+            "stale generation must not overwrite its replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(&token_file).expect("replacement token remains"),
+            new_token
+        );
+        let _ = fs::remove_file(pid_file);
+        let _ = fs::remove_file(token_file);
+        let _ = fs::remove_file(lock_file);
+    }
+
+    #[tokio::test]
+    async fn active_generation_repairs_missing_identity_files() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "opensessions-identity-repair-{}-{id}",
+            process::id()
+        ));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let lock_file = root.with_extension("identity.lock");
+        let server =
+            start_server(ServerConfig::new("127.0.0.1", 0, &pid_file).with_token_file(&token_file))
+                .await
+                .expect("start server");
+        let expected_pid = fs::read_to_string(&pid_file).expect("initial pid");
+        let expected_token = fs::read_to_string(&token_file).expect("initial token");
+
+        async fn wait_for_identity(
+            pid_file: &Path,
+            token_file: &Path,
+            expected_pid: &str,
+            expected_token: &str,
+        ) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if fs::read_to_string(pid_file).is_ok_and(|pid| pid == expected_pid)
+                        && fs::read_to_string(token_file).is_ok_and(|token| token == expected_token)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("active generation should restore identity files");
+        }
+
+        fs::remove_file(&pid_file).expect("remove pid file");
+        fs::remove_file(&token_file).expect("remove token file");
+        wait_for_identity(&pid_file, &token_file, &expected_pid, &expected_token).await;
+
+        fs::remove_file(&pid_file).expect("remove only pid file");
+        wait_for_identity(&pid_file, &token_file, &expected_pid, &expected_token).await;
+
+        fs::remove_file(&token_file).expect("remove only token file");
+        wait_for_identity(&pid_file, &token_file, &expected_pid, &expected_token).await;
+
+        let response = request_at(
+            server.addr(),
+            format!(
+                "POST /ensure-sidebars HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+                fs::read_to_string(&token_file)
+                    .expect("re-read repaired token")
+                    .trim()
+            ),
+        )
+        .await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK"),
+            "repaired token should authenticate a newly launched hook"
+        );
+        server.shutdown().await.expect("stop server");
+        let _ = fs::remove_file(lock_file);
     }
 
     #[tokio::test]
