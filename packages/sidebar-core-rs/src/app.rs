@@ -1259,7 +1259,7 @@ impl App {
         }
         self.commands.push(ClientCommand::SwitchSession {
             name,
-            client_tty: None,
+            client_tty: self.client_tty.clone(),
         });
     }
 
@@ -1891,6 +1891,30 @@ mod tests {
             app.drain_commands(),
             vec![ClientCommand::KillSession {
                 name: "feature-a".to_string(),
+                client_tty: Some("/dev/ttys025".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn switch_session_routes_the_command_to_the_identified_tmux_client() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/feature-a", false),
+            session("feature-b", "/repo/feature-b", false),
+        ];
+        let mut app = App::from_state(state);
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "feature-a".to_string(),
+            client_tty: Some("/dev/ttys025".to_string()),
+        });
+
+        app.switch_to_session("feature-b".to_string());
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "feature-b".to_string(),
                 client_tty: Some("/dev/ttys025".to_string()),
             }]
         );

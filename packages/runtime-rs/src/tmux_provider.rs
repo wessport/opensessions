@@ -403,6 +403,17 @@ impl TmuxClient {
         self.display("#{client_tty}", None)
     }
 
+    pub fn client_tty_for_pane(&self, pane_id: &str) -> Option<String> {
+        self.run(&["list-clients", "-F", "#{client_tty}\t#{pane_id}"])
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once(SEP))
+            .find_map(|(client_tty, active_pane_id)| {
+                (active_pane_id == pane_id && !client_tty.is_empty())
+                    .then(|| client_tty.to_string())
+            })
+    }
+
     pub fn get_current_window_id(&self) -> Option<String> {
         let window_id = self.display("#{window_id}", None);
         (!window_id.is_empty()).then_some(window_id)
@@ -591,6 +602,10 @@ impl MuxProvider for TmuxProvider {
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
+    }
+
+    fn client_tty_for_pane(&self, pane_id: &str) -> Option<String> {
+        self.client.client_tty_for_pane(pane_id)
     }
 
     fn switch_clients_from_session(
@@ -1702,5 +1717,28 @@ mod tests {
             flat_content_width_repairs(&panes, "%1", 36),
             vec![("%2".to_string(), 62)],
         );
+    }
+
+    #[test]
+    fn client_tty_for_pane_uses_client_active_pane_context() {
+        struct ClientPaneRunner;
+
+        impl CommandRunner for ClientPaneRunner {
+            fn run(&self, _args: &[String]) -> CommandOutput {
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: "/dev/ttys001\t%186\n/dev/ttys002\t%22\n".to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+
+        let client = TmuxClient::new(Arc::new(ClientPaneRunner));
+
+        assert_eq!(
+            client.client_tty_for_pane("%186").as_deref(),
+            Some("/dev/ttys001")
+        );
+        assert_eq!(client.client_tty_for_pane("%999"), None);
     }
 }

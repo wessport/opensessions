@@ -48,7 +48,7 @@ use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
@@ -209,7 +209,7 @@ pub trait StateSource: Send + Sync + 'static {
         None
     }
 
-    fn handle_agent_event_json(&self, _body: &Value) -> Result<String, AgentEventError> {
+    fn handle_agent_event_json(&self, _body: &Value) -> Result<(), AgentEventError> {
         Err(AgentEventError::CouldNotResolveSession)
     }
 
@@ -951,8 +951,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let client_tty = command
                     .get("clientTty")
                     .and_then(Value::as_str)
-                    .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                provider.switch_session(name, client_tty);
+                    .map(str::to_string)
+                    .or_else(|| context.and_then(|context| context.client_tty.clone()))
+                    .or_else(|| {
+                        context
+                            .and_then(|context| context.pane_id.as_deref())
+                            .and_then(|pane_id| provider.client_tty_for_pane(pane_id))
+                    });
+                provider.switch_session(name, client_tty.as_deref());
                 None
             }
             "switch-index" => {
@@ -1162,9 +1168,13 @@ impl StateSource for ReadOnlyMuxStateSource {
             .get("windowId")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        context.client_tty = context
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| self.providers.first()?.client_tty_for_pane(pane_id));
         debug_log(format!(
-            "identify-pane session={:?} pane={:?} window={:?} -> acknowledge_sidebar_connected",
-            context.session_name, context.pane_id, context.window_id,
+            "identify-pane session={:?} pane={:?} window={:?} client_tty={:?} -> acknowledge_sidebar_connected",
+            context.session_name, context.pane_id, context.window_id, context.client_tty,
         ));
         let became_visible = {
             let mut coordinator = self.sidebar_coordinator.lock().unwrap();
@@ -1186,11 +1196,10 @@ impl StateSource for ReadOnlyMuxStateSource {
                 self.request_sidebar_width_repair();
             }
         }
-        let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
             r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
             json_string_or_null(Some(session_name)),
-            json_string_or_null(Some(&client_tty)),
+            json_string_or_null(context.client_tty.as_deref()),
         ))
     }
 
@@ -1262,9 +1271,8 @@ impl StateSource for ReadOnlyMuxStateSource {
         Some(self.snapshot_json())
     }
 
-    fn handle_agent_event_json(&self, body: &Value) -> Result<String, AgentEventError> {
-        self.apply_agent_event(body)?;
-        Ok(self.snapshot_json())
+    fn handle_agent_event_json(&self, body: &Value) -> Result<(), AgentEventError> {
+        self.apply_agent_event(body)
     }
 
     fn handle_pi_runtime_upsert(&self, body: &Value) -> Result<(), PiRuntimeError> {
@@ -3208,6 +3216,14 @@ async fn run_accept_loop(
 ) -> Result<(), ServerError> {
     let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let state_operation_lock = Arc::new(AsyncMutex::new(()));
+    let (state_refreshes, refresh_requests) = mpsc::channel(1);
+    tokio::spawn(run_coalesced_state_refreshes(
+        state_source.clone(),
+        state_updates.clone(),
+        Arc::clone(&state_operation_lock),
+        refresh_requests,
+        shutdown.subscribe(),
+    ));
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -3227,6 +3243,7 @@ async fn run_accept_loop(
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 let connection_auth_token = auth_token.clone();
                 let connection_state_operation_lock = Arc::clone(&state_operation_lock);
+                let connection_state_refreshes = state_refreshes.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let _ = handle_connection(
@@ -3238,11 +3255,40 @@ async fn run_accept_loop(
                         connection_shutdown_announcement,
                         connection_auth_token,
                         connection_state_operation_lock,
+                        connection_state_refreshes,
                     )
                     .await;
                 });
             }
 
+        }
+    }
+}
+
+async fn run_coalesced_state_refreshes(
+    state_source: Option<Arc<dyn StateSource>>,
+    state_updates: broadcast::Sender<String>,
+    state_operation_lock: Arc<AsyncMutex<()>>,
+    mut requests: mpsc::Receiver<()>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => return,
+            request = requests.recv() => {
+                if request.is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS)).await;
+                while requests.try_recv().is_ok() {}
+                if let Ok(Some(snapshot)) = run_state_source_blocking(
+                    &state_source,
+                    &state_operation_lock,
+                    StateSource::snapshot_json,
+                ).await {
+                    let _ = state_updates.send(snapshot);
+                }
+            }
         }
     }
 }
@@ -3301,6 +3347,7 @@ async fn handle_connection(
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
     state_operation_lock: Arc<AsyncMutex<()>>,
+    state_refreshes: mpsc::Sender<()>,
 ) -> Result<(), ServerError> {
     let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
         .await
@@ -3430,8 +3477,8 @@ async fn handle_connection(
             .await?
             .unwrap_or(Err(AgentEventError::CouldNotResolveSession));
         match result {
-            Ok(payload) => {
-                let _ = state_updates.send(payload);
+            Ok(()) => {
+                let _ = state_refreshes.try_send(());
                 stream
                     .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
                     .await?;
@@ -3637,6 +3684,41 @@ async fn handle_connection(
                                 let _ = state_updates.send(snapshot);
                             }
                             if let Some(command) = parse_command(&message) {
+                                if let Some(name) = switch_session_target(&command) {
+                                    let _ = state_updates.send(activate_session_json(
+                                        name,
+                                        client_context.pane_id.as_deref(),
+                                    ));
+                                    // Let destination sidebars render the activation before
+                                    // tmux makes one visible. Switching itself intentionally
+                                    // bypasses the full-state operation lock: snapshots may
+                                    // perform slow discovery, while tmux switch-client is a
+                                    // narrow interactive operation that must remain responsive.
+                                    tokio::time::sleep(Duration::from_millis(
+                                        RENDERED_SIDEBAR_FRAME_MS,
+                                    ))
+                                    .await;
+                                    if let Some(switch_source) = state_source.clone() {
+                                        let switch_command = command.clone();
+                                        let switch_context = client_context.clone();
+                                        if let Some(payload) = tokio::task::spawn_blocking(move || {
+                                            switch_source.handle_client_command_with_context(
+                                                &switch_command,
+                                                Some(&switch_context),
+                                            )
+                                        })
+                                        .await?
+                                        {
+                                            websocket.send(Message::text(payload)).await?;
+                                        }
+                                    }
+
+                                    // A settled full state clears the source sidebar's pending
+                                    // marker. Coalesce it with other refresh requests so rapid
+                                    // switches and agent events cannot build a snapshot queue.
+                                    let _ = state_refreshes.try_send(());
+                                    continue;
+                                }
                                 let sender_command = command.clone();
                                 let sender_context = client_context.clone();
                                 if let Some((reply, updated_context)) = run_state_source_blocking(
@@ -3656,21 +3738,6 @@ async fn handle_connection(
                                     if let Some(reply) = reply {
                                         websocket.send(Message::text(reply)).await?;
                                     }
-                                }
-                                if let Some(name) = switch_session_target(&command) {
-                                    let _ = state_updates.send(activate_session_json(
-                                        name,
-                                        client_context.pane_id.as_deref(),
-                                    ));
-                                    // Pre-home every destination sidebar before tmux makes it
-                                    // visible. A scheduler yield does not guarantee that the
-                                    // broadcast reaches the sidebar and renders; reserving one
-                                    // frame prevents the old local selection flashing after a
-                                    // session switch.
-                                    tokio::time::sleep(Duration::from_millis(
-                                        RENDERED_SIDEBAR_FRAME_MS,
-                                    ))
-                                    .await;
                                 }
                                 let command_for_handler = command.clone();
                                 let context_for_handler = client_context.clone();
@@ -4074,6 +4141,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ContendedSwitchSource {
+        snapshot_count: Arc<AtomicUsize>,
+        snapshot_started: Arc<AtomicBool>,
+        snapshot_release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        switch_count: Arc<AtomicUsize>,
+    }
+
+    impl StateSource for ContendedSwitchSource {
+        fn snapshot_json(&self) -> String {
+            let previous = self.snapshot_count.fetch_add(1, Ordering::SeqCst);
+            if previous > 0 {
+                self.snapshot_started.store(true, Ordering::SeqCst);
+                let (released, wake) = self.snapshot_release.as_ref();
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+            "{}".to_string()
+        }
+
+        fn handle_client_command(&self, command: &Value) -> Option<String> {
+            if command.get("type").and_then(Value::as_str) == Some("switch-session") {
+                self.switch_count.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        }
+    }
+
     struct PortTestProvider;
 
     impl MuxProvider for PortTestProvider {
@@ -4381,6 +4478,123 @@ mod tests {
 
         let _ = refresh.await;
         server.shutdown().await.expect("stop server");
+    }
+
+    #[tokio::test]
+    async fn burst_state_refresh_requests_build_one_snapshot() {
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let source_count = Arc::clone(&snapshot_count);
+        let source: Arc<dyn StateSource> = Arc::new(move || {
+            source_count.fetch_add(1, Ordering::SeqCst);
+            "{}".to_string()
+        });
+        let (state_updates, mut updates) = broadcast::channel(4);
+        let (shutdown, _) = broadcast::channel(1);
+        let (requests, receiver) = mpsc::channel(1);
+        let worker = tokio::spawn(run_coalesced_state_refreshes(
+            Some(source),
+            state_updates,
+            Arc::new(AsyncMutex::new(())),
+            receiver,
+            shutdown.subscribe(),
+        ));
+
+        assert!(requests.try_send(()).is_ok());
+        for _ in 0..20 {
+            let _ = requests.try_send(());
+        }
+        tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("coalesced snapshot should be broadcast")
+            .expect("state update channel should remain open");
+
+        assert_eq!(snapshot_count.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(());
+        worker.await.expect("refresh worker should stop");
+    }
+
+    #[tokio::test]
+    async fn websocket_switch_does_not_queue_behind_a_full_state_snapshot() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "opensessions-switch-contention-{}-{id}",
+            process::id()
+        ));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let snapshot_started = Arc::new(AtomicBool::new(false));
+        let snapshot_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let switch_count = Arc::new(AtomicUsize::new(0));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(ContendedSwitchSource {
+                    snapshot_count: Arc::clone(&snapshot_count),
+                    snapshot_started: Arc::clone(&snapshot_started),
+                    snapshot_release: Arc::clone(&snapshot_release),
+                    switch_count: Arc::clone(&switch_count),
+                }),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let uri = format!("ws://{}", server.addr()).parse().expect("ws uri");
+        let authorization = format!("Bearer {}", token.trim())
+            .parse()
+            .expect("authorization header");
+        let (mut websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(http::header::AUTHORIZATION, authorization)
+            .expect("add authorization header")
+            .connect()
+            .await
+            .expect("connect websocket");
+        let _ = websocket.next().await.expect("hello").expect("hello frame");
+        let _ = websocket
+            .next()
+            .await
+            .expect("initial state")
+            .expect("initial state frame");
+
+        let refresh = tokio::spawn(request_at(
+            server.addr(),
+            format!(
+                "POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+                token.trim()
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !snapshot_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh snapshot should start");
+
+        websocket
+            .send(Message::text(
+                r#"{"type":"switch-session","name":"destination"}"#,
+            ))
+            .await
+            .expect("send switch command");
+        let switched_before_release = tokio::time::timeout(Duration::from_millis(150), async {
+            while switch_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        let (released, wake) = snapshot_release.as_ref();
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        let _ = refresh.await;
+        server.shutdown().await.expect("stop server");
+
+        assert!(
+            switched_before_release,
+            "interactive switching must bypass unrelated full-state work"
+        );
     }
 
     #[tokio::test]
