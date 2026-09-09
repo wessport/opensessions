@@ -100,6 +100,9 @@ pub trait MuxProvider: Send + Sync {
     }
     fn get_pane_count(&self, name: &str) -> u32;
     fn get_client_tty(&self) -> String;
+    fn client_tty_for_pane(&self, _pane_id: &str) -> Option<String> {
+        None
+    }
     fn create_session(&self, name: Option<&str>, dir: Option<&str>);
     fn rename_session(&self, _name: &str, _new_name: &str) -> bool {
         false
