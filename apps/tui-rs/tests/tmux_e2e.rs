@@ -389,11 +389,19 @@ fn tmux_sidebar_session_close_ignores_a_stale_cached_client_tty() {
         )
         .await
         .expect("connect stale-client close websocket");
+        let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+        let _ = ws
+            .next()
+            .await
+            .expect("read ws initial state")
+            .expect("ws initial state");
         ws.send(Message::text(format!(
             r#"{{"type":"kill-session","name":"{target}","clientTty":"/dev/stale"}}"#
         )))
         .await
         .expect("send stale-client close command");
+        ws.close().await.expect("close stale-client websocket");
+        tokio::time::sleep(Duration::from_millis(100)).await;
     });
 
     lab.wait_for_session_absent(target);
