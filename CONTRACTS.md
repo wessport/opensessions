@@ -49,7 +49,14 @@ POST /api/agent-event
 Example:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:7391/api/agent-event" \
+OPENSESSIONS_DIR=$(tmux show-environment -g OPENSESSIONS_DIR | cut -d= -f2-)
+SCRIPT_DIR="$OPENSESSIONS_DIR/integrations/tmux-plugin/scripts"
+. "$SCRIPT_DIR/server-common.sh"
+URL="http://${HOST}:${PORT}"
+TOKEN=$(auth_token)
+
+curl -sS -X POST "$URL/api/agent-event" \
+  -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "agent": "my-agent",
@@ -61,6 +68,12 @@ curl -sS -X POST "http://127.0.0.1:7391/api/agent-event" \
     "paneId": "%7"
   }'
 ```
+
+The port and token are scoped to the tmux socket. For an explicitly configured
+`OPENSESSIONS_PORT`, also set `OPENSESSIONS_TOKEN_FILE`; a port does not encode
+the canonical socket key or token path.
+Except for liveness checks, server endpoints require this bearer token;
+unauthenticated requests are rejected.
 
 ### Session Resolution
 

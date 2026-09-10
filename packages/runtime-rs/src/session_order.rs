@@ -180,6 +180,10 @@ fn strings_from_value_array(values: Vec<Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn rename_preserves_position_and_hidden_state() {
@@ -198,5 +202,26 @@ mod tests {
             order.apply(["last".to_string(), "named".to_string(), "first".to_string()]),
             vec!["first".to_string(), "named".to_string(), "last".to_string()]
         );
+    }
+
+    #[test]
+    fn persisted_order_and_hidden_sessions_survive_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "opensessions-session-order-{}-{}.json",
+            process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let mut order = SessionOrder::new(Some(path.clone()));
+        order.sync(["alpha".to_string(), "beta".to_string()]);
+        order.set_visible_order(vec!["beta".to_string(), "alpha".to_string()]);
+        order.hide("alpha");
+
+        let restarted = SessionOrder::new(Some(path.clone()));
+
+        assert_eq!(
+            restarted.apply(["alpha".to_string(), "beta".to_string()]),
+            vec!["beta".to_string()]
+        );
+        fs::remove_file(path).expect("remove persisted order");
     }
 }

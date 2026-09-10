@@ -13,15 +13,22 @@ server_key() {
   socket_path="${TMUX%%,*}"
   [ -n "$socket_path" ] || return
 
-  printf '%s' "$socket_path" | od -An -v -tu1 | awk '
-    {
-      for (i = 1; i <= NF; i++) {
-        byte_index++
-        hash = (hash + $i * byte_index) % 20000
-      }
-    }
-    END { printf "%d\n", hash }
-  '
+  if command -v realpath >/dev/null 2>&1 && canonical_path="$(realpath "$socket_path" 2>/dev/null)"; then
+    socket_path="$canonical_path"
+  else
+    socket_dir="$(dirname "$socket_path")"
+    if canonical_dir="$(cd "$socket_dir" 2>/dev/null && pwd -P)"; then
+      socket_path="$canonical_dir/$(basename "$socket_path")"
+    fi
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$socket_path" | sha256sum | cut -c1-16
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$socket_path" | shasum -a 256 | cut -c1-16
+  else
+    printf '%s' "$socket_path" | openssl dgst -sha256 | awk '{print substr($NF, 1, 16)}'
+  fi
 }
 
 SERVER_KEY="$(server_key)"
@@ -34,7 +41,14 @@ TMUX_OPENSESSIONS_TOKEN_FILE="$(tmux show-environment -g OPENSESSIONS_TOKEN_FILE
 if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
   PORT="$TMUX_OPENSESSIONS_PORT"
 elif [ -n "$SERVER_KEY" ]; then
-  PORT=$((PORT_BASE + SERVER_KEY))
+  PORT_SUFFIX="$(printf '%s' "$SERVER_KEY" | cut -c1-8)"
+  case "$SERVER_KEY" in
+    [0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9])
+      PORT_SUFFIX="$(awk -v key="$SERVER_KEY" 'BEGIN { print (key + 0) % 20000 }')"
+      ;;
+    *) PORT_SUFFIX=$((0x$PORT_SUFFIX % 20000)) ;;
+  esac
+  PORT=$((PORT_BASE + PORT_SUFFIX))
 else
   PORT="7391"
 fi
@@ -75,7 +89,9 @@ show_startup_error() {
 }
 
 server_alive() {
-  curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
+  expected_identity="opensessions server"
+  [ -z "$SERVER_KEY" ] || expected_identity="$expected_identity $SERVER_KEY"
+  [ "$(curl -s -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null)" = "$expected_identity" ]
 }
 
 auth_token() {
@@ -141,7 +157,6 @@ ensure_server() {
     return 1
   fi
 
-  OPENSESSIONS_RUST=1 \
   OPENSESSIONS_SERVER_KEY="$SERVER_KEY" \
   OPENSESSIONS_HOST="$HOST" \
   OPENSESSIONS_PORT="$PORT" \

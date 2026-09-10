@@ -125,6 +125,14 @@ pub fn hook_context_format() -> &'static str {
     "#{client_tty}|#{session_name}|#{window_id}|#{pane_id}|#{pane_active}"
 }
 
+fn hook_context_script() -> String {
+    let context = hook_context_format().replace("#{", "##{");
+    format!(
+        "$(tmux display-message -p -t '#{{hook_pane}}' {})",
+        shell_quote(&context)
+    )
+}
+
 pub fn http_hook_command(
     base: &str,
     path: &str,
@@ -136,10 +144,25 @@ pub fn http_hook_command(
 }
 
 fn http_hook_script(base: &str, path: &str, data: Option<&str>, token_file: &str) -> String {
-    let body = data.map(|data| format!(" -d '{data}'")).unwrap_or_default();
+    let body = data
+        .map(|data| {
+            let data = if data == hook_context_format() {
+                hook_context_script()
+            } else {
+                shell_quote(data)
+            };
+            format!(" --data-binary \"{data}\"")
+        })
+        .unwrap_or_default();
     format!(
-        "token=$(cat '{token_file}' 2>/dev/null) && curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H \"Authorization: Bearer $token\" -X POST {base}{path}{body} >/dev/null 2>&1 || true"
+        "token=$(cat {} 2>/dev/null) && curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H \"Authorization: Bearer $token\" -X POST {}{body} >/dev/null 2>&1 || true",
+        shell_quote(token_file),
+        shell_quote(&format!("{base}{path}")),
     )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn run_shell_command(script: &str, background: bool) -> String {
@@ -214,17 +237,11 @@ pub fn pane_died_hook_command(base: &str, token_file: &str) -> String {
 pub fn close_dead_content_pane_pipeline() -> String {
     let pane_title = TmuxVar::PaneTitle.format().render_for_hook();
     let pane_dead = TmuxFormat::var_name("pane_dead").render_for_hook();
-    let window_id = TmuxFormat::var_name("window_id").render_for_hook();
-    let session_name = TmuxFormat::var_name("session_name").render_for_hook();
-    let session_windows = TmuxFormat::var_name("session_windows").render_for_hook();
+    let session_id = TmuxFormat::var_name("session_id").render_for_hook();
     let client_tty = TmuxFormat::var_name("client_tty").render_for_hook();
-    let pane_id = TmuxVar::PaneId.format().render_for_hook();
-    let dead_pane_filter =
-        TmuxFormat::eq(TmuxFormat::var_name("pane_dead"), TmuxFormat::literal("1"))
-            .render_for_hook();
 
     format!(
-        "tmux -S #{{socket_path}} list-panes -a -F '{session_name}\t{window_id}\t{pane_title}\t{pane_dead}\t{session_windows}' | awk -F '\t' '{{ key=$1 \"\\t\" $2; session[key]=$1; window[key]=$2; windows[key]=$5; if ($3==\"opensessions-sidebar\") {{ sidebars[key]++ }} else if ($4!=\"1\") {{ live[key]++ }} }} END {{ for (key in session) if (sidebars[key] > 0 && live[key]+0 == 0) print session[key] \"\\t\" window[key] \"\\t\" windows[key] }}' | while IFS=$(printf '\\t') read -r session window windows; do if [ \"$windows\" -le 1 ]; then fallback=$(tmux -S #{{socket_path}} list-sessions -F '{session_name}' | awk -v s=\"$session\" '$0==s {{ if (prev != \"\") {{ print prev; exit }}; seen=1; next }} seen {{ print; exit }} {{ prev=$0 }}'); tmux -S #{{socket_path}} list-clients -t \"=$session:\" -F '{client_tty}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux -S #{{socket_path}} switch-client -c \"$client\" -t \"=$fallback:\" >/dev/null 2>&1 || true; done; fi; tmux -S #{{socket_path}} kill-window -t \"$window\" >/dev/null 2>&1 || true; done; tmux -S #{{socket_path}} list-panes -a -f '{dead_pane_filter}' -F '{pane_id}' | while IFS= read -r pane; do [ -n \"$pane\" ] && tmux -S #{{socket_path}} kill-pane -t \"$pane\" >/dev/null 2>&1 || true; done"
+        "pane='#{{hook_pane}}'; set -- $(tmux display-message -p -t \"$pane\" '##{{window_id}} ##{{session_id}}'); window=$1; session=$2; counts=$(tmux list-panes -t \"$window\" -F '{pane_title}\t{pane_dead}' | awk -F '\\t' '{{ if ($1==\"opensessions-sidebar\") sidebars++; else if ($2!=\"1\") live++ }} END {{ print sidebars+0, live+0 }}'); set -- $counts; if [ \"$1\" -gt 0 ]; then if [ \"$2\" -eq 0 ]; then windows=$(tmux list-windows -t \"$session\" -F x | wc -l | tr -d ' '); if [ \"$windows\" -le 1 ]; then fallback=$(tmux list-sessions -F '{session_id}' | awk -v s=\"$session\" '$0 != s {{ print; exit }}'); tmux list-clients -t \"$session\" -F '{client_tty}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux switch-client -c \"$client\" -t \"$fallback\" >/dev/null 2>&1 || true; done; fi; tmux kill-window -t \"$window\" >/dev/null 2>&1 || true; else tmux kill-pane -t \"$pane\" >/dev/null 2>&1 || true; fi; fi"
     )
 }
 
@@ -341,7 +358,7 @@ mod tests {
             hook.contains("kill-pane -t \\\"\\$pane\\\"")
                 || hook.contains("kill-pane -t \"\\$pane\"")
         );
-        assert!(hook.contains("-X POST http://127.0.0.1:1234/pane-exited"));
+        assert!(hook.contains("-X POST 'http://127.0.0.1:1234/pane-exited'"));
         assert!(!hook.contains("list-panes -a -f '##{&&:##{>:"));
         assert_eq!(hook.matches("run-shell").count(), 1);
     }

@@ -14,6 +14,9 @@ use crate::tmux_scripting::{
 
 const SEP: &str = "\t";
 const STASH_SESSION: &str = "_os_stash";
+const OPENSESSIONS_HOOK_INDEX: u16 = 909;
+const REMAIN_ON_EXIT_PREVIOUS_OPTION: &str = "@opensessions_remain_on_exit_previous";
+const REMAIN_ON_EXIT_INHERITED: &str = "__inherited__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -316,7 +319,7 @@ impl TmuxClient {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        self.run(&["run-shell", "-b", &script]);
+        self.run(&["run-shell", &script]);
     }
 
     pub fn set_window_remain_on_exit(&self, target: &str, enabled: bool) {
@@ -329,11 +332,74 @@ impl TmuxClient {
         ]);
     }
 
+    pub fn ensure_window_remain_on_exit(&self, target: &str) {
+        let local = self.run(&["show-window-options", "-t", target, "-v", "remain-on-exit"]);
+        let effective = if local.stdout.is_empty() {
+            self.run(&["show-window-options", "-g", "-v", "remain-on-exit"])
+                .stdout
+        } else {
+            local.stdout.clone()
+        };
+        if effective == "on" {
+            return;
+        }
+        self.set_window_remain_on_exit(target, true);
+        self.run(&[
+            "set-window-option",
+            "-t",
+            target,
+            REMAIN_ON_EXIT_PREVIOUS_OPTION,
+            if local.stdout.is_empty() {
+                REMAIN_ON_EXIT_INHERITED
+            } else {
+                &local.stdout
+            },
+        ]);
+    }
+
     pub fn set_remain_on_exit_for_sidebar_windows(&self, enabled: bool) {
         let mut seen_windows = HashSet::new();
         for pane in self.list_panes(PaneScope::All) {
             if pane.title == "opensessions-sidebar" && seen_windows.insert(pane.window_id.clone()) {
-                self.set_window_remain_on_exit(&pane.window_id, enabled);
+                if enabled {
+                    self.ensure_window_remain_on_exit(&pane.window_id);
+                } else {
+                    let previous = self
+                        .run(&[
+                            "show-window-options",
+                            "-t",
+                            &pane.window_id,
+                            "-v",
+                            REMAIN_ON_EXIT_PREVIOUS_OPTION,
+                        ])
+                        .stdout;
+                    if previous == REMAIN_ON_EXIT_INHERITED {
+                        self.run(&[
+                            "set-window-option",
+                            "-t",
+                            &pane.window_id,
+                            "-u",
+                            "remain-on-exit",
+                        ]);
+                    } else if !previous.is_empty() {
+                        self.run(&[
+                            "set-window-option",
+                            "-t",
+                            &pane.window_id,
+                            "remain-on-exit",
+                            &previous,
+                        ]);
+                    }
+                    if !previous.is_empty() {
+                        self.run(&[
+                            "set-window-option",
+                            "-t",
+                            &pane.window_id,
+                            "-u",
+                            REMAIN_ON_EXIT_PREVIOUS_OPTION,
+                        ]);
+                    }
+                }
             }
         }
     }
@@ -478,7 +544,8 @@ impl TmuxClient {
     }
 
     pub fn set_global_hook(&self, name: &str, command: &str) {
-        let output = self.run(&["set-hook", "-g", name, command]);
+        let owned_name = format!("{name}[{OPENSESSIONS_HOOK_INDEX}]");
+        let output = self.run(&["set-hook", "-g", &owned_name, command]);
         if !output.ok() {
             eprintln!(
                 "opensessions: failed to install tmux hook {name}: status={} stderr={} command={command}",
@@ -488,7 +555,8 @@ impl TmuxClient {
     }
 
     pub fn unset_global_hook(&self, name: &str) {
-        self.run(&["set-hook", "-gu", name]);
+        let owned_name = format!("{name}[{OPENSESSIONS_HOOK_INDEX}]");
+        self.run(&["set-hook", "-gu", &owned_name]);
     }
 
     pub fn set_global_option(&self, name: &str, value: &str) {
@@ -602,6 +670,7 @@ impl MuxProvider for TmuxProvider {
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
+        self.client.select_sidebar_pane_for_session(name);
     }
 
     fn client_tty_for_pane(&self, pane_id: &str) -> Option<String> {
@@ -928,7 +997,7 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn prepare_sidebar_window(&self, window_id: &str) {
-        self.client.set_window_remain_on_exit(window_id, true);
+        self.client.ensure_window_remain_on_exit(window_id);
     }
 
     fn focus_pane(&self, pane_id: &str) {
@@ -1091,7 +1160,7 @@ impl MuxProvider for TmuxProvider {
         )?;
         self.client
             .set_pane_title(&new_pane.id, "opensessions-sidebar");
-        self.client.set_window_remain_on_exit(window_id, true);
+        self.client.ensure_window_remain_on_exit(window_id);
         Some(new_pane.id)
     }
 
@@ -1698,7 +1767,6 @@ mod tests {
                 ],
                 vec![
                     "run-shell".to_string(),
-                    "-b".to_string(),
                     "tmux resize-pane -t '%1' -x 36 >/dev/null 2>&1 || true; tmux resize-pane -t '%2' -x 36 >/dev/null 2>&1 || true".to_string(),
                 ],
             ],
@@ -1740,5 +1808,44 @@ mod tests {
             Some("/dev/ttys001")
         );
         assert_eq!(client.client_tty_for_pane("%999"), None);
+    }
+
+    #[test]
+    fn switching_sessions_focuses_the_destination_sidebar() {
+        struct SwitchRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl CommandRunner for SwitchRunner {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                self.calls.lock().unwrap().push(args.to_vec());
+                let stdout = match args.first().map(String::as_str) {
+                    Some("list-windows") => "@2\t$2\tbeta\t0\tbeta\t1\t2",
+                    Some("list-panes") => concat!(
+                        "%2\tbeta\t@2\t0\t0\t1\t/dev/ttys2\t11\t/tmp\tzsh\tzsh\t80\t24\t0\t79\n",
+                        "%3\tbeta\t@2\t0\t1\t0\t/dev/ttys3\t12\t/tmp\topensessions-sidebar\topensessions-sidebar\t36\t24\t0\t35"
+                    ),
+                    _ => "",
+                };
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+
+        let runner = Arc::new(SwitchRunner {
+            calls: Mutex::new(Vec::new()),
+        });
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.switch_session("beta", Some("/dev/ttys001"));
+
+        assert!(runner.calls.lock().unwrap().contains(&vec![
+            "select-pane".to_string(),
+            "-t".to_string(),
+            "%3".to_string(),
+        ]));
     }
 }

@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 interface PiRuntimePayload {
   pid: number;
@@ -33,19 +34,25 @@ const REQUEST_TIMEOUT_MS = 750;
  * server port is derived from a hash of the tmux socket path so concurrent
  * tmux servers on the same machine get independent opensessions servers.
  */
-function hashServerKey(input: string): number {
-  let hash = 0;
-  const bytes = new TextEncoder().encode(input);
-  for (let i = 0; i < bytes.length; i += 1) {
-    hash = (hash + bytes[i] * (i + 1)) % 20000;
-  }
-  return hash;
+function hashServerKey(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
+function portForServerKey(key: string): number | null {
+  const legacy = /^\d{1,5}$/.test(key) ? Number.parseInt(key, 10) : null;
+  const value = legacy ?? Number.parseInt(key.slice(0, 8), 16);
+  return Number.isFinite(value) ? RUST_SERVER_PORT_BASE + (value % 20000) : null;
+}
+
+const tokenFileByUrl = new Map<string, string>();
+
 function resolveServerUrls(): string[] {
+  tokenFileByUrl.clear();
   const urls: string[] = [];
-  const add = (url: string | undefined): void => {
-    if (url && !urls.includes(url)) urls.push(url);
+  const add = (url: string | undefined, tokenFile?: string): void => {
+    if (!url) return;
+    if (!urls.includes(url)) urls.push(url);
+    if (tokenFile) tokenFileByUrl.set(url, tokenFile);
   };
 
   add(process.env.OPENSESSIONS_URL?.replace(/\/+$/, ""));
@@ -55,18 +62,19 @@ function resolveServerUrls(): string[] {
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
   if (explicitKey) {
-    const key = Number.parseInt(explicitKey, 10);
-    if (Number.isFinite(key)) {
-      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-    }
+    const port = portForServerKey(explicitKey);
+    if (port) add(`http://127.0.0.1:${port}`, `/tmp/opensessions.${explicitKey}.token`);
   }
 
   const tmux = process.env.TMUX?.trim();
   if (tmux) {
     const socketPath = tmux.split(",", 1)[0];
     if (socketPath) {
-      const key = hashServerKey(socketPath);
-      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+      let canonicalPath = socketPath;
+      try { canonicalPath = realpathSync(socketPath); } catch {}
+      const key = hashServerKey(canonicalPath);
+      const port = portForServerKey(key);
+      if (port) add(`http://127.0.0.1:${port}`, `/tmp/opensessions.${key}.token`);
     }
   }
 
@@ -78,12 +86,7 @@ function authToken(serverUrl: string): string | undefined {
   try {
     const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
     if (explicit) return readFileSync(explicit, "utf8").trim();
-    const port = Number.parseInt(new URL(serverUrl).port, 10);
-    const key = port - RUST_SERVER_PORT_BASE;
-    return readFileSync(
-      key >= 0 && key < 20000 ? `/tmp/opensessions.${key}.token` : "/tmp/opensessions.token",
-      "utf8",
-    ).trim();
+    return readFileSync(tokenFileByUrl.get(serverUrl) ?? "/tmp/opensessions.token", "utf8").trim();
   } catch {
     return undefined;
   }

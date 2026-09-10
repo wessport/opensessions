@@ -36,6 +36,10 @@ pub enum ServerMessage {
         old_name: String,
         new_name: String,
     },
+    SettingsApplied {
+        request_id: u64,
+        settings_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -56,6 +60,8 @@ pub struct ServerState {
     pub agent_panel_scope: AgentPanelScope,
     pub sidebar_width: u32,
     pub detail_panel_height: u32,
+    #[serde(default)]
+    pub settings_revision: u64,
     pub initializing: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,15 +322,19 @@ pub enum ClientCommand {
     SetTheme {
         theme: String,
         transparent_background: bool,
+        request_id: u64,
     },
     SetSidebarWidth {
         width: u32,
+        request_id: u64,
     },
     SetDetailPanelHeight {
         height: u32,
+        request_id: u64,
     },
     SetAgentPanelScope {
         scope: AgentPanelScope,
+        request_id: u64,
     },
     RepairWidth,
     SetFilter {

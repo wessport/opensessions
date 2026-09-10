@@ -4,7 +4,22 @@ opensessions exposes HTTP endpoints that let agents, scripts, and CI pipelines p
 
 ## Endpoints
 
-All endpoints accept `POST` with `Content-Type: application/json` on `127.0.0.1:7391`.
+All metadata endpoints accept authenticated `POST` requests with `Content-Type:
+application/json`. By default, the server port and bearer token are scoped to the
+current tmux socket. Discover them once in shell examples as follows:
+
+```sh
+OPENSESSIONS_DIR=$(tmux show-environment -g OPENSESSIONS_DIR | cut -d= -f2-)
+SCRIPT_DIR="$OPENSESSIONS_DIR/integrations/tmux-plugin/scripts"
+. "$SCRIPT_DIR/server-common.sh"
+URL="http://${HOST}:${PORT}"
+TOKEN=$(auth_token)
+AUTH="authorization: Bearer $TOKEN"
+```
+
+If `OPENSESSIONS_PORT` is explicitly configured, also configure
+`OPENSESSIONS_TOKEN_FILE`; a port alone cannot identify the socket-scoped token.
+Non-liveness endpoints reject requests without a valid bearer token.
 
 Successful updates return `204 No Content`. Malformed JSON or invalid payloads return
 `400 Bad Request`; unsupported methods return `405 Method Not Allowed`. Request bodies
@@ -16,12 +31,12 @@ Set a status pill on a session. Shows in both the session card and the detail pa
 
 ```sh
 # Set status
-curl -sS -X POST http://127.0.0.1:7391/set-status \
+curl -sS -X POST "$URL/set-status" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","text":"Indexing","tone":"info"}'
 
 # Clear status
-curl -sS -X POST http://127.0.0.1:7391/set-status \
+curl -sS -X POST "$URL/set-status" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","text":null}'
 ```
@@ -38,17 +53,17 @@ Set a progress indicator on a session. Shows as a compact summary (e.g. `3/10` o
 
 ```sh
 # Set progress with current/total
-curl -sS -X POST http://127.0.0.1:7391/set-progress \
+curl -sS -X POST "$URL/set-progress" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","current":3,"total":10,"label":"files"}'
 
 # Set progress with percent
-curl -sS -X POST http://127.0.0.1:7391/set-progress \
+curl -sS -X POST "$URL/set-progress" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","percent":0.75,"label":"deploying"}'
 
 # Clear progress
-curl -sS -X POST http://127.0.0.1:7391/set-progress \
+curl -sS -X POST "$URL/set-progress" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","clear":true}'
 ```
@@ -67,7 +82,7 @@ curl -sS -X POST http://127.0.0.1:7391/set-progress \
 Append a structured log entry to a session. Last 8 entries are visible in the detail panel.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:7391/log \
+curl -sS -X POST "$URL/log" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","message":"Build started","source":"ci","tone":"info"}'
 ```
@@ -84,7 +99,7 @@ curl -sS -X POST http://127.0.0.1:7391/log \
 Clear all log entries for a session.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:7391/clear-log \
+curl -sS -X POST "$URL/clear-log" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api"}'
 ```
@@ -94,7 +109,7 @@ curl -sS -X POST http://127.0.0.1:7391/clear-log \
 Send a notification (currently appends to logs with highlighting). Same fields as `/log`.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:7391/notify \
+curl -sS -X POST "$URL/notify" -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"session":"api","message":"Deploy complete","tone":"success","source":"cd"}'
 ```
@@ -137,32 +152,42 @@ curl -sS -X POST http://127.0.0.1:7391/notify \
 ```bash
 #!/bin/bash
 SESSION=$(tmux display-message -p '#{session_name}')
-URL="http://127.0.0.1:7391"
+OPENSESSIONS_DIR=$(tmux show-environment -g OPENSESSIONS_DIR | cut -d= -f2-)
+SCRIPT_DIR="$OPENSESSIONS_DIR/integrations/tmux-plugin/scripts"
+. "$SCRIPT_DIR/server-common.sh"
+URL="http://${HOST}:${PORT}"
+AUTH="authorization: Bearer $(auth_token)"
 
 curl -sS -X POST "$URL/set-status" \
+  -H "$AUTH" \
   -H 'content-type: application/json' \
   -d "{\"session\":\"$SESSION\",\"text\":\"Building\",\"tone\":\"info\"}"
 
 curl -sS -X POST "$URL/set-progress" \
+  -H "$AUTH" \
   -H 'content-type: application/json' \
   -d "{\"session\":\"$SESSION\",\"current\":0,\"total\":3,\"label\":\"steps\"}"
 
 npm run build 2>&1 && {
   curl -sS -X POST "$URL/log" \
+    -H "$AUTH" \
     -H 'content-type: application/json' \
     -d "{\"session\":\"$SESSION\",\"message\":\"Build succeeded\",\"tone\":\"success\",\"source\":\"build\"}"
 } || {
   curl -sS -X POST "$URL/log" \
+    -H "$AUTH" \
     -H 'content-type: application/json' \
     -d "{\"session\":\"$SESSION\",\"message\":\"Build failed\",\"tone\":\"error\",\"source\":\"build\"}"
 }
 
 # Clear when done
 curl -sS -X POST "$URL/set-status" \
+  -H "$AUTH" \
   -H 'content-type: application/json' \
   -d "{\"session\":\"$SESSION\",\"text\":null}"
 
 curl -sS -X POST "$URL/set-progress" \
+  -H "$AUTH" \
   -H 'content-type: application/json' \
   -d "{\"session\":\"$SESSION\",\"clear\":true}"
 ```
