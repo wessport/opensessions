@@ -357,6 +357,7 @@ mod tests {
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 36,
             detail_panel_height: 10,
+            settings_revision: 0,
             initializing: false,
             init_label: None,
             collapsed_worktree_groups: Vec::new(),
@@ -418,6 +419,7 @@ mod tests {
             vec![ClientCommand::SetTheme {
                 theme: "electric-fusion".to_string(),
                 transparent_background: true,
+                request_id: 1,
             }]
         );
     }

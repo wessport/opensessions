@@ -136,11 +136,13 @@ pub struct App {
     last_activated_session: Option<String>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
-    pending_theme_intent: Option<(String, bool)>,
+    pending_theme_intent: Option<(u64, String, bool)>,
     client_tty: Option<String>,
-    pending_sidebar_width_intent: Option<u16>,
-    pending_detail_panel_height_intent: Option<usize>,
-    pending_agent_panel_scope_intent: Option<AgentPanelScope>,
+    pending_sidebar_width_intent: Option<(u64, u16)>,
+    pending_detail_panel_height_intent: Option<(u64, usize)>,
+    pending_agent_panel_scope_intent: Option<(u64, AgentPanelScope)>,
+    next_settings_request_id: u64,
+    settings_revision: u64,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -192,6 +194,8 @@ impl App {
             pending_sidebar_width_intent: None,
             pending_detail_panel_height_intent: None,
             pending_agent_panel_scope_intent: None,
+            next_settings_request_id: 1,
+            settings_revision: state.settings_revision,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -276,12 +280,18 @@ impl App {
                 self.sessions = state.sessions;
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
-                self.apply_server_sidebar_width(state.sidebar_width.min(u16::MAX as u32) as u16);
-                self.apply_server_theme(state.theme, state.transparent_background);
+                let apply_settings = state.settings_revision >= self.settings_revision;
+                if apply_settings {
+                    self.settings_revision = state.settings_revision;
+                    self.apply_server_sidebar_width(
+                        state.sidebar_width.min(u16::MAX as u32) as u16,
+                    );
+                    self.apply_server_theme(state.theme, state.transparent_background);
+                    self.apply_server_agent_panel_scope(state.agent_panel_scope);
+                    self.apply_server_detail_panel_height(state.detail_panel_height as usize);
+                }
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
-                self.apply_server_agent_panel_scope(state.agent_panel_scope);
-                self.apply_server_detail_panel_height(state.detail_panel_height as usize);
                 self.collapsed_worktree_groups =
                     state.collapsed_worktree_groups.into_iter().collect();
                 self.clear_missing_pending_switch();
@@ -322,6 +332,13 @@ impl App {
                 }
             }
             ServerMessage::ReIdentify { .. } => {}
+            ServerMessage::SettingsApplied {
+                request_id,
+                settings_revision,
+            } => {
+                self.settings_revision = self.settings_revision.max(settings_revision);
+                self.clear_acknowledged_settings_intent(request_id);
+            }
             ServerMessage::WindowList {
                 session,
                 mut windows,
@@ -699,9 +716,11 @@ impl App {
             AgentPanelScope::Current => AgentPanelScope::All,
             AgentPanelScope::All => AgentPanelScope::Current,
         };
-        self.pending_agent_panel_scope_intent = Some(self.agent_panel_scope);
+        let request_id = self.next_settings_request_id();
+        self.pending_agent_panel_scope_intent = Some((request_id, self.agent_panel_scope));
         self.commands.push(ClientCommand::SetAgentPanelScope {
             scope: self.agent_panel_scope,
+            request_id,
         });
         self.focused_agent_idx = self
             .focused_agent_idx
@@ -802,10 +821,12 @@ impl App {
     /// `apply_server_message` stores on `self.theme`.
     pub fn set_theme_request(&mut self, theme: String) {
         self.theme = Some(theme.clone());
-        self.pending_theme_intent = Some((theme.clone(), self.transparent_background));
+        let request_id = self.next_settings_request_id();
+        self.pending_theme_intent = Some((request_id, theme.clone(), self.transparent_background));
         self.commands.push(ClientCommand::SetTheme {
             theme,
             transparent_background: self.transparent_background,
+            request_id,
         });
     }
 
@@ -1049,18 +1070,22 @@ impl App {
             }
             *draft_width = next;
             self.sidebar_width = next;
-            self.pending_sidebar_width_intent = Some(next);
+            let request_id = self.next_settings_request_id();
+            self.pending_sidebar_width_intent = Some((request_id, next));
             self.commands.push(ClientCommand::SetSidebarWidth {
                 width: u32::from(next),
+                request_id,
             });
         }
     }
 
     pub fn close_width_slider(&mut self) {
         if let Modal::WidthSlider { draft_width } = self.modal {
-            self.pending_sidebar_width_intent = Some(draft_width);
+            let request_id = self.next_settings_request_id();
+            self.pending_sidebar_width_intent = Some((request_id, draft_width));
             self.commands.push(ClientCommand::SetSidebarWidth {
                 width: u32::from(draft_width),
+                request_id,
             });
         }
         self.modal = Modal::None;
@@ -1068,9 +1093,11 @@ impl App {
 
     pub fn confirm_width_slider(&mut self) {
         if let Modal::WidthSlider { draft_width } = self.modal {
-            self.pending_sidebar_width_intent = Some(draft_width);
+            let request_id = self.next_settings_request_id();
+            self.pending_sidebar_width_intent = Some((request_id, draft_width));
             self.commands.push(ClientCommand::SetSidebarWidth {
                 width: u32::from(draft_width),
+                request_id,
             });
         }
         self.modal = Modal::None;
@@ -1090,14 +1117,16 @@ impl App {
             return;
         }
         self.detail_panel_height = height;
-        self.pending_detail_panel_height_intent = Some(height);
+        let request_id = self.next_settings_request_id();
+        self.pending_detail_panel_height_intent = Some((request_id, height));
         self.commands.push(ClientCommand::SetDetailPanelHeight {
             height: height.min(u32::MAX as usize) as u32,
+            request_id,
         });
     }
 
     fn apply_server_sidebar_width(&mut self, server_width: u16) {
-        if let Some(intent) = self.pending_sidebar_width_intent {
+        if let Some((_, intent)) = self.pending_sidebar_width_intent {
             if server_width == intent {
                 self.pending_sidebar_width_intent = None;
                 self.sidebar_width = server_width;
@@ -1118,7 +1147,7 @@ impl App {
         if matches!(&self.modal, Modal::ThemePicker { .. }) {
             return;
         }
-        if let Some((intent_theme, intent_background)) = self.pending_theme_intent.as_ref() {
+        if let Some((_, intent_theme, intent_background)) = self.pending_theme_intent.as_ref() {
             if server_theme.as_deref() == Some(intent_theme.as_str())
                 && transparent_background == *intent_background
             {
@@ -1134,7 +1163,7 @@ impl App {
 
     fn apply_server_detail_panel_height(&mut self, server_height: usize) {
         let server_height = server_height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT);
-        if let Some(intent) = self.pending_detail_panel_height_intent {
+        if let Some((_, intent)) = self.pending_detail_panel_height_intent {
             if server_height == intent {
                 self.pending_detail_panel_height_intent = None;
                 self.detail_panel_height = server_height;
@@ -1146,7 +1175,7 @@ impl App {
     }
 
     fn apply_server_agent_panel_scope(&mut self, server_scope: AgentPanelScope) {
-        if let Some(intent) = self.pending_agent_panel_scope_intent {
+        if let Some((_, intent)) = self.pending_agent_panel_scope_intent {
             if server_scope == intent {
                 self.pending_agent_panel_scope_intent = None;
                 self.agent_panel_scope = server_scope;
@@ -1160,6 +1189,40 @@ impl App {
             .min(self.focused_agents_len().saturating_sub(1));
         if self.focused_agents_len() == 0 {
             self.panel_focus = PanelFocus::Sessions;
+        }
+    }
+
+    fn next_settings_request_id(&mut self) -> u64 {
+        let request_id = self.next_settings_request_id;
+        self.next_settings_request_id = self.next_settings_request_id.wrapping_add(1).max(1);
+        request_id
+    }
+
+    fn clear_acknowledged_settings_intent(&mut self, request_id: u64) {
+        if self
+            .pending_theme_intent
+            .as_ref()
+            .is_some_and(|(pending, _, _)| *pending == request_id)
+        {
+            self.pending_theme_intent = None;
+        }
+        if self
+            .pending_sidebar_width_intent
+            .is_some_and(|(pending, _)| pending == request_id)
+        {
+            self.pending_sidebar_width_intent = None;
+        }
+        if self
+            .pending_detail_panel_height_intent
+            .is_some_and(|(pending, _)| pending == request_id)
+        {
+            self.pending_detail_panel_height_intent = None;
+        }
+        if self
+            .pending_agent_panel_scope_intent
+            .is_some_and(|(pending, _)| pending == request_id)
+        {
+            self.pending_agent_panel_scope_intent = None;
         }
     }
 
@@ -1555,6 +1618,7 @@ mod tests {
             agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
             detail_panel_height,
+            settings_revision: 0,
             initializing: false,
             init_label: None,
             collapsed_worktree_groups: Vec::new(),
@@ -1653,6 +1717,7 @@ mod tests {
             [ClientCommand::SetTheme {
                 theme,
                 transparent_background: false,
+                ..
             }] if theme == "electric-fusion"
         ));
 
@@ -1737,6 +1802,50 @@ mod tests {
     }
 
     #[test]
+    fn settings_acknowledgements_converge_after_coalesced_competing_updates() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.set_detail_panel_height(14);
+        app.set_detail_panel_height(15);
+        assert_eq!(
+            app.drain_commands(),
+            vec![
+                ClientCommand::SetDetailPanelHeight {
+                    height: 14,
+                    request_id: 1,
+                },
+                ClientCommand::SetDetailPanelHeight {
+                    height: 15,
+                    request_id: 2,
+                },
+            ]
+        );
+
+        app.apply_server_message(ServerMessage::SettingsApplied {
+            request_id: 1,
+            settings_revision: 1,
+        });
+        let mut competing = empty_state(8);
+        competing.settings_revision = 2;
+        app.apply_server_message(ServerMessage::State(competing));
+        assert_eq!(app.detail_panel_height, 15);
+
+        app.apply_server_message(ServerMessage::SettingsApplied {
+            request_id: 2,
+            settings_revision: 3,
+        });
+        let mut stale = empty_state(14);
+        stale.settings_revision = 1;
+        app.apply_server_message(ServerMessage::State(stale));
+        assert_eq!(app.detail_panel_height, 15);
+
+        let mut latest = empty_state(8);
+        latest.settings_revision = 4;
+        app.apply_server_message(ServerMessage::State(latest));
+        assert_eq!(app.detail_panel_height, 8);
+    }
+
+    #[test]
     fn agent_panel_scope_comes_from_server_state_and_toggle_emits_command() {
         let mut state = empty_state(10);
         state.agent_panel_scope = AgentPanelScope::All;
@@ -1751,6 +1860,7 @@ mod tests {
             app.drain_commands(),
             vec![ClientCommand::SetAgentPanelScope {
                 scope: AgentPanelScope::Current,
+                request_id: 1,
             }]
         );
     }
@@ -1784,7 +1894,10 @@ mod tests {
         assert_eq!(app.detail_panel_height, 12);
         assert_eq!(
             app.drain_commands(),
-            vec![ClientCommand::SetDetailPanelHeight { height: 12 }]
+            vec![ClientCommand::SetDetailPanelHeight {
+                height: 12,
+                request_id: 1,
+            }]
         );
     }
 

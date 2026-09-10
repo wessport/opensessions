@@ -27,9 +27,12 @@ SCRIPT_DIR="$SCRIPTS_DIR"
 # of asking users to build Rust locally. Local/dev checkouts can set
 # OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1 and use target/{debug,release}.
 PACKAGE_VERSION="$(grep -o '"version": *"[^"]*"' "$CURRENT_DIR/package.json" 2>/dev/null | head -1 | cut -d'"' -f4)"
-BIN_VERSION="$(cat "$CURRENT_DIR/bin/.opensessions-version" 2>/dev/null || true)"
-if [ ! -x "$CURRENT_DIR/bin/opensessions-sidebar" ] || [ ! -x "$CURRENT_DIR/bin/opensessions-server" ] || [ ! -x "$CURRENT_DIR/bin/lazydiff" ] || [ "$BIN_VERSION" != "$PACKAGE_VERSION" ]; then
-  sh "$SCRIPTS_DIR/install-binaries.sh" "$CURRENT_DIR" >/tmp/opensessions-install.log 2>&1 || true
+# The installer performs a cheap version-and-release-source validation before
+# returning. Run it on every load so a same-version bundle from another fork
+# cannot bypass provenance checks through an old cache marker.
+if ! sh "$SCRIPTS_DIR/install-binaries.sh" "$CURRENT_DIR" >/tmp/opensessions-install.log 2>&1; then
+  tmux display-message "opensessions: binary validation/install failed; see /tmp/opensessions-install.log" 2>/dev/null || true
+  exit 1
 fi
 
 . "$SCRIPTS_DIR/server-common.sh"

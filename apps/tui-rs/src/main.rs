@@ -8,7 +8,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::{SinkExt, StreamExt};
-use opensessions_sidebar::app::{App, LaunchTarget};
+use opensessions_sidebar::app::{App, LaunchTarget, Modal};
 use opensessions_sidebar::cli::{Args, resolve_endpoint_from_env};
 use opensessions_sidebar::client::{
     connect_ws_path_with_token, decode_server_message, encode_client_command, fire_quit_http,
@@ -35,6 +35,7 @@ type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct PendingSidebarWidthCommand {
     width: u32,
+    request_id: u64,
     due_at: std::time::Instant,
 }
 
@@ -394,9 +395,10 @@ async fn send_or_queue_client_command(
     pending_sidebar_width: &mut Option<PendingSidebarWidthCommand>,
 ) -> Result<bool> {
     match command {
-        ClientCommand::SetSidebarWidth { width } => {
+        ClientCommand::SetSidebarWidth { width, request_id } => {
             *pending_sidebar_width = Some(PendingSidebarWidthCommand {
                 width,
+                request_id,
                 due_at: std::time::Instant::now()
                     + std::time::Duration::from_millis(SIDEBAR_WIDTH_DEBOUNCE_MS),
             });
@@ -421,6 +423,7 @@ async fn flush_pending_sidebar_width(
     };
     let command = ClientCommand::SetSidebarWidth {
         width: pending.width,
+        request_id: pending.request_id,
     };
     ws.send(Message::text(encode_client_command(&command)?))
         .await?;
@@ -428,7 +431,11 @@ async fn flush_pending_sidebar_width(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
-    if let Some(key) = ui_key_from_crossterm(key) {
+    let text_entry = matches!(
+        app.modal,
+        Modal::RenameSession { .. } | Modal::ThemePicker { .. }
+    );
+    if let Some(key) = ui_key_from_crossterm(key, text_entry) {
         apply_ui_key(app, key);
     }
 }
@@ -480,7 +487,7 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
     }
 }
 
-fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
+fn ui_key_from_crossterm(key: KeyEvent, text_entry: bool) -> Option<UiKey> {
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('4') {
         return Some(UiKey::Char('$'));
     }
@@ -500,6 +507,7 @@ fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
     }
 
     match key.code {
+        KeyCode::Char(ch) if text_entry => Some(UiKey::Char(ch)),
         KeyCode::Char('j') | KeyCode::Down => Some(UiKey::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(UiKey::Up),
         KeyCode::Left => Some(UiKey::Left),
@@ -814,6 +822,7 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opensessions_sidebar::generated::protocol::{AgentPanelScope, ServerState};
     use std::path::PathBuf;
 
     #[test]
@@ -832,8 +841,51 @@ mod tests {
     #[test]
     fn shifted_four_is_normalized_to_the_session_rename_key() {
         assert_eq!(
-            ui_key_from_crossterm(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT)),
+            ui_key_from_crossterm(
+                KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT),
+                false,
+            ),
             Some(UiKey::Char('$'))
+        );
+    }
+
+    #[test]
+    fn rename_keeps_vim_navigation_characters_as_text() {
+        let mut app = App::from_state(ServerState {
+            sessions: Vec::new(),
+            focused_session: None,
+            current_session: None,
+            visible_sidebar_pane_ids: Vec::new(),
+            theme: None,
+            transparent_background: false,
+            session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
+            sidebar_width: 36,
+            detail_panel_height: 10,
+            settings_revision: 0,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 0,
+        });
+        app.modal = Modal::RenameSession {
+            original_name: "old".to_string(),
+            draft: String::new(),
+        };
+
+        for ch in "job-key".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+
+        assert_eq!(
+            app.modal,
+            Modal::RenameSession {
+                original_name: "old".to_string(),
+                draft: "job-key".to_string(),
+            }
         );
     }
 

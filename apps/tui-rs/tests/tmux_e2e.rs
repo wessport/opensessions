@@ -576,7 +576,7 @@ fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
         "test setup should leave every opensessions sidebar with stale temporary focus; got:\n{second_stale_capture}",
     );
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "1"]);
+    lab.click_session_row(&source, "effect-ts");
     lab.wait_for_client_session("effect-ts");
     let effect = lab.sidebar_pane("effect-ts");
     lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
@@ -896,6 +896,192 @@ fn tmux_sidebar_quit_closes_the_server_and_every_sidebar_client() {
 }
 
 #[test]
+fn tmux_sidebar_sigterm_uses_the_graceful_cleanup_path() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-sigterm");
+    let server_pid = lab
+        .server
+        .as_ref()
+        .expect("server process")
+        .id()
+        .to_string();
+
+    let status = Command::new("kill")
+        .args(["-TERM", &server_pid])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success());
+
+    lab.wait_for_server_exit();
+    lab.wait_for_no_sidebar_processes();
+    assert!(!lab.root.join("server.pid").exists());
+    assert!(!lab.token_file().exists());
+    assert!(
+        !lab.tmux(["show-hooks", "-g"]).contains("opensessions"),
+        "opensessions hooks remained after SIGTERM"
+    );
+}
+
+#[test]
+fn tmux_sidebar_preserves_unrelated_indexed_hooks_across_startup_and_shutdown() {
+    let _guard = e2e_serial_guard();
+    let mut lab = Lab::new("opensessions-e2e-preserve-hooks");
+    lab.setup_repos();
+    lab.setup_tmux();
+    lab.tmux_ok(["set-window-option", "-g", "remain-on-exit", "on"]);
+    lab.tmux_ok([
+        "set-window-option",
+        "-t",
+        "opensessions:0",
+        "remain-on-exit",
+        "off",
+    ]);
+    lab.tmux_ok([
+        "set-window-option",
+        "-t",
+        "lazydiff:0",
+        "remain-on-exit",
+        "failed",
+    ]);
+    let sentinel = lab.root.join("custom-hook-ran");
+    let custom_hook = format!(
+        "run-shell -b {}",
+        shell_quote(&format!(
+            "printf custom > {}",
+            shell_quote(sentinel.to_str().unwrap())
+        ))
+    );
+    lab.tmux_ok([
+        "set-hook",
+        "-g",
+        "after-select-pane[42]",
+        custom_hook.as_str(),
+    ]);
+
+    lab.start_server();
+    lab.spawn_sidebars();
+    assert_eq!(
+        lab.tmux([
+            "show-window-options",
+            "-t",
+            "opensessions:0",
+            "-v",
+            "remain-on-exit",
+        ]),
+        "on"
+    );
+    assert_eq!(
+        lab.tmux([
+            "show-window-options",
+            "-t",
+            "opensessions:0",
+            "-v",
+            "@opensessions_remain_on_exit_previous",
+        ]),
+        "off"
+    );
+    assert_eq!(
+        lab.tmux([
+            "show-window-options",
+            "-t",
+            "lazydiff:0",
+            "-v",
+            "remain-on-exit",
+        ]),
+        "on"
+    );
+    assert_eq!(
+        lab.tmux([
+            "show-window-options",
+            "-t",
+            "lazydiff:0",
+            "-v",
+            "@opensessions_remain_on_exit_previous",
+        ]),
+        "failed"
+    );
+    let hooks = lab.tmux(["show-hooks", "-g", "after-select-pane"]);
+    assert!(hooks.contains("after-select-pane[42]"), "hooks:\n{hooks}");
+    assert!(hooks.contains("after-select-pane[909]"), "hooks:\n{hooks}");
+    let main = lab.main_pane("opensessions");
+    lab.tmux_ok(["select-pane", "-t", main.as_str()]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !sentinel.exists() && Instant::now() < deadline {
+        sleep(Duration::from_millis(20));
+    }
+    assert!(sentinel.exists(), "custom hook did not execute");
+
+    post_hook(lab.port, "/quit", &lab.auth_token());
+    lab.wait_for_server_exit();
+    let hooks = lab.tmux(["show-hooks", "-g", "after-select-pane"]);
+    assert!(hooks.contains("after-select-pane[42]"), "hooks:\n{hooks}");
+    assert!(!hooks.contains("after-select-pane[909]"), "hooks:\n{hooks}");
+    assert_eq!(
+        lab.tmux([
+            "show-window-options",
+            "-t",
+            "opensessions:0",
+            "-v",
+            "remain-on-exit",
+        ]),
+        "off"
+    );
+    assert_eq!(
+        lab.tmux([
+            "show-window-options",
+            "-t",
+            "lazydiff:0",
+            "-v",
+            "remain-on-exit",
+        ]),
+        "failed"
+    );
+    assert_eq!(
+        lab.tmux(["show-window-options", "-g", "-v", "remain-on-exit"]),
+        "on"
+    );
+}
+
+#[test]
+fn tmux_sidebar_hook_context_treats_session_names_as_data() {
+    let _guard = e2e_serial_guard();
+    let mut lab = Lab::new("opensessions-e2e-hook-quoting");
+    lab.setup_repos();
+    lab.setup_tmux();
+    let sentinel = lab.root.join("injected");
+    let hostile_name = format!("odd name'$(touch {})", sentinel.display());
+    lab.tmux_ok(["rename-session", "-t", "effect-ts", hostile_name.as_str()]);
+
+    lab.start_server();
+    lab.spawn_sidebars();
+    let sidebar = lab.sidebar_pane(&hostile_name);
+    let main = lab.main_pane(&hostile_name);
+    lab.tmux_ok(["switch-client", "-t", hostile_name.as_str()]);
+    lab.wait_for_client_session(&hostile_name);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+    lab.tmux_ok(["select-pane", "-t", main.as_str()]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lab
+        .logs()
+        .contains(&format!("focus-pane session={hostile_name}"))
+        && Instant::now() < deadline
+    {
+        sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        lab.logs()
+            .contains(&format!("focus-pane session={hostile_name}")),
+        "hook did not deliver the exact session name; logs:\n{}",
+        lab.logs()
+    );
+    assert!(
+        !sentinel.exists(),
+        "session name was executed as shell code"
+    );
+}
+
+#[test]
 fn tmux_sidebar_server_exits_when_its_tmux_namespace_disappears() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-missing-tmux");
@@ -1004,6 +1190,71 @@ fn tmux_sidebar_pane_exit_does_not_steal_sidebar_width() {
 
     lab.wait_for_non_sidebar_pane_count("opensessions", 1);
     lab.wait_for_all_sidebar_widths(36);
+}
+
+#[test]
+fn tmux_sidebar_pane_death_preserves_an_unrelated_retained_pane() {
+    let _guard = e2e_serial_guard();
+    let mut lab = Lab::new("opensessions-e2e-retained-pane");
+    lab.setup_repos();
+    lab.setup_tmux();
+    lab.tmux_ok([
+        "set-window-option",
+        "-t",
+        "opensessions:0",
+        "remain-on-exit",
+        "on",
+    ]);
+    let retained = lab
+        .tmux([
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "opensessions:0",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .trim()
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while lab.tmux(["display-message", "-p", "-t", &retained, "#{pane_dead}"]) != "1"
+        && Instant::now() < deadline
+    {
+        sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        lab.tmux(["display-message", "-p", "-t", &retained, "#{pane_dead}"]),
+        "1"
+    );
+
+    lab.start_server();
+    lab.spawn_sidebars();
+    let main = lab.main_pane("opensessions");
+    let exiting = lab
+        .tmux([
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            main.as_str(),
+            "sh",
+        ])
+        .trim()
+        .to_string();
+    lab.tmux_ok(["send-keys", "-t", exiting.as_str(), "exit", "Enter"]);
+    lab.wait_for_non_sidebar_pane_count("opensessions", 2);
+
+    assert_eq!(
+        lab.tmux(["display-message", "-p", "-t", &retained, "#{pane_dead}"]),
+        "1",
+        "an unrelated retained pane was deleted"
+    );
 }
 
 #[test]

@@ -27,7 +27,8 @@
 
 // @i-know-the-amp-plugin-api-is-wip-and-very-experimental-right-now
 import type { PluginAPI } from "@ampcode/plugin";
-import { appendFileSync, readFileSync, readdirSync } from "fs";
+import { appendFileSync, readFileSync, readdirSync, realpathSync } from "fs";
+import { createHash } from "crypto";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -117,21 +118,27 @@ async function fetchThreadTitle(threadId: string): Promise<string | null> {
 
 /**
  * Port resolution — matches the tmux-scoped opensessions server namespace.
- * Rust servers use 22000+server_key.
+ * Rust servers map the canonical socket SHA key into the 22000–41999 range.
  */
-function hashServerKey(input: string): number {
-  let hash = 0;
-  const bytes = new TextEncoder().encode(input);
-  for (let i = 0; i < bytes.length; i += 1) {
-    hash = (hash + bytes[i] * (i + 1)) % 20000;
-  }
-  return hash;
+function hashServerKey(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
+function portForServerKey(key: string): number | null {
+  const legacy = /^\d{1,5}$/.test(key) ? Number.parseInt(key, 10) : null;
+  const value = legacy ?? Number.parseInt(key.slice(0, 8), 16);
+  return Number.isFinite(value) ? RUST_SERVER_PORT_BASE + (value % 20000) : null;
+}
+
+const tokenFileByUrl = new Map<string, string>();
+
 function resolveServerUrls(): string[] {
+  tokenFileByUrl.clear();
   const urls: string[] = [];
-  const add = (url: string | undefined): void => {
-    if (url && !urls.includes(url)) urls.push(url);
+  const add = (url: string | undefined, tokenFile?: string): void => {
+    if (!url) return;
+    if (!urls.includes(url)) urls.push(url);
+    if (tokenFile) tokenFileByUrl.set(url, tokenFile);
   };
 
   add(process.env.OPENSESSIONS_URL);
@@ -141,18 +148,19 @@ function resolveServerUrls(): string[] {
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
   if (explicitKey) {
-    const key = Number.parseInt(explicitKey, 10);
-    if (Number.isFinite(key)) {
-      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-    }
+    const port = portForServerKey(explicitKey);
+    if (port) add(`http://127.0.0.1:${port}`, `/tmp/opensessions.${explicitKey}.token`);
   }
 
   const tmux = process.env.TMUX?.trim();
   if (tmux) {
     const socketPath = tmux.split(",", 1)[0];
     if (socketPath) {
-      const key = hashServerKey(socketPath);
-      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+      let canonicalPath = socketPath;
+      try { canonicalPath = realpathSync(socketPath); } catch {}
+      const key = hashServerKey(canonicalPath);
+      const port = portForServerKey(key);
+      if (port) add(`http://127.0.0.1:${port}`, `/tmp/opensessions.${key}.token`);
     }
   }
 
@@ -161,12 +169,13 @@ function resolveServerUrls(): string[] {
   // sessions and no-ops events for folders it does not own.
   try {
     for (const entry of readdirSync("/tmp")) {
-      const match = /^opensessions\.(\d+)\.pid$/.exec(entry);
+      const match = /^opensessions\.([0-9a-f]{16}|\d{1,5})\.pid$/.exec(entry);
       if (!match) continue;
       if (!pidFileIsAlive(join("/tmp", entry))) continue;
-      const key = Number.parseInt(match[1], 10);
-      if (!Number.isFinite(key)) continue;
-      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+      const key = match[1];
+      const port = portForServerKey(key);
+      if (!port) continue;
+      add(`http://127.0.0.1:${port}`, `/tmp/opensessions.${key}.token`);
     }
   } catch {}
 
@@ -196,11 +205,7 @@ function authToken(serverUrl: string): string | undefined {
   try {
     const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
     if (explicit) return readFileSync(explicit, "utf8").trim();
-    const port = Number.parseInt(new URL(serverUrl).port, 10);
-    const key = port - RUST_SERVER_PORT_BASE;
-    const path = key >= 0 && key < 20000
-      ? `/tmp/opensessions.${key}.token`
-      : "/tmp/opensessions.token";
+    const path = tokenFileByUrl.get(serverUrl) ?? "/tmp/opensessions.token";
     return readFileSync(path, "utf8").trim();
   } catch {
     return undefined;

@@ -98,18 +98,28 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 Scripts and agents can push custom metadata to the sidebar over HTTP — no binary needed:
 
 ```sh
+# Use the same socket-scoped endpoint resolver as the sidebar.
+OPENSESSIONS_DIR=$(tmux show-environment -g OPENSESSIONS_DIR | cut -d= -f2-)
+SCRIPT_DIR="$OPENSESSIONS_DIR/integrations/tmux-plugin/scripts"
+. "$SCRIPT_DIR/server-common.sh"
+URL="http://${HOST}:${PORT}"
+TOKEN=$(auth_token)
+
 # Set a status pill on a session
-curl -X POST http://127.0.0.1:7391/set-status \
+curl -X POST "$URL/set-status" \
+  -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"session":"my-app","text":"Deploying","tone":"warn"}'
 
 # Set progress
-curl -X POST http://127.0.0.1:7391/set-progress \
+curl -X POST "$URL/set-progress" \
+  -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"session":"my-app","current":3,"total":10,"label":"services"}'
 
 # Push a log entry
-curl -X POST http://127.0.0.1:7391/log \
+curl -X POST "$URL/log" \
+  -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"session":"my-app","message":"Tests passed","source":"ci","tone":"success"}'
 ```
@@ -188,6 +198,8 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 ## Current Caveats
 
 - The app is local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden.
+- Non-liveness HTTP endpoints require the bearer token scoped to that tmux socket; an unauthenticated request is rejected.
+- Fork installs do not silently fetch upstream release binaries. Publish compatible release artifacts and set `OPENSESSIONS_RELEASE_BASE`, or set `OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1` and build locally.
 - `theme`, `transparentBackground`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
 - tmux is the only supported mux today.
