@@ -137,6 +137,9 @@ pub enum AgentStatus {
     Waiting,
     Interrupted,
     Stale,
+    /// The agent process was stopped after sitting idle; the thread can be
+    /// resumed. Set by auto-hibernation, not by watchers.
+    Hibernated,
 }
 
 impl fmt::Display for AgentStatus {
@@ -150,6 +153,7 @@ impl fmt::Display for AgentStatus {
             Self::Waiting => "waiting",
             Self::Interrupted => "interrupted",
             Self::Stale => "stale",
+            Self::Hibernated => "hibernated",
         })
     }
 }
@@ -376,6 +380,19 @@ pub enum ClientCommand {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hibernated_status_uses_its_wire_name() {
+        assert_eq!(
+            serde_json::to_value(AgentStatus::Hibernated).unwrap(),
+            json!("hibernated")
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentStatus>(json!("hibernated")).unwrap(),
+            AgentStatus::Hibernated
+        );
+        assert_eq!(AgentStatus::Hibernated.to_string(), "hibernated");
+    }
 
     #[test]
     fn window_cleanup_messages_use_stable_window_ids() {

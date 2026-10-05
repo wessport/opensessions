@@ -54,7 +54,7 @@ opensessions/
 {
   agent: string,
   session: string,
-  status: "idle" | "running" | "tool-running" | "done" | "error" | "waiting" | "interrupted" | "stale",
+  status: "idle" | "running" | "tool-running" | "done" | "error" | "waiting" | "interrupted" | "stale" | "hibernated",
   ts: number,
   threadId?: string,
   threadName?: string,

@@ -98,6 +98,11 @@ pub trait MuxProvider: Send + Sync {
     fn get_session_pane_pids(&self, _name: &str) -> Vec<u32> {
         Vec::new()
     }
+    /// Root process id of a pane (normally its shell). Used to locate an
+    /// agent process for hibernation, never to derive agent status.
+    fn get_pane_pid(&self, _pane_id: &str) -> Option<u32> {
+        None
+    }
     fn get_pane_count(&self, name: &str) -> u32;
     fn get_client_tty(&self) -> String;
     fn client_tty_for_pane(&self, _pane_id: &str) -> Option<String> {

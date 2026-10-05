@@ -99,10 +99,11 @@ type AgentStatus =
   | "error"
   | "waiting"
   | "interrupted"
-  | "stale";
+  | "stale"
+  | "hibernated";
 ```
 
-Terminal states are `done`, `error`, and `interrupted`. The tracker uses those states to decide unseen behavior. `tool-running` is a running subtype used when the agent is actively using tools. `stale` means the last known running/waiting state has aged past the runtime threshold.
+Terminal states are `done`, `error`, and `interrupted`. The tracker uses those states to decide unseen behavior. `tool-running` is a running subtype used when the agent is actively using tools. `stale` means the last known running/waiting state has aged past the runtime threshold. `hibernated` means the server stopped an idle agent process to free memory (see `autoHibernate` in the configuration reference); the row stays visible with `liveness: "exited"` and no `paneId`, and the next running, tool-running, or waiting event for the thread resumes it. Other events received within one minute of hibernation are treated as shutdown side effects and ignored.
 
 ### `AgentEvent`
 
