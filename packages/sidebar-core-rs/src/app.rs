@@ -91,6 +91,9 @@ pub enum Modal {
     KillConfirm {
         target: KillTarget,
     },
+    /// `q` stops the server and every sidebar client, so it asks first; a
+    /// stray keypress in the sidebar must not tear down the whole control plane.
+    QuitConfirm,
     WindowManager {
         session: String,
         windows: Vec<WindowData>,
@@ -572,10 +575,7 @@ impl App {
                     self.switch_to_session(session.name.clone());
                 }
             }
-            'q' => {
-                self.commands.push(ClientCommand::Quit);
-                self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
-            }
+            'q' => self.modal = Modal::QuitConfirm,
             'R' => self.commands.push(ClientCommand::Refresh),
             '$' | 'r' => self.open_rename_session(),
             'n' | 'c' => self.pending_launches.push(LaunchTarget::Sessionizer),
@@ -941,6 +941,15 @@ impl App {
                 client_tty: self.client_tty.clone(),
             });
         }
+    }
+
+    pub fn confirm_quit(&mut self) {
+        if !matches!(self.modal, Modal::QuitConfirm) {
+            return;
+        }
+        self.modal = Modal::None;
+        self.commands.push(ClientCommand::Quit);
+        self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
     }
 
     pub fn open_window_manager(&mut self) {

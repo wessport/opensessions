@@ -898,9 +898,31 @@ fn tmux_sidebar_quit_closes_the_server_and_every_sidebar_client() {
     lab.wait_for_capture_pane(&source, |text| text.contains("sessions"));
 
     lab.send_sidebar_key(&source, "q");
+    lab.wait_for_capture_pane(&source, |text| text.contains("Quit opensessions?"));
+    lab.send_sidebar_key(&source, "y");
 
     lab.wait_for_server_exit();
     lab.wait_for_no_sidebar_processes();
+}
+
+#[test]
+fn tmux_sidebar_quit_is_cancelled_without_confirmation() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-quit-cancel");
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("sessions"));
+
+    lab.send_sidebar_key(&source, "q");
+    lab.wait_for_capture_pane(&source, |text| text.contains("Quit opensessions?"));
+    lab.send_sidebar_key(&source, "n");
+    lab.wait_for_capture_pane(&source, |text| !text.contains("Quit opensessions?"));
+
+    assert!(
+        lab.server_is_running(),
+        "cancelling the quit prompt must keep the server running"
+    );
+    assert_eq!(lab.sidebar_panes().len(), SIDEBAR_SESSIONS.len());
 }
 
 #[test]

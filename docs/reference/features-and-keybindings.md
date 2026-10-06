@@ -70,7 +70,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 | `d`, `x` | Open kill-session confirmation for focused session |
 | `t` | Open theme picker |
 | `R` | Refresh state |
-| `q` | Quit the server and all sidebar panes |
+| `q` | Ask to quit the server and all sidebar panes (`y` confirms; any other key cancels) |
 | `Esc` | Close only the current sidebar client |
 
 ### tmux plugin shortcuts
