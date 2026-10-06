@@ -16,7 +16,7 @@ use std::time::{Instant, SystemTime};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
-    AgentWatcherSnapshot, amp_snapshot_from_log_jsonl, amp_snapshot_from_thread_json,
+    AgentWatcherSnapshot, amp_log_pid, amp_snapshot_from_log_jsonl, amp_snapshot_from_thread_json,
     claude_code_snapshot_from_jsonl, codex_snapshot_from_jsonl, codex_thread_id_from_path,
     decode_claude_project_dir, droid_snapshot_from_jsonl, opencode_snapshot_from_row,
     parse_codex_session_index, pi_snapshot_from_jsonl,
@@ -85,7 +85,12 @@ const SIDEBAR_LIFECYCLE_POLL_MS: u64 = 500;
 const SIDEBAR_WIDTH_REPAIR_SETTLE_MS: u64 = 50;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
+/// The startup seed pass looks back this far for idle agents' last activity.
+const AGENT_WATCHER_SEED_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Newest files per agent source read by the startup seed pass.
+const AGENT_WATCHER_SEED_MAX_FILES: usize = 32;
 const AMP_LOG_TAIL_BYTES: u64 = 1024 * 1024;
+const AMP_LOG_PID_TAIL_BYTES: u64 = 64 * 1024;
 const STUCK_RUNNING_TIMEOUT_MS: u64 = 3 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -421,6 +426,8 @@ pub struct ReadOnlyMuxStateSource {
     tmux_socket_path: Option<PathBuf>,
     auto_hibernate: AutoHibernateSettings,
     process_control: Arc<dyn ProcessControl>,
+    /// Home directory holding agents' own durable state (transcripts, logs).
+    agent_state_home: Option<PathBuf>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -522,6 +529,7 @@ impl ReadOnlyMuxStateSource {
             tmux_socket_path: None,
             auto_hibernate: AutoHibernateSettings::default(),
             process_control: Arc::new(SystemProcessControl),
+            agent_state_home: std::env::var_os("HOME").map(PathBuf::from),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -684,6 +692,222 @@ impl ReadOnlyMuxStateSource {
         self
     }
 
+    pub fn with_agent_state_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.agent_state_home = Some(home.into());
+        self
+    }
+
+    /// Restores agents the previous server instance knew about, so their idle
+    /// clocks reflect real last activity instead of restarting with the
+    /// server. Runs once at startup over a bounded set of recent files.
+    fn seed_agents_from_durable_state(&self) -> bool {
+        let Some(home) = self.agent_state_home.as_deref() else {
+            return false;
+        };
+        let observations =
+            scan_agent_watcher_observations(home, current_time_ms(), WatcherScanWindow::SEED);
+        self.seed_agent_watcher_observations(observations)
+    }
+
+    /// Seeds tracker rows from durable agent state. Status comes from the
+    /// agent's own files; panes are used only for routing:
+    /// - files that record their writer process (Amp logs) are bound to the
+    ///   exact pane running that process, or ignored when it is not running in
+    ///   an agent pane;
+    /// - other files resolve by project dir, taking the newest activity that
+    ///   could belong to that session's agent (including activity that matches
+    ///   no session), so a seed is never older than the agent it stands for.
+    ///
+    /// Only quiet statuses are seeded; working agents keep today's behavior.
+    fn seed_agent_watcher_observations(&self, observations: Vec<AgentWatcherObservation>) -> bool {
+        if observations.is_empty() {
+            return false;
+        }
+        let sessions = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.list_sessions())
+            .collect::<Vec<_>>();
+        let process_table = if observations
+            .iter()
+            .any(|observation| observation.pid.is_some())
+        {
+            self.process_control.process_table()
+        } else {
+            Vec::new()
+        };
+        let mut pane_by_agent_pid = HashMap::<(String, u32), (String, String)>::new();
+        if !process_table.is_empty() {
+            for provider in &self.providers {
+                for session in provider.list_sessions() {
+                    for pane in provider.list_agent_panes(&session.name) {
+                        let Some(target) =
+                            provider.get_pane_pid(&pane.pane_id).and_then(|pane_pid| {
+                                find_agent_process(pane_pid, &pane.agent, &process_table)
+                            })
+                        else {
+                            continue;
+                        };
+                        for process in target.processes {
+                            pane_by_agent_pid.insert(
+                                (pane.agent.clone(), process.pid),
+                                (session.name.clone(), pane.pane_id.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let resolve_project = self.watcher_project_resolver(&sessions);
+        // (agent, session, pane) -> (newest observation, newest activity)
+        let mut groups =
+            HashMap::<(&str, String, Option<String>), (AgentWatcherObservation, u64)>::new();
+        let mut unattributed_activity = HashMap::<&str, u64>::new();
+        for observation in observations {
+            let route = match observation.pid {
+                Some(pid) => match pane_by_agent_pid.get(&(observation.agent.to_string(), pid)) {
+                    Some((session, pane_id)) => Some((session.clone(), Some(pane_id.clone()))),
+                    None => continue,
+                },
+                None => observation
+                    .project_dir
+                    .as_deref()
+                    .and_then(&resolve_project)
+                    .map(|session| (session, None)),
+            };
+            let Some((session, pane_id)) = route else {
+                let latest = unattributed_activity.entry(observation.agent).or_default();
+                *latest = (*latest).max(observation.mtime_ms);
+                continue;
+            };
+            let mtime_ms = observation.mtime_ms;
+            groups
+                .entry((observation.agent, session, pane_id))
+                .and_modify(|(newest, activity)| {
+                    *activity = (*activity).max(mtime_ms);
+                    if mtime_ms > newest.mtime_ms {
+                        *newest = observation.clone();
+                    }
+                })
+                .or_insert((observation, mtime_ms));
+        }
+
+        // Project-dir seeds could be attached to any of the session's panes,
+        // so they also yield to activity routed to those panes.
+        let mut session_activity = unattributed_activity
+            .iter()
+            .map(|(agent, ts)| ((*agent, None), *ts))
+            .collect::<HashMap<(&str, Option<String>), u64>>();
+        for ((agent, session, _), (_, activity)) in &groups {
+            let latest = session_activity
+                .entry((*agent, Some(session.clone())))
+                .or_default();
+            *latest = (*latest).max(*activity);
+        }
+
+        let mut groups = groups.into_iter().collect::<Vec<_>>();
+        // Pane-bound seeds first: they are exact, and project-dir seeds yield
+        // to any row the agent already has in the session.
+        groups.sort_by_key(|((_, _, pane_id), _)| pane_id.is_none());
+        let mut tracker = self.agent_tracker.lock().unwrap();
+        let mut changed = false;
+        for ((agent, session, pane_id), (newest, activity)) in groups {
+            let Some(snapshot) = newest.snapshot else {
+                continue;
+            };
+            if !matches!(
+                snapshot.status,
+                AgentStatus::Done
+                    | AgentStatus::Error
+                    | AgentStatus::Interrupted
+                    | AgentStatus::Stale
+            ) {
+                continue;
+            }
+            let ts = if pane_id.is_some() {
+                activity
+            } else {
+                [(agent, None), (agent, Some(session.clone()))]
+                    .iter()
+                    .filter_map(|key| session_activity.get(key))
+                    .fold(activity, |ts, other| ts.max(*other))
+            };
+            debug_log(format!(
+                "watcher-seed session={session} pane={pane_id:?} agent={agent} thread={:?} status={:?} ts={ts}",
+                snapshot.thread_id, snapshot.status,
+            ));
+            changed = tracker.apply_seed_event(AgentEvent {
+                agent: agent.to_string(),
+                session,
+                status: snapshot.status,
+                ts,
+                thread_id: snapshot.thread_id,
+                thread_name: snapshot.thread_name,
+                last_user_prompt: snapshot.last_user_prompt,
+                unseen: None,
+                liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
+                pane_id,
+            }) || changed;
+        }
+        changed
+    }
+
+    /// One routine watcher pass over recently modified agent state: returns
+    /// the snapshots to apply and whether any seeded row was released.
+    fn scan_live_agent_watchers(&self, now_ms: u64) -> (Vec<AgentWatcherSnapshot>, bool) {
+        let Some(home) = self.agent_state_home.as_deref() else {
+            return (Vec::new(), false);
+        };
+        let observations = scan_agent_watcher_observations(home, now_ms, WatcherScanWindow::LIVE);
+        let released = self.release_seeds_for_activity(&observations);
+        let mut snapshots = observations
+            .into_iter()
+            .filter_map(|observation| observation.snapshot)
+            .collect::<Vec<_>>();
+        scan_opencode_sessions(home, now_ms, &mut snapshots);
+        (snapshots, released)
+    }
+
+    /// Drops seeded rows whose source files show newer activity, including
+    /// activity the live watchers cannot attribute to a session.
+    fn release_seeds_for_activity(&self, observations: &[AgentWatcherObservation]) -> bool {
+        let mut tracker = self.agent_tracker.lock().unwrap();
+        let mut released = false;
+        for observation in observations {
+            released = tracker.release_seeds_with_newer_activity(
+                observation.agent,
+                &observation.thread_id,
+                observation.mtime_ms,
+            ) || released;
+        }
+        released
+    }
+
+    fn watcher_project_resolver(
+        &self,
+        sessions: &[opensessions_runtime::mux::MuxSessionInfo],
+    ) -> impl Fn(&str) -> Option<String> {
+        let encoded_sessions = sessions
+            .iter()
+            .map(|session| (encode_agent_project_dir(&session.dir), session.name.clone()))
+            .collect::<Vec<_>>();
+        let dir_session_map = build_dir_session_map(
+            sessions
+                .iter()
+                .map(|session| (session.name.clone(), session.dir.clone())),
+        );
+        move |project_dir: &str| {
+            if let Some(encoded) = project_dir.strip_prefix("__encoded__:") {
+                return encoded_sessions
+                    .iter()
+                    .find(|(session_encoded, _)| session_encoded == encoded)
+                    .map(|(_, name)| name.clone());
+            }
+            resolve_session_for_project_dir(project_dir, &dir_session_map)
+        }
+    }
+
     /// Stops the agent process in panes whose agent has been idle longer
     /// than the configured threshold, keeping each row as `hibernated`.
     /// Status still comes from the tracker; panes are only used to find the
@@ -715,6 +939,20 @@ impl ReadOnlyMuxStateSource {
         }
 
         let process_table = self.process_control.process_table();
+        let amp_activity_by_pid = if candidates.iter().any(|candidate| candidate.agent == "amp") {
+            self.agent_state_home
+                .as_deref()
+                .map(|home| {
+                    recent_amp_activity_by_pid(
+                        home,
+                        (self.now_ms)(),
+                        self.auto_hibernate.idle_after_ms,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         let mut targets = Vec::<AgentProcessTarget>::new();
         let mut planned = Vec::new();
         for candidate in candidates {
@@ -739,6 +977,21 @@ impl ReadOnlyMuxStateSource {
                 ));
                 continue;
             };
+            // The agent's own durable state can show activity the tracker
+            // could not attribute (for example a new thread in the same
+            // process); never stop a process that was active recently.
+            if candidate.agent == "amp"
+                && let Some(activity) = target
+                    .processes
+                    .iter()
+                    .find_map(|process| amp_activity_by_pid.get(&process.pid))
+            {
+                debug_log(format!(
+                    "auto-hibernate: recent durable activity session={} pane={} pid={} activity={activity}",
+                    candidate.session, candidate.pane_id, target.pid,
+                ));
+                continue;
+            }
             let index = targets
                 .iter()
                 .position(|existing| existing.pid == target.pid)
@@ -1708,26 +1961,13 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn resolve_agent_watcher_session(&self, snapshot: &AgentWatcherSnapshot) -> Option<String> {
+        let project_dir = snapshot.project_dir.as_deref()?;
         let sessions = self
             .providers
             .iter()
             .flat_map(|provider| provider.list_sessions())
             .collect::<Vec<_>>();
-        let project_dir = snapshot.project_dir.as_deref()?;
-
-        if let Some(encoded) = project_dir.strip_prefix("__encoded__:") {
-            return sessions
-                .iter()
-                .find(|session| encode_agent_project_dir(&session.dir) == encoded)
-                .map(|session| session.name.clone());
-        }
-
-        let dir_session_map = build_dir_session_map(
-            sessions
-                .into_iter()
-                .map(|session| (session.name, session.dir)),
-        );
-        resolve_session_for_project_dir(project_dir, &dir_session_map)
+        self.watcher_project_resolver(&sessions)(project_dir)
     }
 
     fn resolve_agent_event_session(&self, body: &Value) -> Option<String> {
@@ -2534,6 +2774,20 @@ async fn run_agent_watcher_loop(
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
     let mut unchanged_polls = 0;
 
+    let seed_source = source.clone();
+    let seeded = tokio::task::spawn_blocking(move || seed_source.seed_agents_from_durable_state())
+        .await
+        .unwrap_or(false);
+    if seeded {
+        debug_log("agent_watcher_loop: restored idle agents from durable state, broadcasting");
+        let snapshot_source = source.clone();
+        if let Ok(snapshot) =
+            tokio::task::spawn_blocking(move || snapshot_source.snapshot_json()).await
+        {
+            let _ = state_updates.send(snapshot);
+        }
+    }
+
     loop {
         let delay = adaptive_poll_delay_ms(
             unchanged_polls,
@@ -2558,13 +2812,15 @@ async fn run_agent_watcher_loop(
                     }
                 }
                 let now = current_time_ms();
-                let snapshots = tokio::task::spawn_blocking(move || scan_agent_watcher_snapshots(now))
-                    .await
-                    .unwrap_or_default();
+                let scan_source = source.clone();
+                let (snapshots, released) =
+                    tokio::task::spawn_blocking(move || scan_source.scan_live_agent_watchers(now))
+                        .await
+                        .unwrap_or_default();
                 let has_active_agents = snapshots
                     .iter()
                     .any(|snapshot| agent_status_needs_fast_polling(snapshot.status));
-                let mut changed = false;
+                let mut changed = released;
                 for snapshot in snapshots {
                     if snapshot.status == AgentStatus::Idle {
                         continue;
@@ -2644,84 +2900,186 @@ fn agent_watcher_key(snapshot: &AgentWatcherSnapshot) -> String {
     )
 }
 
-fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
-    let mut snapshots = Vec::new();
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return snapshots;
-    };
-
-    scan_amp_threads(&home, now_ms, &mut snapshots);
-    scan_amp_logs(&home, now_ms, &mut snapshots);
-    scan_claude_code_projects(&home, now_ms, &mut snapshots);
-    scan_codex_sessions(&home, now_ms, &mut snapshots);
-    scan_opencode_sessions(&home, now_ms, &mut snapshots);
-    scan_pi_sessions(&home, now_ms, &mut snapshots);
-    scan_droid_sessions(&home, now_ms, &mut snapshots);
-    snapshots
+/// Which agent state files a scan reads: files modified within `max_age_ms`,
+/// newest first, at most `max_files` per source.
+#[derive(Debug, Clone, Copy)]
+struct WatcherScanWindow {
+    max_age_ms: u64,
+    max_files: usize,
 }
 
-fn scan_amp_threads(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
-    let threads_dir = home.join(".local/share/amp/threads");
-    let Ok(entries) = fs::read_dir(threads_dir) else {
-        return;
+impl WatcherScanWindow {
+    /// Routine polling only rereads recently modified files.
+    const LIVE: Self = Self {
+        max_age_ms: AGENT_WATCHER_RECENT_MS,
+        max_files: usize::MAX,
+    };
+    /// One bounded startup pass that restores idle agents' last activity.
+    const SEED: Self = Self {
+        max_age_ms: AGENT_WATCHER_SEED_MAX_AGE_MS,
+        max_files: AGENT_WATCHER_SEED_MAX_FILES,
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
-            continue;
-        };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(snapshot) = amp_snapshot_from_thread_json(&raw, mtime_ms) {
-            snapshots.push(snapshot);
+    fn select(self, paths: impl IntoIterator<Item = PathBuf>, now_ms: u64) -> Vec<(PathBuf, u64)> {
+        let mut files = paths
+            .into_iter()
+            .filter_map(|path| {
+                let mtime_ms = file_mtime_ms(&path)?;
+                (now_ms.saturating_sub(mtime_ms) <= self.max_age_ms).then_some((path, mtime_ms))
+            })
+            .collect::<Vec<_>>();
+        files.sort_by_key(|(_, mtime_ms)| std::cmp::Reverse(*mtime_ms));
+        files.truncate(self.max_files);
+        files
+    }
+}
+
+/// One agent state file: when it last changed, where it can be routed, and
+/// the parsed snapshot when the file was readable.
+#[derive(Debug, Clone)]
+struct AgentWatcherObservation {
+    agent: &'static str,
+    thread_id: String,
+    mtime_ms: u64,
+    project_dir: Option<String>,
+    /// The agent process that last wrote the file, when the format records it.
+    pid: Option<u32>,
+    snapshot: Option<AgentWatcherSnapshot>,
+}
+
+impl AgentWatcherObservation {
+    fn new(
+        agent: &'static str,
+        thread_id: &str,
+        mtime_ms: u64,
+        snapshot: Option<AgentWatcherSnapshot>,
+    ) -> Self {
+        Self {
+            agent,
+            thread_id: snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.thread_id.clone())
+                .unwrap_or_else(|| thread_id.to_string()),
+            mtime_ms,
+            project_dir: snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.project_dir.clone()),
+            pid: None,
+            snapshot,
         }
     }
 }
 
-fn scan_amp_logs(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
-    let logs_dir = home.join(".cache/amp/logs/threads");
-    let Ok(entries) = fs::read_dir(logs_dir) else {
-        return;
-    };
+fn scan_agent_watcher_observations(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+) -> Vec<AgentWatcherObservation> {
+    let mut observations = Vec::new();
+    scan_amp_threads(home, now_ms, window, &mut observations);
+    scan_amp_logs(home, now_ms, window, &mut observations);
+    scan_claude_code_projects(home, now_ms, window, &mut observations);
+    scan_codex_sessions(home, now_ms, window, &mut observations);
+    scan_pi_sessions(home, now_ms, window, &mut observations);
+    scan_droid_sessions(home, now_ms, window, &mut observations);
+    observations
+}
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
-            continue;
-        }
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
+fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
+        .collect()
+}
+
+fn file_stem(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|stem| stem.to_str())
+}
+
+fn scan_amp_threads(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+    observations: &mut Vec<AgentWatcherObservation>,
+) {
+    let threads_dir = home.join(".local/share/amp/threads");
+    for (path, mtime_ms) in window.select(files_with_extension(&threads_dir, "json"), now_ms) {
+        let Some(thread_id) = file_stem(&path) else {
             continue;
         };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
-        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let snapshot = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| amp_snapshot_from_thread_json(&raw, mtime_ms));
+        observations.push(AgentWatcherObservation::new(
+            "amp", thread_id, mtime_ms, snapshot,
+        ));
+    }
+}
+
+fn scan_amp_logs(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+    observations: &mut Vec<AgentWatcherObservation>,
+) {
+    let logs_dir = home.join(".cache/amp/logs/threads");
+    for (path, mtime_ms) in window.select(files_with_extension(&logs_dir, "log"), now_ms) {
+        let Some(thread_id) = file_stem(&path) else {
             continue;
         };
-        let Some(raw) = read_file_tail(&path, AMP_LOG_TAIL_BYTES) else {
-            continue;
-        };
-        let Some(snapshot) = amp_snapshot_from_log_jsonl(thread_id, &raw, mtime_ms) else {
-            continue;
-        };
-        if let Some(existing) = snapshots.iter_mut().find(|existing| {
-            existing.agent == "amp" && existing.thread_id.as_deref() == Some(thread_id)
-        }) {
-            if snapshot.ts > existing.ts {
-                *existing = snapshot;
+        let raw = read_file_tail(&path, AMP_LOG_TAIL_BYTES);
+        let snapshot = raw
+            .as_deref()
+            .and_then(|raw| amp_snapshot_from_log_jsonl(thread_id, raw, mtime_ms));
+        let mut observation = AgentWatcherObservation::new("amp", thread_id, mtime_ms, snapshot);
+        observation.pid = raw.as_deref().and_then(amp_log_pid);
+        // Legacy thread files and current logs can describe the same thread;
+        // the newer readable snapshot wins.
+        if let Some(existing) = observations
+            .iter_mut()
+            .find(|existing| existing.agent == "amp" && existing.thread_id == observation.thread_id)
+        {
+            if observation.snapshot.is_some() && mtime_ms > existing.mtime_ms {
+                *existing = observation;
+            } else {
+                existing.mtime_ms = existing.mtime_ms.max(mtime_ms);
+                existing.pid = observation.pid.or(existing.pid);
             }
         } else {
-            snapshots.push(snapshot);
+            observations.push(observation);
         }
     }
+}
+
+/// Latest log activity per Amp process for logs modified within
+/// `max_age_ms`. Reads only a small tail per file unless its last line is
+/// longer than that.
+fn recent_amp_activity_by_pid(home: &Path, now_ms: u64, max_age_ms: u64) -> HashMap<u32, u64> {
+    let window = WatcherScanWindow {
+        max_age_ms,
+        max_files: usize::MAX,
+    };
+    let logs_dir = home.join(".cache/amp/logs/threads");
+    let mut activity = HashMap::<u32, u64>::new();
+    for (path, mtime_ms) in window.select(files_with_extension(&logs_dir, "log"), now_ms) {
+        let pid = read_file_tail(&path, AMP_LOG_PID_TAIL_BYTES)
+            .as_deref()
+            .and_then(amp_log_pid)
+            .or_else(|| {
+                read_file_tail(&path, AMP_LOG_TAIL_BYTES)
+                    .as_deref()
+                    .and_then(amp_log_pid)
+            });
+        if let Some(pid) = pid {
+            let latest = activity.entry(pid).or_default();
+            *latest = (*latest).max(mtime_ms);
+        }
+    }
+    activity
 }
 
 fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
@@ -2735,53 +3093,56 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn scan_claude_code_projects(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_claude_code_projects(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+    observations: &mut Vec<AgentWatcherObservation>,
+) {
     let projects_dir = home.join(".claude/projects");
     let Ok(projects) = fs::read_dir(projects_dir) else {
         return;
     };
+    let files = projects
+        .flatten()
+        .map(|project| project.path())
+        .filter(|project_path| project_path.is_dir())
+        .flat_map(|project_path| files_with_extension(&project_path, "jsonl"));
 
-    for project in projects.flatten() {
-        let project_path = project.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let encoded = project.file_name().to_string_lossy().to_string();
-        let project_dir = decode_claude_project_dir(&encoded, |path| Path::new(path).is_dir());
-        let Ok(files) = fs::read_dir(project_path) else {
+    for (path, mtime_ms) in window.select(files, now_ms) {
+        let (Some(thread_id), Some(encoded)) = (
+            file_stem(&path),
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+        ) else {
             continue;
         };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(mtime_ms) = file_mtime_ms(&path) else {
-                continue;
-            };
-            if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-                continue;
-            }
-            let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            let Ok(raw) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(snapshot) =
-                claude_code_snapshot_from_jsonl(thread_id, &project_dir, &raw, mtime_ms, now_ms)
-            {
-                snapshots.push(snapshot);
-            }
-        }
+        let project_dir = decode_claude_project_dir(encoded, |path| Path::new(path).is_dir());
+        let snapshot = fs::read_to_string(&path).ok().and_then(|raw| {
+            claude_code_snapshot_from_jsonl(thread_id, &project_dir, &raw, mtime_ms, now_ms)
+        });
+        let mut observation =
+            AgentWatcherObservation::new("claude-code", thread_id, mtime_ms, snapshot);
+        observation.project_dir = Some(project_dir);
+        observations.push(observation);
     }
 }
 
-fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_codex_sessions(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+    observations: &mut Vec<AgentWatcherObservation>,
+) {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
     let sessions_dir = codex_home.join("sessions");
+    let files = window.select(collect_jsonl_files(&sessions_dir), now_ms);
+    if files.is_empty() {
+        return;
+    }
     let names = fs::read_to_string(codex_home.join("session_index.jsonl"))
         .ok()
         .map(|raw| {
@@ -2791,29 +3152,23 @@ fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatche
         })
         .unwrap_or_default();
 
-    for path in collect_jsonl_files(&sessions_dir) {
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
-            continue;
-        };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
+    for (path, mtime_ms) in files {
         let Some(path_text) = path.to_str() else {
             continue;
         };
         let thread_id = codex_thread_id_from_path(path_text);
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(snapshot) = codex_snapshot_from_jsonl(
-            &thread_id,
-            &raw,
-            names.get(&thread_id).map(String::as_str),
-            mtime_ms,
-            now_ms,
-        ) {
-            snapshots.push(snapshot);
-        }
+        let snapshot = fs::read_to_string(&path).ok().and_then(|raw| {
+            codex_snapshot_from_jsonl(
+                &thread_id,
+                &raw,
+                names.get(&thread_id).map(String::as_str),
+                mtime_ms,
+                now_ms,
+            )
+        });
+        observations.push(AgentWatcherObservation::new(
+            "codex", &thread_id, mtime_ms, snapshot,
+        ));
     }
 }
 
@@ -2883,7 +3238,12 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
     }
 }
 
-fn scan_pi_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_pi_sessions(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+    observations: &mut Vec<AgentWatcherObservation>,
+) {
     let sessions_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -2893,46 +3253,39 @@ fn scan_pi_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSn
         })
         .unwrap_or_else(|| home.join(".pi/agent/sessions"));
 
-    for path in collect_jsonl_files(&sessions_dir) {
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
+    for (path, mtime_ms) in window.select(collect_jsonl_files(&sessions_dir), now_ms) {
+        let Some(thread_id) = file_stem(&path) else {
             continue;
         };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
-        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(snapshot) = pi_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms) {
-            snapshots.push(snapshot);
-        }
+        let snapshot = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| pi_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms));
+        observations.push(AgentWatcherObservation::new(
+            "pi", thread_id, mtime_ms, snapshot,
+        ));
     }
 }
 
-fn scan_droid_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_droid_sessions(
+    home: &Path,
+    now_ms: u64,
+    window: WatcherScanWindow,
+    observations: &mut Vec<AgentWatcherObservation>,
+) {
     let projects_dir = std::env::var_os("FACTORY_PROJECTS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".factory/projects"));
 
-    for path in collect_jsonl_files(&projects_dir) {
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
+    for (path, mtime_ms) in window.select(collect_jsonl_files(&projects_dir), now_ms) {
+        let Some(thread_id) = file_stem(&path) else {
             continue;
         };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
-        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(snapshot) = droid_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms) {
-            snapshots.push(snapshot);
-        }
+        let snapshot = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| droid_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms));
+        observations.push(AgentWatcherObservation::new(
+            "droid", thread_id, mtime_ms, snapshot,
+        ));
     }
 }
 
@@ -4667,8 +5020,9 @@ mod tests {
         )
         .expect("write Amp log");
 
-        let mut snapshots = Vec::new();
-        scan_amp_logs(&home, current_time_ms(), &mut snapshots);
+        let (snapshots, _) = ReadOnlyMuxStateSource::new(Vec::new())
+            .with_agent_state_home(home.clone())
+            .scan_live_agent_watchers(current_time_ms());
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].thread_id.as_deref(), Some("T-current"));
@@ -4905,6 +5259,307 @@ mod tests {
 
         assert!(!source.hibernate_idle_agent_panes());
         assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    /// A freshly restarted server: tmux still has Amp running in a background
+    /// pane (`%1`, process 101) and the focused pane (`%2`, process 201), but
+    /// the in-memory tracker is empty.
+    struct RestartTestProvider;
+
+    impl MuxProvider for RestartTestProvider {
+        fn name(&self) -> &str {
+            "restart-test"
+        }
+
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            ["focused", "background"]
+                .into_iter()
+                .map(|name| opensessions_runtime::mux::MuxSessionInfo {
+                    name: name.to_string(),
+                    created_at: 0,
+                    dir: format!("/restart-test/{name}"),
+                    windows: 1,
+                })
+                .collect()
+        }
+
+        fn list_agent_panes(
+            &self,
+            session_name: &str,
+        ) -> Vec<opensessions_runtime::mux::AgentPane> {
+            let (agent, pane_id) = match session_name {
+                "background" => ("amp", "%1"),
+                "focused" => ("amp", "%2"),
+                _ => return Vec::new(),
+            };
+            vec![opensessions_runtime::mux::AgentPane {
+                agent: agent.to_string(),
+                pane_id: pane_id.to_string(),
+                active: true,
+                thread_id: None,
+                thread_name: None,
+            }]
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("focused".to_string())
+        }
+        fn get_session_dir(&self, name: &str) -> String {
+            format!("/restart-test/{name}")
+        }
+        fn get_pane_pid(&self, pane_id: &str) -> Option<u32> {
+            match pane_id {
+                "%1" => Some(100),
+                "%2" => Some(200),
+                _ => None,
+            }
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+
+    struct AgentStateHome(PathBuf);
+
+    impl AgentStateHome {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "opensessions-restart-test-{}-{}",
+                process::id(),
+                NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst)
+            )))
+        }
+
+        fn write(&self, relative: &str, contents: &str, age_ms: u64) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).expect("create agent state dir");
+            fs::write(&path, contents).expect("write agent state file");
+            let modified = SystemTime::now() - Duration::from_millis(age_ms);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(modified))
+                .expect("set agent state mtime");
+            path
+        }
+
+        fn amp_log(&self, thread_id: &str, pid: u32, subtype: &str, age_ms: u64) -> PathBuf {
+            self.write(
+                &format!(".cache/amp/logs/threads/{thread_id}.log"),
+                &format!(
+                    "{{\"type\":\"agent_state\",\"direction\":\"receive\",\"subtype\":\"{subtype}\",\"threadId\":\"{thread_id}\",\"pid\":\"{pid}\"}}\n"
+                ),
+                age_ms,
+            )
+        }
+    }
+
+    impl Drop for AgentStateHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn restarted_source(
+        home: &AgentStateHome,
+    ) -> (ReadOnlyMuxStateSource, Arc<TermIgnoringProcesses>) {
+        let processes = Arc::new(TermIgnoringProcesses::default());
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(RestartTestProvider)])
+            .with_process_control(processes.clone())
+            .with_agent_state_home(home.0.clone());
+        (source, processes)
+    }
+
+    fn file_mtime(path: &Path) -> u64 {
+        file_mtime_ms(path).expect("mtime")
+    }
+
+    #[test]
+    fn restarted_server_hibernates_agents_idle_since_before_the_restart() {
+        use opensessions_runtime::hibernate::Signal;
+        let home = AgentStateHome::new();
+        let idle_log = home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        home.amp_log("T-focused", 201, "idle", 48 * HOUR_MS);
+        let (source, processes) = restarted_source(&home);
+
+        assert!(source.seed_agents_from_durable_state());
+        source.snapshot_json();
+
+        let seeded = agent_status(&source, "background", "T-bg");
+        assert_eq!(
+            seeded.ts,
+            file_mtime(&idle_log),
+            "idle clock is the thread's real last activity"
+        );
+        assert_eq!(seeded.pane_id.as_deref(), Some("%1"));
+        assert_eq!(seeded.unseen, None);
+        assert!(!source.agent_tracker.lock().unwrap().is_unseen("background"));
+
+        assert!(source.hibernate_idle_agent_panes());
+        assert_eq!(
+            *processes.signals.lock().unwrap(),
+            vec![
+                (101, Signal::Term),
+                (101, Signal::Kill),
+                (102, Signal::Kill)
+            ],
+            "only the background agent process is stopped; the focused session is protected"
+        );
+        assert_eq!(
+            agent_status(&source, "background", "T-bg").status,
+            AgentStatus::Hibernated
+        );
+        assert_eq!(
+            agent_status(&source, "focused", "T-focused").status,
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn restarted_server_keeps_recently_active_agents() {
+        let home = AgentStateHome::new();
+        let recent_log = home.amp_log("T-bg", 101, "idle", HOUR_MS);
+        let (source, processes) = restarted_source(&home);
+
+        assert!(source.seed_agents_from_durable_state());
+
+        assert_eq!(
+            agent_status(&source, "background", "T-bg").ts,
+            file_mtime(&recent_log)
+        );
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restarted_server_does_not_seed_agents_without_known_last_activity() {
+        let home = AgentStateHome::new();
+        // A working thread, a thread whose process is gone, and a log with no
+        // writer process: none of them prove when a pane's agent was last used.
+        home.amp_log("T-working", 101, "working", 48 * HOUR_MS);
+        home.amp_log("T-gone", 999, "idle", 48 * HOUR_MS);
+        home.write(
+            ".cache/amp/logs/threads/T-anonymous.log",
+            "{\"type\":\"agent_state\",\"direction\":\"receive\",\"subtype\":\"idle\"}\n",
+            48 * HOUR_MS,
+        );
+        let (source, processes) = restarted_source(&home);
+
+        assert!(!source.seed_agents_from_durable_state());
+        source.snapshot_json();
+
+        assert!(
+            source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .get_agents("background")
+                .is_empty()
+        );
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn seeds_resolved_by_project_dir_take_the_newest_activity_that_could_be_theirs() {
+        let home = AgentStateHome::new();
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}],"stop_reason":"end_turn"}}"#;
+        home.write(
+            ".claude/projects/-restart-test-background/old.jsonl",
+            line,
+            48 * HOUR_MS,
+        );
+        let unattributed = home.write(
+            ".claude/projects/-somewhere-else/recent.jsonl",
+            line,
+            HOUR_MS,
+        );
+        let (source, _) = restarted_source(&home);
+
+        assert!(source.seed_agents_from_durable_state());
+
+        let seeded = agent_status(&source, "background", "old");
+        assert_eq!(
+            seeded.ts,
+            file_mtime(&unattributed),
+            "activity that matches no session could be this pane's, so it keeps the clock recent"
+        );
+        assert_eq!(seeded.pane_id, None);
+    }
+
+    #[test]
+    fn hibernation_skips_agent_processes_with_recent_durable_activity() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        let (source, processes) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+        source.snapshot_json();
+
+        // The same Amp process moved on to a new thread the live watcher
+        // cannot attribute to a session.
+        home.amp_log("T-new", 101, "working", 0);
+
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn newer_activity_on_a_seeded_thread_releases_its_restored_idle_clock() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        let (source, processes) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+
+        home.amp_log("T-bg", 101, "working", 0);
+        let (_, released) = source.scan_live_agent_watchers(current_time_ms());
+        assert!(released);
+
+        assert!(
+            source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .get_agents("background")
+                .is_empty()
+        );
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_scan_skips_threads_idle_past_the_recent_window() {
+        let home = AgentStateHome::new();
+        home.write(
+            ".cache/amp/logs/threads/T-old.log",
+            "{\"data\":{\"args\":{\"workdir\":\"/repo\"}}}\n{\"type\":\"agent_state\",\"direction\":\"receive\",\"subtype\":\"idle\",\"pid\":\"101\"}\n",
+            AGENT_WATCHER_RECENT_MS + 60_000,
+        );
+        home.write(
+            ".cache/amp/logs/threads/T-fresh.log",
+            "{\"data\":{\"args\":{\"workdir\":\"/repo\"}}}\n{\"type\":\"agent_state\",\"direction\":\"receive\",\"subtype\":\"idle\",\"pid\":\"101\"}\n",
+            0,
+        );
+
+        let (source, _) = restarted_source(&home);
+        let (snapshots, _) = source.scan_live_agent_watchers(current_time_ms());
+
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter_map(|snapshot| snapshot.thread_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["T-fresh"]
+        );
     }
 
     #[test]
