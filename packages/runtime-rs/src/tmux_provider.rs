@@ -357,50 +357,50 @@ impl TmuxClient {
         ]);
     }
 
-    pub fn set_remain_on_exit_for_sidebar_windows(&self, enabled: bool) {
+    pub fn ensure_remain_on_exit_for_sidebar_windows(&self) {
         let mut seen_windows = HashSet::new();
         for pane in self.list_panes(PaneScope::All) {
             if pane.title == "opensessions-sidebar" && seen_windows.insert(pane.window_id.clone()) {
-                if enabled {
-                    self.ensure_window_remain_on_exit(&pane.window_id);
-                } else {
-                    let previous = self
-                        .run(&[
-                            "show-window-options",
-                            "-t",
-                            &pane.window_id,
-                            "-v",
-                            REMAIN_ON_EXIT_PREVIOUS_OPTION,
-                        ])
-                        .stdout;
-                    if previous == REMAIN_ON_EXIT_INHERITED {
-                        self.run(&[
-                            "set-window-option",
-                            "-t",
-                            &pane.window_id,
-                            "-u",
-                            "remain-on-exit",
-                        ]);
-                    } else if !previous.is_empty() {
-                        self.run(&[
-                            "set-window-option",
-                            "-t",
-                            &pane.window_id,
-                            "remain-on-exit",
-                            &previous,
-                        ]);
-                    }
-                    if !previous.is_empty() {
-                        self.run(&[
-                            "set-window-option",
-                            "-t",
-                            &pane.window_id,
-                            "-u",
-                            REMAIN_ON_EXIT_PREVIOUS_OPTION,
-                        ]);
-                    }
-                }
+                self.ensure_window_remain_on_exit(&pane.window_id);
             }
+        }
+    }
+
+    /// Restores `remain-on-exit` on every window that opensessions changed.
+    ///
+    /// Windows are found by their saved-value marker rather than by their
+    /// sidebar panes: during shutdown sidebar clients exit before cleanup and
+    /// the `pane-died` hook removes their panes, so a sidebar-pane scan would
+    /// skip windows and leave them with `remain-on-exit on`.
+    pub fn restore_remain_on_exit_for_marked_windows(&self) {
+        let format = format!("#{{window_id}}{SEP}#{{{REMAIN_ON_EXIT_PREVIOUS_OPTION}}}");
+        let output = self.run(&["list-windows", "-a", "-F", &format]);
+        let mut seen_windows = HashSet::new();
+        for line in output.stdout.lines() {
+            let Some((window_id, previous)) = line.split_once(SEP) else {
+                continue;
+            };
+            if previous.is_empty() || !seen_windows.insert(window_id) {
+                continue;
+            }
+            if previous == REMAIN_ON_EXIT_INHERITED {
+                self.run(&["set-window-option", "-t", window_id, "-u", "remain-on-exit"]);
+            } else {
+                self.run(&[
+                    "set-window-option",
+                    "-t",
+                    window_id,
+                    "remain-on-exit",
+                    previous,
+                ]);
+            }
+            self.run(&[
+                "set-window-option",
+                "-t",
+                window_id,
+                "-u",
+                REMAIN_ON_EXIT_PREVIOUS_OPTION,
+            ]);
         }
     }
 
@@ -801,11 +801,11 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
         self.client
             .setup_sidebar_mouse_resize_binding(&base, token_file);
-        self.client.set_remain_on_exit_for_sidebar_windows(true);
+        self.client.ensure_remain_on_exit_for_sidebar_windows();
     }
 
     fn cleanup_hooks(&self) {
-        self.client.set_remain_on_exit_for_sidebar_windows(false);
+        self.client.restore_remain_on_exit_for_marked_windows();
         self.client.cleanup_sidebar_mouse_resize_binding();
         for hook in [
             "client-session-changed",
@@ -1542,6 +1542,70 @@ mod tests {
                 stderr: String::new(),
             }
         }
+    }
+
+    #[test]
+    fn cleanup_restores_remain_on_exit_after_sidebar_panes_are_gone() {
+        struct RestoreRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl CommandRunner for RestoreRunner {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                self.calls.lock().unwrap().push(args.to_vec());
+                // Sidebar clients already exited and `pane-died` removed their
+                // panes, so only the per-window markers remain.
+                let stdout = match args.first().map(String::as_str) {
+                    Some("list-windows") => concat!(
+                        "@1\toff\n",
+                        "@2\t\n",
+                        "@3\tfailed\n",
+                        "@4\t__inherited__\n",
+                        "@1\toff",
+                    ),
+                    _ => "",
+                };
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+
+        let runner = Arc::new(RestoreRunner {
+            calls: Mutex::new(Vec::new()),
+        });
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.cleanup_hooks();
+
+        let calls = runner.calls.lock().unwrap();
+        let option_calls = calls
+            .iter()
+            .filter(|call| call.first().map(String::as_str) == Some("set-window-option"))
+            .map(|call| call[1..].join(" "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            option_calls,
+            vec![
+                "-t @1 remain-on-exit off",
+                "-t @1 -u @opensessions_remain_on_exit_previous",
+                "-t @3 remain-on-exit failed",
+                "-t @3 -u @opensessions_remain_on_exit_previous",
+                "-t @4 -u remain-on-exit",
+                "-t @4 -u @opensessions_remain_on_exit_previous",
+            ],
+        );
+        assert_eq!(
+            calls[0],
+            vec![
+                "list-windows".to_string(),
+                "-a".to_string(),
+                "-F".to_string(),
+                "#{window_id}\t#{@opensessions_remain_on_exit_previous}".to_string(),
+            ],
+        );
     }
 
     #[test]
