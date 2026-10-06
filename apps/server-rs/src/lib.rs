@@ -598,6 +598,24 @@ impl ReadOnlyMuxStateSource {
         Some(hasher.finish())
     }
 
+    fn recorded_sidebar_visibility(&self) -> Option<bool> {
+        self.providers
+            .iter()
+            .filter(|provider| provider.is_full_sidebar_capable())
+            .find_map(|provider| provider.sidebar_visibility_preference())
+    }
+
+    /// Persist an explicit user show/hide choice in the mux namespace so the
+    /// next server generation can restore it. Only user-driven transitions
+    /// call this; shutdown (`begin_closing`, hook/pane cleanup) never does.
+    fn record_sidebar_visibility(&self, visible: bool) {
+        for provider in &self.providers {
+            if provider.is_full_sidebar_capable() {
+                provider.set_sidebar_visibility_preference(visible);
+            }
+        }
+    }
+
     fn should_ensure_sidebar(&self) -> bool {
         let state = self.sidebar_coordinator.lock().unwrap().state();
         state.visible && state.lifecycle != SidebarLifecycle::Closing
@@ -888,6 +906,17 @@ impl StateSource for ReadOnlyMuxStateSource {
             .any(|provider| !provider.list_sidebar_panes(None).is_empty())
         {
             self.sidebar_coordinator.lock().unwrap().mark_ready();
+            self.ensure_all_sidebars();
+        } else if self.recorded_sidebar_visibility() == Some(true) {
+            // A previous server generation exited (update, crash, SIGTERM)
+            // and its sidebar clients exited with it. Restore the user's last
+            // explicit choice exactly like toggle-on: every window, warming.
+            debug_log("setup_mux_hooks: restoring recorded visible sidebar");
+            let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+            self.sidebar_coordinator
+                .lock()
+                .unwrap()
+                .begin_warmup_until(warmup_until);
             self.ensure_all_sidebars();
         }
     }
@@ -1349,6 +1378,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             !was_visible && coordinator.state().visible
         };
         if became_visible {
+            self.record_sidebar_visibility(true);
             self.ensure_all_sidebars();
         }
         if let Some(window_id) = context.window_id.as_deref() {
@@ -2027,6 +2057,7 @@ impl ReadOnlyMuxStateSource {
                 }
             }
             self.sidebar_coordinator.lock().unwrap().hide();
+            self.record_sidebar_visibility(false);
             return;
         }
 
@@ -2035,6 +2066,7 @@ impl ReadOnlyMuxStateSource {
             .lock()
             .unwrap()
             .begin_warmup_until(warmup_until);
+        self.record_sidebar_visibility(true);
         let width = self.current_sidebar_width_u16();
         for provider in providers {
             let mut unique_windows = Vec::<ActiveWindow>::new();
@@ -5778,5 +5810,213 @@ mod tests {
             .expect("repair worker should stop")
             .expect("repair worker should not panic");
         assert_eq!(*batches.lock().unwrap(), vec![3, 1]);
+    }
+
+    /// Two windows, sidebar panes created by `spawn_sidebar`, and a recorded
+    /// show/hide preference standing in for the tmux global user option.
+    struct SidebarVisibilityTestProvider {
+        preference: Mutex<Option<bool>>,
+        panes: Mutex<Vec<opensessions_runtime::mux::SidebarPane>>,
+        spawned_windows: Mutex<Vec<String>>,
+    }
+
+    impl SidebarVisibilityTestProvider {
+        fn with_preference(preference: Option<bool>) -> Arc<Self> {
+            Arc::new(Self {
+                preference: Mutex::new(preference),
+                panes: Mutex::new(Vec::new()),
+                spawned_windows: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn spawned_windows(&self) -> Vec<String> {
+            self.spawned_windows.lock().unwrap().clone()
+        }
+    }
+
+    impl MuxProvider for SidebarVisibilityTestProvider {
+        fn name(&self) -> &str {
+            "sidebar-visibility-test"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            Vec::new()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("main".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+        fn sidebar_visibility_preference(&self) -> Option<bool> {
+            *self.preference.lock().unwrap()
+        }
+        fn set_sidebar_visibility_preference(&self, visible: bool) {
+            *self.preference.lock().unwrap() = Some(visible);
+        }
+        fn is_window_capable(&self) -> bool {
+            true
+        }
+        fn is_sidebar_capable(&self) -> bool {
+            true
+        }
+        fn get_current_window_id(&self) -> Option<String> {
+            Some("@1".to_string())
+        }
+        fn list_active_windows(&self) -> Vec<ActiveWindow> {
+            ["@1", "@2"]
+                .into_iter()
+                .map(|id| ActiveWindow {
+                    id: id.to_string(),
+                    session_name: "main".to_string(),
+                    active: id == "@1",
+                })
+                .collect()
+        }
+        fn list_sidebar_panes(
+            &self,
+            _session_name: Option<&str>,
+        ) -> Vec<opensessions_runtime::mux::SidebarPane> {
+            self.panes.lock().unwrap().clone()
+        }
+        fn spawn_sidebar(
+            &self,
+            session_name: &str,
+            window_id: &str,
+            width: u16,
+            _position: SidebarPosition,
+            _scripts_dir: &str,
+        ) -> Option<String> {
+            let mut panes = self.panes.lock().unwrap();
+            let pane_id = format!("%{}", panes.len() + 100);
+            panes.push(opensessions_runtime::mux::SidebarPane {
+                pane_id: pane_id.clone(),
+                session_name: session_name.to_string(),
+                window_id: window_id.to_string(),
+                width: Some(width),
+                window_width: Some(120),
+            });
+            self.spawned_windows
+                .lock()
+                .unwrap()
+                .push(window_id.to_string());
+            Some(pane_id)
+        }
+        fn hide_sidebar(&self, pane_id: &str) {
+            self.panes
+                .lock()
+                .unwrap()
+                .retain(|pane| pane.pane_id != pane_id);
+        }
+        fn kill_sidebar_pane(&self, pane_id: &str) {
+            self.hide_sidebar(pane_id);
+        }
+    }
+
+    const ENSURE_CONTEXT: &str = "/dev/ttys001|main|@1|%1|1";
+
+    #[test]
+    fn restarted_server_restores_a_visible_sidebar_in_every_window() {
+        let provider = SidebarVisibilityTestProvider::with_preference(Some(true));
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+
+        source.setup_mux_hooks("127.0.0.1", 0, "");
+
+        assert!(source.is_sidebar_visible());
+        assert_eq!(provider.spawned_windows(), ["@1", "@2"]);
+    }
+
+    #[test]
+    fn restarted_server_respawns_a_visible_sidebar_on_ensure() {
+        let provider = SidebarVisibilityTestProvider::with_preference(Some(true));
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.setup_mux_hooks("127.0.0.1", 0, "");
+        provider.panes.lock().unwrap().clear();
+
+        source.handle_http_hook("/ensure-sidebar", ENSURE_CONTEXT);
+
+        assert_eq!(provider.spawned_windows(), ["@1", "@2", "@1"]);
+    }
+
+    #[test]
+    fn restarted_server_keeps_a_hidden_sidebar_hidden() {
+        let provider = SidebarVisibilityTestProvider::with_preference(Some(false));
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+
+        source.setup_mux_hooks("127.0.0.1", 0, "");
+        source.handle_http_hook("/ensure-sidebar", ENSURE_CONTEXT);
+        source.handle_http_hook("/ensure-sidebars", "");
+
+        assert!(!source.is_sidebar_visible());
+        assert!(provider.spawned_windows().is_empty());
+    }
+
+    #[test]
+    fn first_server_start_without_a_recorded_choice_stays_hidden() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+
+        source.setup_mux_hooks("127.0.0.1", 0, "");
+        source.handle_http_hook("/ensure-sidebar", ENSURE_CONTEXT);
+
+        assert!(!source.is_sidebar_visible());
+        assert!(provider.spawned_windows().is_empty());
+        assert_eq!(provider.sidebar_visibility_preference(), None);
+    }
+
+    #[test]
+    fn toggle_records_the_users_visibility_choice() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+        assert_eq!(provider.sidebar_visibility_preference(), Some(true));
+
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+        assert_eq!(provider.sidebar_visibility_preference(), Some(false));
+    }
+
+    #[test]
+    fn sidebar_connection_on_a_fresh_server_records_a_visible_choice() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        let mut context = ClientConnectionContext::default();
+
+        source.handle_sender_command_with_context(
+            &serde_json::json!({
+                "type": "identify-pane",
+                "paneId": "%1",
+                "sessionName": "main",
+                "windowId": "@1",
+            }),
+            &mut context,
+        );
+
+        assert!(source.is_sidebar_visible());
+        assert_eq!(provider.sidebar_visibility_preference(), Some(true));
+    }
+
+    #[test]
+    fn server_shutdown_does_not_record_the_sidebar_as_hidden() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+
+        source.begin_shutdown();
+        source.cleanup_mux_hooks();
+        source.cleanup_sidebar_clients();
+
+        assert!(provider.panes.lock().unwrap().is_empty());
+        assert_eq!(provider.sidebar_visibility_preference(), Some(true));
     }
 }

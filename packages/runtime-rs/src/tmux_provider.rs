@@ -17,6 +17,10 @@ const STASH_SESSION: &str = "_os_stash";
 const OPENSESSIONS_HOOK_INDEX: u16 = 909;
 const REMAIN_ON_EXIT_PREVIOUS_OPTION: &str = "@opensessions_remain_on_exit_previous";
 const REMAIN_ON_EXIT_INHERITED: &str = "__inherited__";
+/// Tmux-server-scoped record of the user's last explicit sidebar show/hide
+/// choice. It intentionally survives opensessions server restarts and hook
+/// cleanup, and disappears with the tmux server itself.
+const SIDEBAR_VISIBLE_OPTION: &str = "@opensessions_sidebar_visible";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -865,6 +869,24 @@ impl MuxProvider for TmuxProvider {
     fn set_sidebar_width_hint(&self, width: u16) {
         self.client
             .set_global_option("@opensessions_width", &width.to_string());
+    }
+
+    fn sidebar_visibility_preference(&self) -> Option<bool> {
+        match self
+            .client
+            .run(&["show-option", "-gqv", SIDEBAR_VISIBLE_OPTION])
+            .stdout
+            .trim()
+        {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn set_sidebar_visibility_preference(&self, visible: bool) {
+        self.client
+            .set_global_option(SIDEBAR_VISIBLE_OPTION, if visible { "on" } else { "off" });
     }
 
     fn is_sidebar_mouse_resize_active(&self, window_id: &str) -> bool {
@@ -2124,5 +2146,57 @@ mod tests {
         assert_eq!(pane_pid_provider(0, "").1.get_pane_pid("%7"), None);
         assert_eq!(pane_pid_provider(0, "1").1.get_pane_pid("%7"), None);
         assert_eq!(pane_pid_provider(0, "4242").1.get_pane_pid(""), None);
+    }
+
+    /// Emulates tmux global user options so visibility persistence can be
+    /// exercised through the provider's public interface.
+    #[derive(Default)]
+    struct GlobalOptionRunner {
+        options: Mutex<HashMap<String, String>>,
+    }
+
+    impl CommandRunner for GlobalOptionRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut options = self.options.lock().unwrap();
+            let stdout = match args.as_slice() {
+                ["set-option", "-gq", name, value] => {
+                    options.insert(name.to_string(), value.to_string());
+                    String::new()
+                }
+                ["set-option", "-gu", name] => {
+                    options.remove(*name);
+                    String::new()
+                }
+                ["show-option", "-gqv", name] => options.get(*name).cloned().unwrap_or_default(),
+                _ => String::new(),
+            };
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_visibility_preference_round_trips_through_tmux_global_option() {
+        let provider = TmuxProvider::new(Arc::new(GlobalOptionRunner::default()));
+
+        assert_eq!(provider.sidebar_visibility_preference(), None);
+        provider.set_sidebar_visibility_preference(true);
+        assert_eq!(provider.sidebar_visibility_preference(), Some(true));
+        provider.set_sidebar_visibility_preference(false);
+        assert_eq!(provider.sidebar_visibility_preference(), Some(false));
+    }
+
+    #[test]
+    fn hook_cleanup_preserves_the_sidebar_visibility_preference() {
+        let provider = TmuxProvider::new(Arc::new(GlobalOptionRunner::default()));
+        provider.set_sidebar_visibility_preference(true);
+
+        provider.cleanup_hooks();
+
+        assert_eq!(provider.sidebar_visibility_preference(), Some(true));
     }
 }

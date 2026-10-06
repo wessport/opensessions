@@ -57,6 +57,18 @@ Expected shutdown behavior:
 - the server broadcasts `quit` to websocket sidebar clients
 - the server waits briefly for clients to receive the quit frame, then removes hooks and pid file
 - restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
+- shutdown is not a user choice to hide the sidebar: no shutdown path (`q`, `/quit`, SIGTERM, the tmux namespace disappearing) changes the recorded sidebar visibility
+
+### Sidebar visibility survives server restarts
+
+Restarting the opensessions server (update, crash, SIGTERM, `q`) must not silently turn the sidebar off. The user's last explicit show/hide choice is the source of truth for the next server generation in the same tmux server.
+
+- the choice is stored in the tmux global user option `@opensessions_sidebar_visible` (`on`/`off`) on that tmux server, so it is naturally per-socket, survives opensessions restarts, and disappears with the tmux server; hook cleanup leaves it in place and `uninstall.sh` removes it
+- only explicit user transitions record it: toggle-on and the first sidebar connection on a fresh server record `on`; toggle-off records `off`
+- on startup, a server that finds no sidebar panes but a recorded `on` restores visibility exactly like toggle-on: `warming up…` and a sidebar in every window, before it starts accepting requests
+- a recorded `off` keeps the server hidden, so `/ensure-sidebar` and window/session hooks do not respawn sidebars
+- with no recorded choice (first start in a tmux server), the server starts hidden as before and the first toggle shows the sidebar
+- `toggle.sh` skips its toggle when its own `ensure_server` call just started a server that already restored sidebars; otherwise the restore would be undone immediately
 
 ### Session switching keeps the sidebar in control
 
@@ -219,7 +231,7 @@ Symptoms of broken per-server wiring:
 - pressing `q` in a connected sidebar does not stop the expected derived server
 - sidebars keep rendering after their server pid file has been removed
 
-The recovery path is: clear stale tmux-scoped overrides, refresh hooks from the current plugin, restart the derived server for that tmux socket, and respawn visible sidebar panes.
+The recovery path is: clear stale tmux-scoped overrides, refresh hooks from the current plugin, and restart the derived server for that tmux socket. The restarted server respawns sidebar panes on its own when the recorded visibility is `on`.
 
 ### Background work must scale with visible activity
 
@@ -370,6 +382,7 @@ Before shipping any sidebar behavior change, verify all of these.
 - `warming up…` clears once spawn/restore is complete
 - no `adjusting…` lifecycle appears for width repair
 - server shutdown broadcasts `quit` to websocket sidebar clients before cleanup
+- restarting the server restores visible sidebars in every window, and a hidden sidebar stays hidden
 - control-mode clients cannot steal foreground/current-session authority
 - hooks and sidebar clients point to the derived server for the current tmux socket
 - tmux windows remain in `window-size latest`
