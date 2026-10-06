@@ -1090,6 +1090,22 @@ fn tmux_sidebar_hook_context_treats_session_names_as_data() {
 }
 
 #[test]
+fn lab_drop_removes_its_tmux_socket_file() {
+    let _guard = e2e_serial_guard();
+    let lab = Lab::new("opensessions-e2e-socket-cleanup");
+    lab.tmux_ok(["new-session", "-d", "-s", "probe"]);
+    let socket_path = PathBuf::from(lab.tmux(["display-message", "-p", "#{socket_path}"]));
+    assert!(socket_path.exists(), "tmux socket missing: {socket_path:?}");
+
+    drop(lab);
+
+    assert!(
+        !socket_path.exists(),
+        "lab left its tmux socket behind: {socket_path:?}"
+    );
+}
+
+#[test]
 fn tmux_sidebar_server_exits_when_its_tmux_namespace_disappears() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-missing-tmux");
@@ -2938,6 +2954,22 @@ for _ in range(3000):
         self.tmux(["capture-pane", "-p", "-t", pane])
     }
 
+    /// Mirrors tmux's `-L` resolution: `$TMUX_TMPDIR` (or `/tmp`), then
+    /// `tmux-<uid>/<name>`. Computed rather than queried so it still works
+    /// after a test has already killed the tmux server.
+    fn tmux_socket_path(&self) -> PathBuf {
+        let tmpdir = std::env::var_os("TMUX_TMPDIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let uid = Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default();
+        tmpdir.join(format!("tmux-{uid}")).join(&self.socket)
+    }
+
     fn tmux_socket_env(&self) -> String {
         format!(
             "{},0,0",
@@ -3077,6 +3109,9 @@ impl Drop for Lab {
         let _ = Command::new("tmux")
             .args(["-L", &self.socket, "kill-server"])
             .output();
+        // tmux leaves its socket file behind after kill-server, so every lab
+        // would otherwise leak one file into the shared tmux socket directory.
+        let _ = fs::remove_file(self.tmux_socket_path());
         let _ = fs::remove_dir_all(&self.root);
     }
 }
