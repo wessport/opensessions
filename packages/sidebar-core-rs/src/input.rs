@@ -110,6 +110,7 @@ fn apply_modal_key(app: &mut App, key: UiKey) {
         Modal::ThemePicker { .. } => apply_theme_picker_key(app, key),
         Modal::WidthSlider { .. } => apply_width_slider_key(app, key),
         Modal::KillConfirm { .. } => apply_kill_confirm_key(app, key),
+        Modal::QuitConfirm => apply_quit_confirm_key(app, key),
         Modal::WindowManager { .. } => apply_window_manager_key(app, key),
         Modal::None => {}
     }
@@ -228,6 +229,13 @@ fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
         _ => {
             app.modal = Modal::None;
         }
+    }
+}
+
+fn apply_quit_confirm_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Char('y') => app.confirm_quit(),
+        _ => app.modal = Modal::None,
     }
 }
 
@@ -512,5 +520,36 @@ mod tests {
 
         apply_ui_key(&mut app, UiKey::Esc);
         assert_eq!(app.modal, Modal::None);
+    }
+
+    #[test]
+    fn q_asks_before_quitting_and_y_quits() {
+        let mut app = app_with_windows();
+        app.modal = Modal::None;
+
+        apply_ui_key(&mut app, UiKey::Char('q'));
+        assert_eq!(app.modal, Modal::QuitConfirm);
+        assert!(app.drain_commands().is_empty());
+        assert!(app.quit_deadline.is_none());
+
+        apply_ui_key(&mut app, UiKey::Char('y'));
+        assert_eq!(app.modal, Modal::None);
+        assert_eq!(app.drain_commands(), vec![ClientCommand::Quit]);
+        assert!(app.quit_deadline.is_some());
+    }
+
+    #[test]
+    fn any_other_key_cancels_the_quit_confirmation() {
+        for key in [UiKey::Char('n'), UiKey::Char('q'), UiKey::Esc, UiKey::Enter] {
+            let mut app = app_with_windows();
+            app.modal = Modal::None;
+            apply_ui_key(&mut app, UiKey::Char('q'));
+
+            apply_ui_key(&mut app, key);
+
+            assert_eq!(app.modal, Modal::None, "{key:?} should cancel");
+            assert!(app.drain_commands().is_empty(), "{key:?} must not quit");
+            assert!(app.quit_deadline.is_none(), "{key:?} must not arm quit");
+        }
     }
 }

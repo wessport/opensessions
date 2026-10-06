@@ -1516,6 +1516,14 @@ fn render_modal_overlay(
             let (title, label) = app.kill_confirm_copy(target);
             render_kill_confirm_overlay(palette, lines, width, height, &title, &label)
         }
+        Modal::QuitConfirm => render_kill_confirm_overlay(
+            palette,
+            lines,
+            width,
+            height,
+            "Quit opensessions?",
+            "Closes every sidebar",
+        ),
         Modal::WindowManager {
             session,
             windows,
@@ -3360,6 +3368,21 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("plane-page-title-duplication") && line.contains('…')),
             "long kill target should be visibly truncated inside narrow modal\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn quit_confirm_overlay_asks_before_quitting() {
+        let mut app = app_from_sessions(vec![session("project", "/tmp/project", "main")]);
+        app.modal = Modal::QuitConfirm;
+
+        let lines = render_text(&app, 36, 24);
+
+        assert!(
+            lines.iter().any(|line| line.contains("Quit opensessions?"))
+                && lines.iter().any(|line| line.contains("y / n")),
+            "quit confirmation should ask before quitting\n{}",
             lines.join("\n")
         );
     }

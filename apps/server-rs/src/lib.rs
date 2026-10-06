@@ -16,10 +16,10 @@ use std::time::{Instant, SystemTime};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
-    AgentWatcherSnapshot, amp_log_pid, amp_snapshot_from_log_jsonl, amp_snapshot_from_thread_json,
-    claude_code_snapshot_from_jsonl, codex_snapshot_from_jsonl, codex_thread_id_from_path,
-    decode_claude_project_dir, droid_snapshot_from_jsonl, opencode_snapshot_from_row,
-    parse_codex_session_index, pi_snapshot_from_jsonl,
+    AgentWatcherSnapshot, amp_log_pid, amp_log_thread_title, amp_snapshot_from_log_jsonl,
+    amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl, codex_snapshot_from_jsonl,
+    codex_thread_id_from_path, decode_claude_project_dir, droid_snapshot_from_jsonl,
+    opencode_snapshot_from_row, parse_codex_session_index, pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::config::{
     AutoHibernateSettings, OpensessionsConfig, SidebarPosition as ConfigSidebarPosition,
@@ -28,7 +28,7 @@ use opensessions_runtime::config::{
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::hibernate::{
     AgentProcessTarget, HIBERNATE_POLL_INTERVAL_MS, HIBERNATE_TERM_GRACE, ProcessControl,
-    SystemProcessControl, find_agent_process, terminate_agent_processes,
+    ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes,
 };
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
@@ -91,6 +91,9 @@ const AGENT_WATCHER_SEED_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const AGENT_WATCHER_SEED_MAX_FILES: usize = 32;
 const AMP_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 const AMP_LOG_PID_TAIL_BYTES: u64 = 64 * 1024;
+/// Amp logs a thread's generated title near the start of its log, so logs
+/// whose tail has no title are named from this much of their head.
+const AMP_LOG_TITLE_HEAD_BYTES: u64 = 256 * 1024;
 const STUCK_RUNNING_TIMEOUT_MS: u64 = 3 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -428,6 +431,8 @@ pub struct ReadOnlyMuxStateSource {
     process_control: Arc<dyn ProcessControl>,
     /// Home directory holding agents' own durable state (transcripts, logs).
     agent_state_home: Option<PathBuf>,
+    /// Agent panes found for writer pids recorded in agent state files.
+    agent_pane_routes: Mutex<AgentPaneRouteCache>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -530,6 +535,7 @@ impl ReadOnlyMuxStateSource {
             auto_hibernate: AutoHibernateSettings::default(),
             process_control: Arc::new(SystemProcessControl),
             agent_state_home: std::env::var_os("HOME").map(PathBuf::from),
+            agent_pane_routes: Mutex::new(AgentPaneRouteCache::default()),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -746,36 +752,14 @@ impl ReadOnlyMuxStateSource {
             .iter()
             .flat_map(|provider| provider.list_sessions())
             .collect::<Vec<_>>();
-        let process_table = if observations
+        let pane_by_agent_pid = if observations
             .iter()
             .any(|observation| observation.pid.is_some())
         {
-            self.process_control.process_table()
+            self.agent_panes_by_pid(&self.process_control.process_table())
         } else {
-            Vec::new()
+            HashMap::new()
         };
-        let mut pane_by_agent_pid = HashMap::<(String, u32), (String, String)>::new();
-        if !process_table.is_empty() {
-            for provider in &self.providers {
-                for session in provider.list_sessions() {
-                    for pane in provider.list_agent_panes(&session.name) {
-                        let Some(target) =
-                            provider.get_pane_pid(&pane.pane_id).and_then(|pane_pid| {
-                                find_agent_process(pane_pid, &pane.agent, &process_table)
-                            })
-                        else {
-                            continue;
-                        };
-                        for process in target.processes {
-                            pane_by_agent_pid.insert(
-                                (pane.agent.clone(), process.pid),
-                                (session.name.clone(), pane.pane_id.clone()),
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         let resolve_project = self.watcher_project_resolver(&sessions);
         // (agent, session, pane) -> (newest observation, newest activity)
@@ -785,7 +769,7 @@ impl ReadOnlyMuxStateSource {
         for observation in observations {
             let route = match observation.pid {
                 Some(pid) => match pane_by_agent_pid.get(&(observation.agent.to_string(), pid)) {
-                    Some((session, pane_id)) => Some((session.clone(), Some(pane_id.clone()))),
+                    Some(route) => Some((route.session.clone(), Some(route.pane_id.clone()))),
                     None => continue,
                 },
                 None => observation
@@ -873,18 +857,148 @@ impl ReadOnlyMuxStateSource {
 
     /// One routine watcher pass over recently modified agent state: returns
     /// the snapshots to apply and whether any seeded row was released.
-    fn scan_live_agent_watchers(&self, now_ms: u64) -> (Vec<AgentWatcherSnapshot>, bool) {
+    fn scan_live_agent_watchers(&self, now_ms: u64) -> (Vec<LiveAgentSnapshot>, bool) {
         let Some(home) = self.agent_state_home.as_deref() else {
             return (Vec::new(), false);
         };
         let observations = scan_agent_watcher_observations(home, now_ms, WatcherScanWindow::LIVE);
         let released = self.release_seeds_for_activity(&observations);
+        let routes = self.route_unattributed_observations(&observations);
         let mut snapshots = observations
             .into_iter()
-            .filter_map(|observation| observation.snapshot)
+            .filter_map(|observation| {
+                let pane = routes
+                    .get(&(observation.agent, observation.thread_id.clone()))
+                    .cloned();
+                observation
+                    .snapshot
+                    .map(|snapshot| LiveAgentSnapshot { snapshot, pane })
+            })
             .collect::<Vec<_>>();
-        scan_opencode_sessions(home, now_ms, &mut snapshots);
+        let mut opencode = Vec::new();
+        scan_opencode_sessions(home, now_ms, &mut opencode);
+        snapshots.extend(opencode.into_iter().map(|snapshot| LiveAgentSnapshot {
+            snapshot,
+            pane: None,
+        }));
         (snapshots, released)
+    }
+
+    /// Routes live snapshots their project dir cannot place (most current
+    /// Amp logs record no workdir) to the agent pane running the process that
+    /// wrote them, the same way startup seeding does. Only reads the process
+    /// table when such snapshots exist and their pids are not already known
+    /// for the current tmux layout.
+    fn route_unattributed_observations(
+        &self,
+        observations: &[AgentWatcherObservation],
+    ) -> HashMap<(&'static str, String), AgentPaneRoute> {
+        let unattributed = observations
+            .iter()
+            .filter(|observation| {
+                observation.pid.is_some()
+                    && observation
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.status != AgentStatus::Idle)
+            })
+            .collect::<Vec<_>>();
+        if unattributed.is_empty() {
+            return HashMap::new();
+        }
+        let sessions = if unattributed
+            .iter()
+            .any(|observation| observation.project_dir.is_some())
+        {
+            self.providers
+                .iter()
+                .flat_map(|provider| provider.list_sessions())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let resolve_project = self.watcher_project_resolver(&sessions);
+        let unattributed = unattributed
+            .into_iter()
+            .filter(|observation| {
+                observation
+                    .project_dir
+                    .as_deref()
+                    .and_then(&resolve_project)
+                    .is_none()
+            })
+            .filter_map(|observation| {
+                let pid_key = (observation.agent.to_string(), observation.pid?);
+                Some(((observation.agent, observation.thread_id.clone()), pid_key))
+            })
+            .collect::<Vec<_>>();
+        let wanted = unattributed
+            .iter()
+            .map(|(_, pid_key)| pid_key.clone())
+            .collect::<HashSet<_>>();
+        if wanted.is_empty() {
+            return HashMap::new();
+        }
+
+        let fingerprint = self.tmux_state_fingerprint();
+        let mut cache = self.agent_pane_routes.lock().unwrap();
+        if fingerprint.is_none() || cache.tmux_fingerprint != fingerprint {
+            *cache = AgentPaneRouteCache {
+                tmux_fingerprint: fingerprint,
+                routes: HashMap::new(),
+            };
+        }
+        if wanted.iter().any(|key| !cache.routes.contains_key(key)) {
+            // A pid missing from a fresh table belongs to a process that has
+            // exited; remembering it as unroutable is safe for this layout.
+            let found = self.agent_panes_by_pid(&self.process_control.process_table());
+            for key in &wanted {
+                cache.routes.insert(key.clone(), None);
+            }
+            cache
+                .routes
+                .extend(found.into_iter().map(|(key, route)| (key, Some(route))));
+        }
+        unattributed
+            .into_iter()
+            .filter_map(|(thread_key, pid_key)| {
+                let route = cache.routes.get(&pid_key)?.clone()?;
+                Some((thread_key, route))
+            })
+            .collect()
+    }
+
+    /// Every agent process running in an agent pane, keyed by agent and
+    /// pid. Panes only route state; status still comes from the agent.
+    fn agent_panes_by_pid(
+        &self,
+        process_table: &[ProcessEntry],
+    ) -> HashMap<(String, u32), AgentPaneRoute> {
+        let mut routes = HashMap::new();
+        if process_table.is_empty() {
+            return routes;
+        }
+        for provider in &self.providers {
+            for session in provider.list_sessions() {
+                for pane in provider.list_agent_panes(&session.name) {
+                    let Some(target) = provider.get_pane_pid(&pane.pane_id).and_then(|pane_pid| {
+                        find_agent_process(pane_pid, &pane.agent, process_table)
+                    }) else {
+                        continue;
+                    };
+                    for process in target.processes {
+                        routes.insert(
+                            (pane.agent.clone(), process.pid),
+                            AgentPaneRoute {
+                                session: session.name.clone(),
+                                pane_id: pane.pane_id.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        routes
     }
 
     /// Drops seeded rows whose source files show newer activity, including
@@ -1924,7 +2038,8 @@ impl ReadOnlyMuxStateSource {
         Ok(())
     }
 
-    fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot) -> bool {
+    fn apply_agent_watcher_snapshot(&self, live: LiveAgentSnapshot) -> bool {
+        let LiveAgentSnapshot { snapshot, pane } = live;
         if snapshot.status == AgentStatus::Idle {
             debug_log(format!(
                 "watcher-snapshot ignored idle agent={} thread_id={:?} thread_name={:?} project_dir={:?}",
@@ -1932,7 +2047,11 @@ impl ReadOnlyMuxStateSource {
             ));
             return false;
         }
-        let Some(session) = self.resolve_agent_watcher_session(&snapshot) else {
+        let session = match &pane {
+            Some(route) => Some(route.session.clone()),
+            None => self.resolve_agent_watcher_session(&snapshot),
+        };
+        let Some(session) = session else {
             debug_log(format!(
                 "watcher-snapshot unresolved agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
                 snapshot.agent,
@@ -1943,7 +2062,7 @@ impl ReadOnlyMuxStateSource {
             ));
             return false;
         };
-        let focused_pane = self
+        let existing = self
             .agent_tracker
             .lock()
             .unwrap()
@@ -1952,16 +2071,33 @@ impl ReadOnlyMuxStateSource {
             .find(|event| {
                 event.agent == snapshot.agent
                     && event.thread_id.as_deref() == snapshot.thread_id.as_deref()
-            })
-            .and_then(|event| event.pane_id)
+            });
+        // Amp snapshots are stamped with the log's mtime; a row with newer
+        // activity came from a live event (such as the Amp plugin) that the
+        // log has not caught up with, so the older snapshot must not win.
+        if snapshot.agent == "amp"
+            && let Some(existing) = existing.as_ref()
+            && existing.ts > snapshot.ts
+        {
+            debug_log(format!(
+                "watcher-snapshot older than tracked row session={} agent={} thread_id={:?} snapshot_ts={} row_ts={}",
+                session, snapshot.agent, snapshot.thread_id, snapshot.ts, existing.ts,
+            ));
+            return false;
+        }
+        let pane_id = pane.map(|route| route.pane_id);
+        let focused_pane = pane_id
+            .clone()
+            .or_else(|| existing.and_then(|event| event.pane_id))
             .filter(|pane_id| {
                 self.providers
                     .iter()
                     .any(|provider| provider.client_tty_for_pane(pane_id).is_some())
             });
         debug_log(format!(
-            "watcher-snapshot applying session={} focused_pane={:?} agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
+            "watcher-snapshot applying session={} pane={:?} focused_pane={:?} agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
             session,
+            pane_id,
             focused_pane,
             snapshot.agent,
             snapshot.status,
@@ -1978,8 +2114,8 @@ impl ReadOnlyMuxStateSource {
             thread_name: snapshot.thread_name.clone(),
             last_user_prompt: snapshot.last_user_prompt.clone(),
             unseen: None,
-            pane_id: None,
-            liveness: None,
+            liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
+            pane_id,
         };
         self.agent_tracker.lock().unwrap().apply_event(event);
         if let Some(pane_id) = focused_pane {
@@ -2815,7 +2951,7 @@ async fn run_agent_watcher_loop(
     shutdown: broadcast::Sender<()>,
 ) {
     let mut shutdown_rx = shutdown.subscribe();
-    let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
+    let poll = Arc::new(Mutex::new(AgentWatcherPoll::default()));
     let mut unchanged_polls = 0;
 
     let seed_source = source.clone();
@@ -2856,43 +2992,17 @@ async fn run_agent_watcher_loop(
                     }
                 }
                 let now = current_time_ms();
-                let scan_source = source.clone();
-                let (snapshots, released) =
-                    tokio::task::spawn_blocking(move || scan_source.scan_live_agent_watchers(now))
-                        .await
-                        .unwrap_or_default();
-                let has_active_agents = snapshots
-                    .iter()
-                    .any(|snapshot| agent_status_needs_fast_polling(snapshot.status));
-                let mut changed = released;
-                for snapshot in snapshots {
-                    if snapshot.status == AgentStatus::Idle {
-                        continue;
-                    }
-                    let key = agent_watcher_key(&snapshot);
-                    let fingerprint = AgentWatcherFingerprint::from(&snapshot);
-                    if last_seen.get(&key) == Some(&fingerprint) {
-                        continue;
-                    }
-                    let agent = snapshot.agent.to_string();
-                    let status = snapshot.status;
-                    let thread_name = snapshot.thread_name.clone();
-                    let apply_source = source.clone();
-                    let applied = tokio::task::spawn_blocking(move || {
-                        apply_source.apply_agent_watcher_snapshot(snapshot)
-                    }).await.unwrap_or(false);
-                    if applied {
-                        debug_log(format!(
-                            "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
-                        ));
-                        last_seen.insert(key, fingerprint);
-                        changed = true;
-                    } else {
-                        debug_log(format!(
-                            "agent_watcher_loop: dropped snapshot agent={agent} status={status:?} (no matching session)",
-                        ));
-                    }
-                }
+                let poll_source = source.clone();
+                let poll_state = poll.clone();
+                let AgentWatcherPollOutcome { changed, has_active_agents } =
+                    tokio::task::spawn_blocking(move || {
+                        poll_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .run(&poll_source, now)
+                    })
+                    .await
+                    .unwrap_or_default();
                 if changed {
                     let snapshot_source = source.clone();
                     if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
@@ -2911,23 +3021,109 @@ async fn run_agent_watcher_loop(
     }
 }
 
+/// Watcher state kept across polls: the last applied fingerprint per
+/// thread, so unchanged agent state is not reapplied.
+#[derive(Debug, Default)]
+struct AgentWatcherPoll {
+    last_seen: HashMap<String, AgentWatcherFingerprint>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AgentWatcherPollOutcome {
+    changed: bool,
+    has_active_agents: bool,
+}
+
+impl AgentWatcherPoll {
+    /// Scans recently modified agent state once and applies what changed.
+    fn run(&mut self, source: &ReadOnlyMuxStateSource, now_ms: u64) -> AgentWatcherPollOutcome {
+        let (snapshots, released) = source.scan_live_agent_watchers(now_ms);
+        let has_active_agents = snapshots
+            .iter()
+            .any(|snapshot| agent_status_needs_fast_polling(snapshot.status));
+        let mut changed = released;
+        for snapshot in snapshots {
+            if snapshot.status == AgentStatus::Idle {
+                continue;
+            }
+            let key = agent_watcher_key(&snapshot);
+            let fingerprint = AgentWatcherFingerprint::from(&snapshot);
+            if self.last_seen.get(&key) == Some(&fingerprint) {
+                continue;
+            }
+            let agent = snapshot.agent;
+            let status = snapshot.status;
+            let thread_name = snapshot.thread_name.clone();
+            if source.apply_agent_watcher_snapshot(snapshot) {
+                debug_log(format!(
+                    "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
+                ));
+                self.last_seen.insert(key, fingerprint);
+                changed = true;
+            } else {
+                debug_log(format!(
+                    "agent_watcher_loop: dropped snapshot agent={agent} status={status:?} (no matching session or newer row)",
+                ));
+            }
+        }
+        AgentWatcherPollOutcome {
+            changed,
+            has_active_agents,
+        }
+    }
+}
+
+/// A live watcher snapshot, plus the agent pane it was routed to through its
+/// writer process when its project dir could not place it.
+#[derive(Debug, Clone)]
+struct LiveAgentSnapshot {
+    snapshot: AgentWatcherSnapshot,
+    pane: Option<AgentPaneRoute>,
+}
+
+impl std::ops::Deref for LiveAgentSnapshot {
+    type Target = AgentWatcherSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentPaneRoute {
+    session: String,
+    pane_id: String,
+}
+
+/// Writer pid routes for one tmux layout. Unroutable pids are remembered
+/// too, so steady activity from processes outside agent panes does not
+/// reread the process table every poll. Cleared when the layout changes;
+/// never cached without a layout fingerprint.
+#[derive(Debug, Default)]
+struct AgentPaneRouteCache {
+    tmux_fingerprint: Option<u64>,
+    routes: HashMap<(String, u32), Option<AgentPaneRoute>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentWatcherFingerprint {
     status: AgentStatus,
     thread_name: Option<String>,
     last_user_prompt: Option<String>,
     project_dir: Option<String>,
+    pane: Option<AgentPaneRoute>,
     ts: u64,
 }
 
-impl From<&AgentWatcherSnapshot> for AgentWatcherFingerprint {
-    fn from(snapshot: &AgentWatcherSnapshot) -> Self {
+impl From<&LiveAgentSnapshot> for AgentWatcherFingerprint {
+    fn from(live: &LiveAgentSnapshot) -> Self {
         Self {
-            status: snapshot.status,
-            thread_name: snapshot.thread_name.clone(),
-            last_user_prompt: snapshot.last_user_prompt.clone(),
-            project_dir: snapshot.project_dir.clone(),
-            ts: snapshot.ts,
+            status: live.status,
+            thread_name: live.thread_name.clone(),
+            last_user_prompt: live.last_user_prompt.clone(),
+            project_dir: live.project_dir.clone(),
+            pane: live.pane.clone(),
+            ts: live.ts,
         }
     }
 }
@@ -3076,18 +3272,37 @@ fn scan_amp_logs(
             continue;
         };
         let raw = read_file_tail(&path, AMP_LOG_TAIL_BYTES);
-        let snapshot = raw
+        let mut snapshot = raw
             .as_deref()
             .and_then(|raw| amp_snapshot_from_log_jsonl(thread_id, raw, mtime_ms));
+        if let Some(snapshot) = snapshot.as_mut().filter(|snapshot| {
+            snapshot.thread_name.is_none()
+                && file_len(&path).is_some_and(|len| len > AMP_LOG_TAIL_BYTES)
+        }) {
+            snapshot.thread_name = read_file_head(&path, AMP_LOG_TITLE_HEAD_BYTES)
+                .and_then(|head| amp_log_thread_title(&head));
+        }
         let mut observation = AgentWatcherObservation::new("amp", thread_id, mtime_ms, snapshot);
         observation.pid = raw.as_deref().and_then(amp_log_pid);
         // Legacy thread files and current logs can describe the same thread;
-        // the newer readable snapshot wins.
+        // the newer readable snapshot wins, keeping the legacy title if the
+        // log has none.
         if let Some(existing) = observations
             .iter_mut()
             .find(|existing| existing.agent == "amp" && existing.thread_id == observation.thread_id)
         {
             if observation.snapshot.is_some() && mtime_ms > existing.mtime_ms {
+                let legacy_name = existing
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.thread_name.clone());
+                if let Some(snapshot) = observation
+                    .snapshot
+                    .as_mut()
+                    .filter(|snapshot| snapshot.thread_name.is_none())
+                {
+                    snapshot.thread_name = legacy_name;
+                }
                 *existing = observation;
             } else {
                 existing.mtime_ms = existing.mtime_ms.max(mtime_ms);
@@ -3124,6 +3339,24 @@ fn recent_amp_activity_by_pid(home: &Path, now_ms: u64, max_age_ms: u64) -> Hash
         }
     }
     activity
+}
+
+fn file_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+/// The first `max_bytes` of a file, without a trailing partial line.
+fn read_file_head(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(max_bytes)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') {
+        bytes.truncate(end + 1);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
@@ -4962,10 +5195,14 @@ mod tests {
         };
         let mut second = first.clone();
         second.ts = 200;
+        let live = |snapshot| LiveAgentSnapshot {
+            snapshot,
+            pane: None,
+        };
 
         assert_ne!(
-            AgentWatcherFingerprint::from(&first),
-            AgentWatcherFingerprint::from(&second)
+            AgentWatcherFingerprint::from(&live(first)),
+            AgentWatcherFingerprint::from(&live(second))
         );
     }
 
@@ -5173,10 +5410,12 @@ mod tests {
     #[derive(Default)]
     struct TermIgnoringProcesses {
         signals: Mutex<Vec<(u32, opensessions_runtime::hibernate::Signal)>>,
+        table_reads: AtomicUsize,
     }
 
     impl ProcessControl for TermIgnoringProcesses {
         fn process_table(&self) -> Vec<opensessions_runtime::hibernate::ProcessEntry> {
+            self.table_reads.fetch_add(1, Ordering::SeqCst);
             opensessions_runtime::hibernate::parse_process_table(
                 "100 1 -zsh\n\
                  101 100 /Users/me/.amp/bin/amp threads continue T-bg\n\
@@ -5313,6 +5552,11 @@ mod tests {
     impl MuxProvider for RestartTestProvider {
         fn name(&self) -> &str {
             "restart-test"
+        }
+
+        /// The tmux layout never changes during these tests.
+        fn state_fingerprint(&self) -> Option<u64> {
+            Some(1)
         }
 
         fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
@@ -5604,6 +5848,228 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["T-fresh"]
         );
+    }
+
+    fn amp_state_line(thread_id: &str, pid: u32, subtype: &str) -> String {
+        format!(
+            "{{\"type\":\"agent_state\",\"direction\":\"receive\",\"subtype\":\"{subtype}\",\"threadId\":\"{thread_id}\",\"pid\":\"{pid}\"}}\n"
+        )
+    }
+
+    fn amp_title_line(thread_id: &str, pid: u32, title: &str) -> String {
+        format!(
+            "{{\"message\":\"[observer] onThreadTitle\",\"threadId\":\"{thread_id}\",\"data\":{{\"type\":\"thread_title\",\"title\":\"{title}\",\"source\":\"generated\"}},\"pid\":{pid}}}\n"
+        )
+    }
+
+    fn background_threads(source: &ReadOnlyMuxStateSource) -> Vec<String> {
+        let mut threads = source
+            .agent_tracker
+            .lock()
+            .unwrap()
+            .get_agents("background")
+            .into_iter()
+            .filter_map(|agent| agent.thread_id)
+            .collect::<Vec<_>>();
+        threads.sort();
+        threads
+    }
+
+    #[test]
+    fn live_amp_activity_routed_by_writer_pid_updates_the_seeded_row() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        let (source, _) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+
+        // The log has no workdir, so only its writer process can route it.
+        let working = home.amp_log("T-bg", 101, "working", 0);
+        let mut poll = AgentWatcherPoll::default();
+        assert!(poll.run(&source, current_time_ms()).changed);
+
+        let row = agent_status(&source, "background", "T-bg");
+        assert_eq!(row.status, AgentStatus::Running);
+        assert_eq!(row.ts, file_mtime(&working));
+        assert_eq!(row.pane_id.as_deref(), Some("%1"));
+        assert_eq!(row.liveness, Some(AgentLiveness::Alive));
+
+        let done = home.amp_log("T-bg", 101, "idle", 0);
+        assert!(poll.run(&source, current_time_ms()).changed);
+        let row = agent_status(&source, "background", "T-bg");
+        assert_eq!(row.status, AgentStatus::Done);
+        assert_eq!(row.ts, file_mtime(&done));
+        assert!(
+            source.agent_tracker.lock().unwrap().is_unseen("background"),
+            "a live completion is unseen like any other"
+        );
+    }
+
+    #[test]
+    fn a_new_thread_in_a_seeded_amp_process_replaces_its_seed() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        let (source, _) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+
+        home.amp_log("T-new", 101, "working", 0);
+        AgentWatcherPoll::default().run(&source, current_time_ms());
+
+        assert_eq!(background_threads(&source), vec!["T-new"]);
+        let row = agent_status(&source, "background", "T-new");
+        assert_eq!(row.status, AgentStatus::Running);
+        assert_eq!(row.pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn first_live_rescan_of_a_seeded_log_keeps_the_seed_quiet() {
+        let home = AgentStateHome::new();
+        let idle_log = home.amp_log("T-bg", 101, "idle", 60_000);
+        let (source, _) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+
+        AgentWatcherPoll::default().run(&source, current_time_ms());
+
+        let row = agent_status(&source, "background", "T-bg");
+        assert_eq!(row.status, AgentStatus::Done);
+        assert_eq!(row.ts, file_mtime(&idle_log));
+        assert_eq!(row.unseen, None);
+        assert!(!source.agent_tracker.lock().unwrap().is_unseen("background"));
+    }
+
+    #[test]
+    fn pid_routed_amp_rows_carry_the_logged_thread_title() {
+        let home = AgentStateHome::new();
+        home.write(
+            ".cache/amp/logs/threads/T-bg.log",
+            &format!(
+                "{}{}",
+                amp_title_line("T-bg", 101, "Restore idle clocks"),
+                amp_state_line("T-bg", 101, "idle"),
+            ),
+            48 * HOUR_MS,
+        );
+        let (source, _) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+        assert_eq!(
+            agent_status(&source, "background", "T-bg")
+                .thread_name
+                .as_deref(),
+            Some("Restore idle clocks")
+        );
+
+        // Long threads log their title near the start, outside the tail the
+        // watcher parses.
+        let filler = "{\"message\":\"websocket message\",\"pid\":\"101\"}\n"
+            .repeat((AMP_LOG_TAIL_BYTES as usize / 40) + 1_000);
+        home.write(
+            ".cache/amp/logs/threads/T-long.log",
+            &format!(
+                "{}{filler}{}",
+                amp_title_line("T-long", 101, "Long running thread"),
+                amp_state_line("T-long", 101, "working"),
+            ),
+            0,
+        );
+        AgentWatcherPoll::default().run(&source, current_time_ms());
+
+        let row = agent_status(&source, "background", "T-long");
+        assert_eq!(row.status, AgentStatus::Running);
+        assert_eq!(row.thread_name.as_deref(), Some("Long running thread"));
+    }
+
+    #[test]
+    fn amp_activity_from_processes_outside_agent_panes_is_ignored() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-gone", 999, "working", 0);
+        home.amp_log("T-shell", 401, "working", 0);
+        let (source, _) = restarted_source(&home);
+
+        let outcome = AgentWatcherPoll::default().run(&source, current_time_ms());
+
+        assert!(!outcome.changed);
+        for session in ["background", "focused"] {
+            assert!(
+                source
+                    .agent_tracker
+                    .lock()
+                    .unwrap()
+                    .get_agents(session)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_events_keep_precedence_over_older_pid_routed_log_snapshots() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "working", 10_000);
+        let (source, _) = restarted_source(&home);
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "amp",
+                "tmuxSession": "background",
+                "threadId": "T-bg",
+                "threadName": "Plugin title",
+                "status": "done",
+                "paneId": "%1",
+            }))
+            .expect("apply plugin event");
+        let mut poll = AgentWatcherPoll::default();
+
+        poll.run(&source, current_time_ms());
+        let row = agent_status(&source, "background", "T-bg");
+        assert_eq!(
+            row.status,
+            AgentStatus::Done,
+            "older log activity never wins"
+        );
+        assert_eq!(row.thread_name.as_deref(), Some("Plugin title"));
+
+        std::thread::sleep(Duration::from_millis(5));
+        home.amp_log("T-bg", 101, "working", 0);
+        poll.run(&source, current_time_ms());
+        let row = agent_status(&source, "background", "T-bg");
+        assert_eq!(
+            row.status,
+            AgentStatus::Running,
+            "newer log activity applies"
+        );
+        assert_eq!(row.thread_name.as_deref(), Some("Plugin title"));
+        assert_eq!(row.pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn watcher_reads_processes_only_for_unattributed_amp_activity() {
+        let home = AgentStateHome::new();
+        home.write(
+            ".cache/amp/logs/threads/T-repo.log",
+            &format!(
+                "{{\"data\":{{\"args\":{{\"workdir\":\"/restart-test/background\"}}}}}}\n{}",
+                amp_state_line("T-repo", 101, "working"),
+            ),
+            0,
+        );
+        let (source, processes) = restarted_source(&home);
+        let mut poll = AgentWatcherPoll::default();
+        let reads = || processes.table_reads.load(Ordering::SeqCst);
+
+        poll.run(&source, current_time_ms());
+        assert_eq!(background_threads(&source), vec!["T-repo"]);
+        assert_eq!(reads(), 0, "project-dir routing needs no process table");
+
+        home.amp_log("T-bg", 101, "working", 0);
+        poll.run(&source, current_time_ms());
+        assert_eq!(background_threads(&source), vec!["T-bg", "T-repo"]);
+        assert_eq!(reads(), 1);
+
+        home.amp_log("T-bg", 101, "idle", 0);
+        poll.run(&source, current_time_ms());
+        assert_eq!(reads(), 1, "routes are reused while tmux is unchanged");
+
+        home.amp_log("T-gone", 999, "working", 0);
+        poll.run(&source, current_time_ms());
+        poll.run(&source, current_time_ms());
+        assert_eq!(reads(), 2, "processes outside agent panes are remembered");
     }
 
     #[test]

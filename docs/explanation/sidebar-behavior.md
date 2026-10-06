@@ -44,7 +44,7 @@ Important details from the user's point of view:
 - dragging the OpenSessions divider with tmux's default `MouseDrag1Border` binding changes and persists the global sidebar width
 - a command-driven pane resize, background sidebar drift, pane exit, or whole-terminal resize must not redefine the sidebar width
 - background sidebars should already be at Fixed Sidebar Width before the user lands in them
-- pressing `q` quits opensessions only when the key is delivered to a connected sidebar client; pressing `q` in a normal tmux pane is just a normal shell/app keypress
+- pressing `q` in a connected sidebar asks for confirmation and quits opensessions only after `y`; any other key cancels, so a stray `q` cannot stop the control plane. Pressing `q` in a normal tmux pane is just a normal shell/app keypress
 
 ### Server shutdown must not leave stale sidebar clients
 

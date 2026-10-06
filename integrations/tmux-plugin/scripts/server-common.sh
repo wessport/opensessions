@@ -98,8 +98,14 @@ auth_token() {
   cat "$TOKEN_FILE" 2>/dev/null
 }
 
+# A cold start answers `server_alive` only after the server's first snapshot
+# and hook setup, which can take several seconds on a busy machine (git, ps,
+# lsof). Launchers and lock waiters wait this long while the start is still
+# making progress, instead of giving up after a fixed number of polls.
+START_TIMEOUT="${OPENSESSIONS_START_TIMEOUT:-30}"
+
 acquire_start_lock() {
-  attempt=0
+  deadline=$(( $(date +%s) + START_TIMEOUT ))
   while ! mkdir "$START_LOCK_DIR" 2>/dev/null; do
     if server_alive; then
       return 2
@@ -114,12 +120,11 @@ acquire_start_lock() {
       continue
     fi
 
-    if [ "$attempt" -ge 50 ]; then
+    if [ "$(date +%s)" -ge "$deadline" ]; then
       show_startup_error "opensessions: server start lock timed out. Remove $START_LOCK_DIR if no launcher is active."
       return 1
     fi
     sleep 0.1
-    attempt=$((attempt + 1))
   done
 
   printf '%s\n' "$$" >"$START_LOCK_DIR/pid" 2>/dev/null || true
@@ -168,16 +173,18 @@ ensure_server() {
   OPENSESSIONS_TOKEN_FILE="$TOKEN_FILE" \
   OPENSESSIONS_DIR="$PLUGIN_DIR" \
     "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
+  server_pid=$!
 
-  attempt=0
-  while [ "$attempt" -lt 30 ]; do
+  # Keep waiting while the launched server is still running; stop early only
+  # when it exits (for example, another launcher's server owns the port).
+  deadline=$(( $(date +%s) + START_TIMEOUT ))
+  while kill -0 "$server_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 0.1
     if server_alive; then
       SERVER_STARTED=1
       release_start_lock
       return 0
     fi
-    attempt=$((attempt + 1))
   done
 
   # A concurrent launcher may have won the race between our final poll and the
