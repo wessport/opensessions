@@ -316,25 +316,44 @@ impl TmuxClient {
                     Some((parts.get(2)?.to_string(), parts.get(15)?.to_string()))
                 })
                 .collect::<HashMap<_, _>>();
+            if attempt > 1 {
+                // A guarded repair that found a stale layout left its window
+                // untouched. Retry only sidebars that still have the wrong
+                // width: content repairs are only computed for those, so the
+                // fresh listing is the version-independent retry signal.
+                pending.retain(|target| {
+                    panes
+                        .iter()
+                        .any(|pane| pane.id == *target && pane.width != width)
+                });
+                if pending.is_empty() {
+                    return;
+                }
+            }
+            let stale_layout = if attempt == SIDEBAR_REPAIR_ATTEMPTS {
+                StaleLayoutRepair::SidebarOnly
+            } else {
+                StaleLayoutRepair::Skip
+            };
             let script = pending
                 .iter()
-                .enumerate()
-                .map(|(index, target)| {
-                    let stale_layout = if attempt == SIDEBAR_REPAIR_ATTEMPTS {
-                        StaleLayoutRepair::SidebarOnly
-                    } else {
-                        StaleLayoutRepair::Report(index)
-                    };
+                .map(|target| {
                     sidebar_width_repair_script(&panes, &layouts, target, width, stale_layout)
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            let stdout = self.run(&["run-shell", &script]).stdout;
-            pending = stdout
-                .lines()
-                .filter_map(|line| line.strip_prefix(STALE_LAYOUT_MARKER)?.parse().ok())
-                .filter_map(|index: usize| pending.get(index).cloned())
-                .collect();
+            self.run(&["run-shell", &script]);
+            // Unguarded repairs (no listed layout) always apply, so there is
+            // nothing to verify and no reason to spend another listing.
+            let any_guarded = pending.iter().any(|target| {
+                panes
+                    .iter()
+                    .find(|pane| pane.id == *target)
+                    .is_some_and(|pane| layouts.contains_key(&pane.window_id))
+            });
+            if !any_guarded {
+                return;
+            }
         }
     }
 
@@ -1223,14 +1242,13 @@ fn pane_format() -> &'static str {
 /// with a fresh listing; the last attempt falls back to a sidebar-only resize
 /// so Fixed Sidebar Width still wins under continuous layout churn.
 const SIDEBAR_REPAIR_ATTEMPTS: usize = 3;
-const STALE_LAYOUT_MARKER: &str = "opensessions-stale-layout:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StaleLayoutRepair {
-    /// Leave the window untouched and print the sidebar's position in this
-    /// pass for another attempt. Positions rather than pane ids are printed
-    /// because `display-message` expands `%` sequences.
-    Report(usize),
+    /// Leave the window untouched; `resize_pane_widths` re-lists panes and
+    /// retries sidebars that still have the wrong width. No output is used as
+    /// a signal: tmux 3.4 drops `if-shell` command output under `run-shell`.
+    Skip,
     /// Restore only the sidebar width.
     SidebarOnly,
 }
@@ -1267,20 +1285,15 @@ fn sidebar_width_repair_script(
         .chain(content.iter().map(|(pane, width)| resize(pane, *width)))
         .collect::<Vec<_>>()
         .join(" ; ");
-    // Only the retry marker may reach stdout; `resize_pane_widths` parses it.
-    let (otherwise, stdout) = match stale_layout {
-        StaleLayoutRepair::Report(index) => (
-            format!("display-message -p {STALE_LAYOUT_MARKER}{index}"),
-            "",
-        ),
-        StaleLayoutRepair::SidebarOnly => (resize(sidebar_id, width), " >/dev/null"),
+    let otherwise = match stale_layout {
+        StaleLayoutRepair::Skip => String::new(),
+        StaleLayoutRepair::SidebarOnly => format!(" {}", shell_quote(&resize(sidebar_id, width))),
     };
     format!(
-        "tmux if-shell -F -t {} {} {} {}{stdout} 2>/dev/null || true",
+        "tmux if-shell -F -t {} {} {}{otherwise} >/dev/null 2>&1 || true",
         shell_quote(sidebar_id),
         shell_quote(&window_layout_guard(layout)),
         shell_quote(&guarded),
-        shell_quote(&otherwise),
     )
 }
 
@@ -1960,16 +1973,13 @@ mod tests {
         let guard = "'##{==:##{window_layout},a1b2##,159x39##,0##,0{53x39##,0##,0##,1##,53x39##,54##,0##,2##,52x39##,107##,0##,3##}}'";
         let guarded = r"'resize-pane -t '\''%1'\'' -x 36 ; resize-pane -t '\''%2'\'' -x 62'";
         assert_eq!(
-            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Report(4)),
-            format!(
-                "tmux if-shell -F -t '%1' {guard} {guarded} {} 2>/dev/null || true",
-                "'display-message -p opensessions-stale-layout:4'",
-            ),
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Skip),
+            format!("tmux if-shell -F -t '%1' {guard} {guarded} >/dev/null 2>&1 || true"),
         );
         assert_eq!(
             sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::SidebarOnly),
             format!(
-                "tmux if-shell -F -t '%1' {guard} {guarded} {} >/dev/null 2>/dev/null || true",
+                "tmux if-shell -F -t '%1' {guard} {guarded} {} >/dev/null 2>&1 || true",
                 r"'resize-pane -t '\''%1'\'' -x 36'",
             ),
         );
@@ -1985,12 +1995,12 @@ mod tests {
             "c3d4,160x39,0,0{36x39,0,0,1,123x39,37,0,2}".to_string(),
         )]);
         assert_eq!(
-            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Report(0)),
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Skip),
             concat!(
                 "tmux if-shell -F -t '%1' ",
                 "'##{==:##{window_layout},c3d4##,160x39##,0##,0{36x39##,0##,0##,1##,123x39##,37##,0##,2##}}' ",
                 r"'resize-pane -t '\''%1'\'' -x 36' ",
-                "'display-message -p opensessions-stale-layout:0' 2>/dev/null || true",
+                ">/dev/null 2>&1 || true",
             ),
         );
     }
