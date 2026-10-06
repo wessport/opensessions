@@ -1488,22 +1488,28 @@ impl StateSource for ReadOnlyMuxStateSource {
                 None
             }
             "/pane-exited" => {
+                // Queue fixed-width repair before orphan cleanup. The repair
+                // worker runs outside the state-operation lock, so tmux's
+                // redistributed sidebar width is restored without waiting for
+                // the snapshot-backed fallback computation below.
+                if self.is_sidebar_visible() {
+                    self.request_sidebar_width_repair();
+                }
+                // One snapshot serves every sidebar; computing it per pane
+                // held the state-operation lock for seconds under load.
+                let display_names = self.sidebar_display_session_names().unwrap_or_default();
                 let fallback_sessions = self
                     .providers
                     .iter()
                     .flat_map(|provider| provider.list_sidebar_panes(None))
                     .filter_map(|pane| {
-                        let fallback = self
-                            .session_before(&pane.session_name)
-                            .or_else(|| self.session_after(&pane.session_name))?;
+                        let fallback = session_before_in(&display_names, &pane.session_name)
+                            .or_else(|| session_after_in(&display_names, &pane.session_name))?;
                         Some((pane.session_name, fallback))
                     })
                     .collect::<HashMap<_, _>>();
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
-                }
-                if self.is_sidebar_visible() {
-                    self.request_sidebar_width_repair();
                 }
                 None
             }
@@ -2192,17 +2198,11 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn session_before(&self, name: &str) -> Option<String> {
-        let names = self.sidebar_display_session_names()?;
-        let index = names.iter().position(|candidate| candidate == name)?;
-        index
-            .checked_sub(1)
-            .and_then(|previous| names.get(previous).cloned())
+        session_before_in(&self.sidebar_display_session_names()?, name)
     }
 
     fn session_after(&self, name: &str) -> Option<String> {
-        let names = self.sidebar_display_session_names()?;
-        let index = names.iter().position(|candidate| candidate == name)?;
-        names.get(index + 1).cloned()
+        session_after_in(&self.sidebar_display_session_names()?, name)
     }
 
     fn sidebar_display_session_names(&self) -> Option<Vec<String>> {
@@ -2383,6 +2383,18 @@ async fn run_coalesced_sidebar_width_repairs<F, Fut>(
             repair(request_count).await;
         }
     }
+}
+
+fn session_before_in(names: &[String], name: &str) -> Option<String> {
+    let index = names.iter().position(|candidate| candidate == name)?;
+    index
+        .checked_sub(1)
+        .and_then(|previous| names.get(previous).cloned())
+}
+
+fn session_after_in(names: &[String], name: &str) -> Option<String> {
+    let index = names.iter().position(|candidate| candidate == name)?;
+    names.get(index + 1).cloned()
 }
 
 fn adaptive_poll_delay_ms(unchanged_polls: u32, base_ms: u64, max_ms: u64) -> u64 {
@@ -4995,6 +5007,127 @@ mod tests {
         fn kill_session(&self, _name: &str) {}
         fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
         fn cleanup_hooks(&self) {}
+    }
+
+    #[derive(Default)]
+    struct PaneExitTestProvider {
+        list_sessions_calls: AtomicUsize,
+        repair_scheduler: std::sync::OnceLock<Arc<SidebarWidthRepairScheduler>>,
+        cleanup_observations: Mutex<Vec<(HashMap<String, String>, usize)>>,
+    }
+
+    impl MuxProvider for PaneExitTestProvider {
+        fn name(&self) -> &str {
+            "pane-exit-test"
+        }
+
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            self.list_sessions_calls.fetch_add(1, Ordering::SeqCst);
+            ["alpha", "beta", "gamma"]
+                .into_iter()
+                .map(|name| opensessions_runtime::mux::MuxSessionInfo {
+                    name: name.to_string(),
+                    created_at: 0,
+                    dir: String::new(),
+                    windows: 1,
+                })
+                .collect()
+        }
+
+        fn list_sidebar_panes(
+            &self,
+            _session_name: Option<&str>,
+        ) -> Vec<opensessions_runtime::mux::SidebarPane> {
+            ["alpha", "beta", "gamma"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, session)| opensessions_runtime::mux::SidebarPane {
+                    pane_id: format!("%{index}"),
+                    session_name: session.to_string(),
+                    window_id: format!("@{index}"),
+                    width: Some(36),
+                    window_width: Some(160),
+                })
+                .collect()
+        }
+
+        fn kill_orphaned_sidebar_panes_with_fallbacks(
+            &self,
+            fallback_sessions: &HashMap<String, String>,
+        ) {
+            let pending_repairs = self
+                .repair_scheduler
+                .get()
+                .map(|scheduler| scheduler.pending_requests.load(Ordering::SeqCst))
+                .unwrap_or_default();
+            self.cleanup_observations
+                .lock()
+                .unwrap()
+                .push((fallback_sessions.clone(), pending_repairs));
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("alpha".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn pane_exit_queues_width_repair_before_one_snapshot_backed_orphan_cleanup() {
+        let provider = Arc::new(PaneExitTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        provider
+            .repair_scheduler
+            .set(Arc::clone(&source.sidebar_width_repairs))
+            .expect("scheduler set once");
+        source
+            .sidebar_coordinator
+            .lock()
+            .unwrap()
+            .acknowledge_sidebar_connected();
+
+        // The first snapshot also warms caches; measure a steady-state one.
+        source.snapshot_json();
+        let before_snapshot = provider.list_sessions_calls.load(Ordering::SeqCst);
+        source.snapshot_json();
+        let calls_per_snapshot =
+            provider.list_sessions_calls.load(Ordering::SeqCst) - before_snapshot;
+
+        let before_hook = provider.list_sessions_calls.load(Ordering::SeqCst);
+        source.handle_http_hook("/pane-exited", "");
+        let hook_calls = provider.list_sessions_calls.load(Ordering::SeqCst) - before_hook;
+
+        assert_eq!(
+            hook_calls, calls_per_snapshot,
+            "pane exit must build one display-order snapshot, not one per sidebar pane"
+        );
+        let observations = provider.cleanup_observations.lock().unwrap();
+        let (fallbacks, pending_repairs) = observations.first().expect("orphan cleanup ran");
+        assert_eq!(
+            *pending_repairs, 1,
+            "fixed-width repair must be queued before slow orphan cleanup"
+        );
+        assert_eq!(
+            fallbacks,
+            &HashMap::from([
+                ("alpha".to_string(), "beta".to_string()),
+                ("beta".to_string(), "alpha".to_string()),
+                ("gamma".to_string(), "beta".to_string()),
+            ])
+        );
     }
 
     #[test]

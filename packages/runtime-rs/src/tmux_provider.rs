@@ -300,26 +300,61 @@ impl TmuxClient {
     }
 
     pub fn resize_pane_widths(&self, targets: &[String], width: u16) {
-        if targets.is_empty() {
-            return;
+        let mut pending = targets.to_vec();
+        for attempt in 1..=SIDEBAR_REPAIR_ATTEMPTS {
+            if pending.is_empty() {
+                return;
+            }
+            // List layouts in the same call so each one matches its pane widths.
+            let format = format!("{}{SEP}#{{window_layout}}", pane_format());
+            let output = self.run(&["list-panes", "-a", "-F", &format]).stdout;
+            let panes = parse_panes(&output);
+            let layouts = output
+                .lines()
+                .filter_map(|line| {
+                    let parts = split(line);
+                    Some((parts.get(2)?.to_string(), parts.get(15)?.to_string()))
+                })
+                .collect::<HashMap<_, _>>();
+            if attempt > 1 {
+                // A guarded repair that found a stale layout left its window
+                // untouched. Retry only sidebars that still have the wrong
+                // width: content repairs are only computed for those, so the
+                // fresh listing is the version-independent retry signal.
+                pending.retain(|target| {
+                    panes
+                        .iter()
+                        .any(|pane| pane.id == *target && pane.width != width)
+                });
+                if pending.is_empty() {
+                    return;
+                }
+            }
+            let stale_layout = if attempt == SIDEBAR_REPAIR_ATTEMPTS {
+                StaleLayoutRepair::SidebarOnly
+            } else {
+                StaleLayoutRepair::Skip
+            };
+            let script = pending
+                .iter()
+                .map(|target| {
+                    sidebar_width_repair_script(&panes, &layouts, target, width, stale_layout)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.run(&["run-shell", &script]);
+            // Unguarded repairs (no listed layout) always apply, so there is
+            // nothing to verify and no reason to spend another listing.
+            let any_guarded = pending.iter().any(|target| {
+                panes
+                    .iter()
+                    .find(|pane| pane.id == *target)
+                    .is_some_and(|pane| layouts.contains_key(&pane.window_id))
+            });
+            if !any_guarded {
+                return;
+            }
         }
-        let panes = self.list_panes(PaneScope::All);
-        let mut repairs = Vec::new();
-        for target in targets {
-            repairs.push((target.clone(), width));
-            repairs.extend(flat_content_width_repairs(&panes, target, width));
-        }
-        let script = repairs
-            .iter()
-            .map(|(target, width)| {
-                format!(
-                    "tmux resize-pane -t {} -x {width} >/dev/null 2>&1 || true",
-                    shell_quote(target)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        self.run(&["run-shell", &script]);
     }
 
     pub fn set_window_remain_on_exit(&self, target: &str, enabled: bool) {
@@ -357,50 +392,50 @@ impl TmuxClient {
         ]);
     }
 
-    pub fn set_remain_on_exit_for_sidebar_windows(&self, enabled: bool) {
+    pub fn ensure_remain_on_exit_for_sidebar_windows(&self) {
         let mut seen_windows = HashSet::new();
         for pane in self.list_panes(PaneScope::All) {
             if pane.title == "opensessions-sidebar" && seen_windows.insert(pane.window_id.clone()) {
-                if enabled {
-                    self.ensure_window_remain_on_exit(&pane.window_id);
-                } else {
-                    let previous = self
-                        .run(&[
-                            "show-window-options",
-                            "-t",
-                            &pane.window_id,
-                            "-v",
-                            REMAIN_ON_EXIT_PREVIOUS_OPTION,
-                        ])
-                        .stdout;
-                    if previous == REMAIN_ON_EXIT_INHERITED {
-                        self.run(&[
-                            "set-window-option",
-                            "-t",
-                            &pane.window_id,
-                            "-u",
-                            "remain-on-exit",
-                        ]);
-                    } else if !previous.is_empty() {
-                        self.run(&[
-                            "set-window-option",
-                            "-t",
-                            &pane.window_id,
-                            "remain-on-exit",
-                            &previous,
-                        ]);
-                    }
-                    if !previous.is_empty() {
-                        self.run(&[
-                            "set-window-option",
-                            "-t",
-                            &pane.window_id,
-                            "-u",
-                            REMAIN_ON_EXIT_PREVIOUS_OPTION,
-                        ]);
-                    }
-                }
+                self.ensure_window_remain_on_exit(&pane.window_id);
             }
+        }
+    }
+
+    /// Restores `remain-on-exit` on every window that opensessions changed.
+    ///
+    /// Windows are found by their saved-value marker rather than by their
+    /// sidebar panes: during shutdown sidebar clients exit before cleanup and
+    /// the `pane-died` hook removes their panes, so a sidebar-pane scan would
+    /// skip windows and leave them with `remain-on-exit on`.
+    pub fn restore_remain_on_exit_for_marked_windows(&self) {
+        let format = format!("#{{window_id}}{SEP}#{{{REMAIN_ON_EXIT_PREVIOUS_OPTION}}}");
+        let output = self.run(&["list-windows", "-a", "-F", &format]);
+        let mut seen_windows = HashSet::new();
+        for line in output.stdout.lines() {
+            let Some((window_id, previous)) = line.split_once(SEP) else {
+                continue;
+            };
+            if previous.is_empty() || !seen_windows.insert(window_id) {
+                continue;
+            }
+            if previous == REMAIN_ON_EXIT_INHERITED {
+                self.run(&["set-window-option", "-t", window_id, "-u", "remain-on-exit"]);
+            } else {
+                self.run(&[
+                    "set-window-option",
+                    "-t",
+                    window_id,
+                    "remain-on-exit",
+                    previous,
+                ]);
+            }
+            self.run(&[
+                "set-window-option",
+                "-t",
+                window_id,
+                "-u",
+                REMAIN_ON_EXIT_PREVIOUS_OPTION,
+            ]);
         }
     }
 
@@ -801,11 +836,11 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
         self.client
             .setup_sidebar_mouse_resize_binding(&base, token_file);
-        self.client.set_remain_on_exit_for_sidebar_windows(true);
+        self.client.ensure_remain_on_exit_for_sidebar_windows();
     }
 
     fn cleanup_hooks(&self) {
-        self.client.set_remain_on_exit_for_sidebar_windows(false);
+        self.client.restore_remain_on_exit_for_marked_windows();
         self.client.cleanup_sidebar_mouse_resize_binding();
         for hook in [
             "client-session-changed",
@@ -1203,6 +1238,74 @@ fn pane_format() -> &'static str {
     "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
 }
 
+/// Proportional repairs whose window layout changed after listing are retried
+/// with a fresh listing; the last attempt falls back to a sidebar-only resize
+/// so Fixed Sidebar Width still wins under continuous layout churn.
+const SIDEBAR_REPAIR_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleLayoutRepair {
+    /// Leave the window untouched; `resize_pane_widths` re-lists panes and
+    /// retries sidebars that still have the wrong width. No output is used as
+    /// a signal: tmux 3.4 drops `if-shell` command output under `run-shell`.
+    Skip,
+    /// Restore only the sidebar width.
+    SidebarOnly,
+}
+
+/// Builds one sidebar's repair command for the global `run-shell` script.
+///
+/// Content-pane widths are absolute values computed from `panes`. Applying
+/// them after the window changed (for example, a stale session expanding on
+/// return) gives the reclaimed space to one content pane, and so does a
+/// sidebar-only resize computed before the change; once the sidebar is
+/// correct, no later pass restores the content proportions. The sidebar and
+/// content resizes therefore run as one atomic tmux command guarded by the
+/// window layout listed with `panes`.
+fn sidebar_width_repair_script(
+    panes: &[PaneInfo],
+    layouts: &HashMap<String, String>,
+    sidebar_id: &str,
+    width: u16,
+    stale_layout: StaleLayoutRepair,
+) -> String {
+    let resize =
+        |pane: &str, width: u16| format!("resize-pane -t {} -x {width}", shell_quote(pane));
+    let content = flat_content_width_repairs(panes, sidebar_id, width);
+    // Guard even when no content repair is needed: a sidebar-only resize
+    // applied after the window changed would also skew the content panes.
+    let layout = panes
+        .iter()
+        .find(|pane| pane.id == sidebar_id)
+        .and_then(|sidebar| layouts.get(&sidebar.window_id));
+    let Some(layout) = layout else {
+        return format!("tmux {} >/dev/null 2>&1 || true", resize(sidebar_id, width));
+    };
+    let guarded = std::iter::once(resize(sidebar_id, width))
+        .chain(content.iter().map(|(pane, width)| resize(pane, *width)))
+        .collect::<Vec<_>>()
+        .join(" ; ");
+    let otherwise = match stale_layout {
+        StaleLayoutRepair::Skip => String::new(),
+        StaleLayoutRepair::SidebarOnly => format!(" {}", shell_quote(&resize(sidebar_id, width))),
+    };
+    format!(
+        "tmux if-shell -F -t {} {} {}{otherwise} >/dev/null 2>&1 || true",
+        shell_quote(sidebar_id),
+        shell_quote(&window_layout_guard(layout)),
+        shell_quote(&guarded),
+    )
+}
+
+/// An `if-shell -F` condition that holds while the window still has `layout`.
+///
+/// `run-shell` format-expands its script first, so `##` reaches `if-shell` as
+/// `#`; the layout's `,` and `}` are escaped as `#,` and `#}` for that pass.
+fn window_layout_guard(layout: &str) -> String {
+    let escaped = layout.replace(',', "##,").replace('}', "##}");
+    format!("##{{==:##{{window_layout}},{escaped}}}")
+}
+
 fn flat_content_width_repairs(
     panes: &[PaneInfo],
     sidebar_id: &str,
@@ -1545,6 +1648,70 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_restores_remain_on_exit_after_sidebar_panes_are_gone() {
+        struct RestoreRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl CommandRunner for RestoreRunner {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                self.calls.lock().unwrap().push(args.to_vec());
+                // Sidebar clients already exited and `pane-died` removed their
+                // panes, so only the per-window markers remain.
+                let stdout = match args.first().map(String::as_str) {
+                    Some("list-windows") => concat!(
+                        "@1\toff\n",
+                        "@2\t\n",
+                        "@3\tfailed\n",
+                        "@4\t__inherited__\n",
+                        "@1\toff",
+                    ),
+                    _ => "",
+                };
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+
+        let runner = Arc::new(RestoreRunner {
+            calls: Mutex::new(Vec::new()),
+        });
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.cleanup_hooks();
+
+        let calls = runner.calls.lock().unwrap();
+        let option_calls = calls
+            .iter()
+            .filter(|call| call.first().map(String::as_str) == Some("set-window-option"))
+            .map(|call| call[1..].join(" "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            option_calls,
+            vec![
+                "-t @1 remain-on-exit off",
+                "-t @1 -u @opensessions_remain_on_exit_previous",
+                "-t @3 remain-on-exit failed",
+                "-t @3 -u @opensessions_remain_on_exit_previous",
+                "-t @4 -u remain-on-exit",
+                "-t @4 -u @opensessions_remain_on_exit_previous",
+            ],
+        );
+        assert_eq!(
+            calls[0],
+            vec![
+                "list-windows".to_string(),
+                "-a".to_string(),
+                "-F".to_string(),
+                "#{window_id}\t#{@opensessions_remain_on_exit_previous}".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn client_focus_uses_tmux_target_client_not_window_active_state() {
         let runner = Arc::new(RecordingRunner::default());
         let provider = TmuxProvider::new(runner.clone());
@@ -1781,13 +1948,60 @@ mod tests {
                     "list-panes".to_string(),
                     "-a".to_string(),
                     "-F".to_string(),
-                    pane_format().to_string(),
+                    format!("{}\t#{{window_layout}}", pane_format()),
                 ],
                 vec![
                     "run-shell".to_string(),
                     "tmux resize-pane -t '%1' -x 36 >/dev/null 2>&1 || true; tmux resize-pane -t '%2' -x 36 >/dev/null 2>&1 || true".to_string(),
                 ],
             ],
+        );
+    }
+
+    #[test]
+    fn proportional_sidebar_repair_is_guarded_by_the_listed_window_layout() {
+        let panes = parse_panes(concat!(
+            "%1\tproject\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\topensessions\topensessions-sidebar\t53\t39\t0\t52\n",
+            "%2\tproject\t@1\t0\t1\t1\t/dev/ttys2\t11\t/tmp\tamp\tAgent 1\t53\t39\t54\t106\n",
+            "%3\tproject\t@1\t0\t2\t0\t/dev/ttys3\t12\t/tmp\tamp\tAgent 2\t52\t39\t107\t158",
+        ));
+        let layouts = HashMap::from([(
+            "@1".to_string(),
+            "a1b2,159x39,0,0{53x39,0,0,1,53x39,54,0,2,52x39,107,0,3}".to_string(),
+        )]);
+
+        let guard = "'##{==:##{window_layout},a1b2##,159x39##,0##,0{53x39##,0##,0##,1##,53x39##,54##,0##,2##,52x39##,107##,0##,3##}}'";
+        let guarded = r"'resize-pane -t '\''%1'\'' -x 36 ; resize-pane -t '\''%2'\'' -x 62'";
+        assert_eq!(
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Skip),
+            format!("tmux if-shell -F -t '%1' {guard} {guarded} >/dev/null 2>&1 || true"),
+        );
+        assert_eq!(
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::SidebarOnly),
+            format!(
+                "tmux if-shell -F -t '%1' {guard} {guarded} {} >/dev/null 2>&1 || true",
+                r"'resize-pane -t '\''%1'\'' -x 36'",
+            ),
+        );
+
+        // An already-correct sidebar is guarded too, so its no-op resize
+        // cannot shrink a neighbor after the window changes size.
+        let panes = parse_panes(concat!(
+            "%1\tproject\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\topensessions\topensessions-sidebar\t36\t39\t0\t35\n",
+            "%2\tproject\t@1\t0\t1\t1\t/dev/ttys2\t11\t/tmp\tamp\tAgent 1\t123\t39\t37\t159",
+        ));
+        let layouts = HashMap::from([(
+            "@1".to_string(),
+            "c3d4,160x39,0,0{36x39,0,0,1,123x39,37,0,2}".to_string(),
+        )]);
+        assert_eq!(
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Skip),
+            concat!(
+                "tmux if-shell -F -t '%1' ",
+                "'##{==:##{window_layout},c3d4##,160x39##,0##,0{36x39##,0##,0##,1##,123x39##,37##,0##,2##}}' ",
+                r"'resize-pane -t '\''%1'\'' -x 36' ",
+                ">/dev/null 2>&1 || true",
+            ),
         );
     }
 

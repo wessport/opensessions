@@ -106,6 +106,8 @@ The accepted rule set is:
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - global repair is single-flight: a request that arrives during a pass causes one follow-up pass rather than concurrent work, and every pass reads the latest configured width
 - each provider starts a global pass with one mux invocation when possible, then uses independent race-tolerant pane repairs so interactive commands can interleave
+- proportional content-pane widths are absolute values computed from a pane listing; each window's sidebar and content resizes run as one tmux command guarded by the window layout listed with those widths, and a window whose layout changed in between is re-listed and recomputed (bounded retries, then a sidebar-only fallback) so stale widths never redistribute its content panes
+- `pane-exited`/`after-kill-pane` queue the width repair before orphan-sidebar cleanup, and that cleanup builds at most one state snapshot, so fixed-width repair never waits behind snapshot work under load
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
 
 ## Global Width Repair Rules

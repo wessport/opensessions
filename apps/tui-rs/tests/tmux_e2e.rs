@@ -1475,6 +1475,128 @@ fn tmux_sidebar_preserves_even_content_panes_when_returning_to_stale_session() {
 }
 
 #[test]
+fn tmux_sidebar_proportional_repair_skips_stale_content_widths_after_window_resize() {
+    use opensessions_runtime::mux::MuxProvider;
+    use opensessions_runtime::tmux_provider::{CommandOutput, CommandRunner, TmuxProvider};
+
+    /// Runs tmux on the lab socket and, once armed, resizes the window after
+    /// the provider listed panes but before its repair script runs.
+    struct LabRunner {
+        socket: String,
+        resize_before_repair: Mutex<Option<&'static str>>,
+    }
+
+    impl LabRunner {
+        fn tmux(&self, args: &[&str]) -> CommandOutput {
+            let output = Command::new("tmux")
+                .arg("-L")
+                .arg(&self.socket)
+                .args(args)
+                .output()
+                .expect("run tmux");
+            CommandOutput {
+                exit_code: output.status.code().unwrap_or(1),
+                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }
+        }
+    }
+
+    impl CommandRunner for LabRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            if args.first().map(String::as_str) == Some("run-shell")
+                && let Some(width) = self.resize_before_repair.lock().unwrap().take()
+            {
+                self.tmux(&["resize-window", "-t", "stale", "-x", width]);
+            }
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            self.tmux(&args)
+        }
+    }
+
+    let _guard = e2e_serial_guard();
+    let lab = Lab::new("opensessions-e2e-stale-repair-geometry");
+    lab.tmux_ok([
+        "new-session",
+        "-d",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "-s",
+        "stale",
+        "sh",
+    ]);
+    lab.tmux_ok(["split-window", "-h", "-t", "stale", "sh"]);
+    // Like the product, add the sidebar last on the left so pane-id order
+    // differs from layout order.
+    lab.tmux_ok(["split-window", "-hbf", "-t", "stale", "sh"]);
+    lab.tmux_ok(["select-layout", "-t", "stale", "even-horizontal"]);
+    let panes = lab.tmux(["list-panes", "-t", "stale", "-F", "#{pane_id}"]);
+    let panes = panes.lines().collect::<Vec<_>>();
+    let &[sidebar, first, _second] = panes.as_slice() else {
+        panic!("expected three panes; got {panes:?}");
+    };
+    lab.tmux_ok(["select-pane", "-t", sidebar, "-T", "opensessions-sidebar"]);
+    lab.tmux_ok(["resize-pane", "-t", sidebar, "-x", "36"]);
+    lab.tmux_ok(["resize-pane", "-t", first, "-x", "61"]);
+    let widths = || {
+        lab.tmux(["list-panes", "-t", "stale", "-F", "#{pane_width}"])
+            .lines()
+            .map(|width| width.parse::<u16>().expect("pane width"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(widths(), [36, 61, 61]);
+
+    let runner = std::sync::Arc::new(LabRunner {
+        socket: lab.socket.clone(),
+        resize_before_repair: Mutex::new(None),
+    });
+    let provider = TmuxProvider::new(runner.clone());
+
+    // An undisturbed repair restores the sidebar and keeps content even.
+    lab.tmux_ok(["resize-window", "-t", "stale", "-x", "100"]);
+    assert_eq!(widths(), [16, 41, 41]);
+    provider.resize_sidebar_panes(&[sidebar.to_string()], 36);
+    assert_eq!(widths(), [36, 31, 31]);
+
+    // Widths computed for a 70-column window must not be applied after the
+    // window grew back to 100 columns; tmux already restored the sidebar.
+    lab.tmux_ok(["resize-window", "-t", "stale", "-x", "70"]);
+    assert_eq!(widths(), [26, 21, 21]);
+    *runner.resize_before_repair.lock().unwrap() = Some("100");
+    provider.resize_sidebar_panes(&[sidebar.to_string()], 36);
+    assert_eq!(
+        widths(),
+        [36, 31, 31],
+        "a repair computed before the window resized must not redistribute content panes",
+    );
+
+    // When the sidebar is still wrong after the window changed, the repair is
+    // recomputed from the new layout instead of resizing only the sidebar,
+    // which would hand all reclaimed space to the first content pane.
+    lab.tmux_ok(["resize-window", "-t", "stale", "-x", "70"]);
+    assert_eq!(widths(), [26, 21, 21]);
+    *runner.resize_before_repair.lock().unwrap() = Some("130");
+    provider.resize_sidebar_panes(&[sidebar.to_string()], 36);
+    assert_eq!(
+        widths(),
+        [36, 46, 46],
+        "a repair whose layout went stale must be recomputed from the current layout",
+    );
+
+    // A sidebar that was already correct when listed must not be resized
+    // blindly after the window shrinks; that would shrink only its neighbor.
+    *runner.resize_before_repair.lock().unwrap() = Some("100");
+    provider.resize_sidebar_panes(&[sidebar.to_string()], 36);
+    assert_eq!(
+        widths(),
+        [36, 31, 31],
+        "a no-op repair computed before the window shrank must be recomputed",
+    );
+}
+
+#[test]
 fn tmux_sidebar_client_resize_never_persists_a_smaller_sidebar_width() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-client-resize-fixed-width");
