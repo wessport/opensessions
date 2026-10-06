@@ -59,6 +59,7 @@ pub fn amp_snapshot_from_log_jsonl(
 ) -> Option<AgentWatcherSnapshot> {
     let mut project_dir = None;
     let mut status = None;
+    let mut thread_name = None;
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -66,6 +67,9 @@ pub fn amp_snapshot_from_log_jsonl(
         };
         if let Some(workdir) = entry.pointer("/data/args/workdir").and_then(Value::as_str) {
             project_dir = Some(workdir.to_string());
+        }
+        if let Some(title) = amp_log_entry_title(&entry) {
+            thread_name = Some(title);
         }
         if entry.get("type").and_then(Value::as_str) == Some("agent_state")
             && entry.get("direction").and_then(Value::as_str) == Some("receive")
@@ -81,12 +85,35 @@ pub fn amp_snapshot_from_log_jsonl(
     Some(AgentWatcherSnapshot {
         agent: "amp",
         thread_id: Some(thread_id.to_string()),
-        thread_name: None,
+        thread_name,
         last_user_prompt: None,
         project_dir,
         status: status?,
         ts,
     })
+}
+
+/// The latest thread title Amp logged (`onThreadTitle` observer events).
+/// Amp logs the generated title early in a thread, so callers can read the
+/// start of a log when its tail has no title.
+pub fn amp_log_thread_title(raw: &str) -> Option<String> {
+    raw.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|entry| amp_log_entry_title(&entry))
+}
+
+fn amp_log_entry_title(entry: &Value) -> Option<String> {
+    if entry.pointer("/data/type").and_then(Value::as_str) != Some("thread_title") {
+        return None;
+    }
+    entry
+        .pointer("/data/title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToString::to_string)
 }
 
 /// The Amp process that last wrote a thread log. Every Amp log line carries
@@ -779,6 +806,24 @@ mod tests {
         let snapshot = amp_snapshot_from_log_jsonl("thread", &done, 2_000).expect("snapshot");
         assert_eq!(snapshot.project_dir.as_deref(), Some("/repo"));
         assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn amp_log_snapshot_names_the_thread_from_its_latest_title() {
+        let raw = r#"
+{"message":"[observer] onThreadTitle","threadId":"T-1","data":{"type":"thread_title","title":"First title","source":"generated"},"pid":7}
+{"type":"thread_title","direction":"receive","threadId":"T-1","pid":7}
+{"message":"[observer] onThreadTitle","threadId":"T-1","data":{"type":"thread_title","title":"Renamed","source":"user"},"pid":7}
+{"message":"[observer] onThreadTitle","threadId":"T-1","data":{"type":"thread_title","title":""},"pid":7}
+{"type":"agent_state","direction":"receive","subtype":"idle","threadId":"T-1","pid":7}
+"#;
+        let snapshot = amp_snapshot_from_log_jsonl("T-1", raw, 1_000).expect("snapshot");
+        assert_eq!(snapshot.thread_name.as_deref(), Some("Renamed"));
+        assert_eq!(amp_log_thread_title(raw).as_deref(), Some("Renamed"));
+        assert_eq!(
+            amp_log_thread_title(r#"{"type":"agent_state","subtype":"idle"}"#),
+            None
+        );
     }
 
     #[test]

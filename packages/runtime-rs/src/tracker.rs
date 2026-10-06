@@ -828,6 +828,9 @@ impl AgentTracker {
         {
             return;
         }
+        if self.restates_seed(event, &key) {
+            return;
+        }
         self.supersede_seeds(event, &key);
         let mut removed_unseen_keys = Vec::new();
         if is_terminal_status(event.status) {
@@ -1029,6 +1032,32 @@ impl AgentTracker {
         for seed_key in superseded {
             self.remove_instance(&event.session, &seed_key);
         }
+    }
+
+    /// An event with the seed's status and no newer activity (for example the
+    /// first live rescan of the file the seed came from) adds nothing new, so
+    /// the row stays a quiet seed; it only fills in details the seed lacked.
+    fn restates_seed(&mut self, event: &AgentEvent, key: &str) -> bool {
+        if !self.is_seeded(&event.session, key) {
+            return false;
+        }
+        let Some(seed) = self
+            .instances
+            .get_mut(&event.session)
+            .and_then(|instances| instances.get_mut(key))
+        else {
+            return false;
+        };
+        if seed.status != event.status || event.ts > seed.ts {
+            return false;
+        }
+        if event.thread_name.is_some() {
+            seed.thread_name = event.thread_name.clone();
+        }
+        if event.last_user_prompt.is_some() {
+            seed.last_user_prompt = event.last_user_prompt.clone();
+        }
+        true
     }
 
     fn is_seeded(&self, session: &str, key: &str) -> bool {
@@ -1936,6 +1965,28 @@ mod tests {
                 .iter()
                 .all(|agent| agent.thread_id.as_deref() != Some("T-one")),
             "a live event with an unknown pane supersedes every seed of that agent"
+        );
+    }
+
+    #[test]
+    fn events_that_only_restate_a_seed_keep_it_quiet() {
+        let mut tracker = AgentTracker::new();
+        let last_activity = now_ms() - 60_000;
+        tracker.apply_seed_event(seed("T-old", last_activity, Some("%1")));
+
+        let mut restated = seed("T-old", last_activity, None);
+        restated.thread_name = Some("Named later".to_string());
+        tracker.apply_event(restated);
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].unseen, None);
+        assert_eq!(agents[0].pane_id.as_deref(), Some("%1"));
+        assert_eq!(agents[0].thread_name.as_deref(), Some("Named later"));
+        assert!(!tracker.is_unseen("work"));
+        assert!(
+            tracker.release_seeds_with_newer_activity("amp", "T-old", last_activity + 1),
+            "the row is still a seed"
         );
     }
 
