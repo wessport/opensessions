@@ -300,26 +300,42 @@ impl TmuxClient {
     }
 
     pub fn resize_pane_widths(&self, targets: &[String], width: u16) {
-        if targets.is_empty() {
-            return;
+        let mut pending = targets.to_vec();
+        for attempt in 1..=SIDEBAR_REPAIR_ATTEMPTS {
+            if pending.is_empty() {
+                return;
+            }
+            // List layouts in the same call so each one matches its pane widths.
+            let format = format!("{}{SEP}#{{window_layout}}", pane_format());
+            let output = self.run(&["list-panes", "-a", "-F", &format]).stdout;
+            let panes = parse_panes(&output);
+            let layouts = output
+                .lines()
+                .filter_map(|line| {
+                    let parts = split(line);
+                    Some((parts.get(2)?.to_string(), parts.get(15)?.to_string()))
+                })
+                .collect::<HashMap<_, _>>();
+            let script = pending
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    let stale_layout = if attempt == SIDEBAR_REPAIR_ATTEMPTS {
+                        StaleLayoutRepair::SidebarOnly
+                    } else {
+                        StaleLayoutRepair::Report(index)
+                    };
+                    sidebar_width_repair_script(&panes, &layouts, target, width, stale_layout)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let stdout = self.run(&["run-shell", &script]).stdout;
+            pending = stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix(STALE_LAYOUT_MARKER)?.parse().ok())
+                .filter_map(|index: usize| pending.get(index).cloned())
+                .collect();
         }
-        let panes = self.list_panes(PaneScope::All);
-        let mut repairs = Vec::new();
-        for target in targets {
-            repairs.push((target.clone(), width));
-            repairs.extend(flat_content_width_repairs(&panes, target, width));
-        }
-        let script = repairs
-            .iter()
-            .map(|(target, width)| {
-                format!(
-                    "tmux resize-pane -t {} -x {width} >/dev/null 2>&1 || true",
-                    shell_quote(target)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        self.run(&["run-shell", &script]);
     }
 
     pub fn set_window_remain_on_exit(&self, target: &str, enabled: bool) {
@@ -1203,6 +1219,80 @@ fn pane_format() -> &'static str {
     "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
 }
 
+/// Proportional repairs whose window layout changed after listing are retried
+/// with a fresh listing; the last attempt falls back to a sidebar-only resize
+/// so Fixed Sidebar Width still wins under continuous layout churn.
+const SIDEBAR_REPAIR_ATTEMPTS: usize = 3;
+const STALE_LAYOUT_MARKER: &str = "opensessions-stale-layout:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleLayoutRepair {
+    /// Leave the window untouched and print the sidebar's position in this
+    /// pass for another attempt. Positions rather than pane ids are printed
+    /// because `display-message` expands `%` sequences.
+    Report(usize),
+    /// Restore only the sidebar width.
+    SidebarOnly,
+}
+
+/// Builds one sidebar's repair command for the global `run-shell` script.
+///
+/// Content-pane widths are absolute values computed from `panes`. Applying
+/// them after the window changed (for example, a stale session expanding on
+/// return) gives the reclaimed space to one content pane, and so does a
+/// sidebar-only resize computed before the change; once the sidebar is
+/// correct, no later pass restores the content proportions. The sidebar and
+/// content resizes therefore run as one atomic tmux command guarded by the
+/// window layout listed with `panes`.
+fn sidebar_width_repair_script(
+    panes: &[PaneInfo],
+    layouts: &HashMap<String, String>,
+    sidebar_id: &str,
+    width: u16,
+    stale_layout: StaleLayoutRepair,
+) -> String {
+    let resize =
+        |pane: &str, width: u16| format!("resize-pane -t {} -x {width}", shell_quote(pane));
+    let content = flat_content_width_repairs(panes, sidebar_id, width);
+    // Guard even when no content repair is needed: a sidebar-only resize
+    // applied after the window changed would also skew the content panes.
+    let layout = panes
+        .iter()
+        .find(|pane| pane.id == sidebar_id)
+        .and_then(|sidebar| layouts.get(&sidebar.window_id));
+    let Some(layout) = layout else {
+        return format!("tmux {} >/dev/null 2>&1 || true", resize(sidebar_id, width));
+    };
+    let guarded = std::iter::once(resize(sidebar_id, width))
+        .chain(content.iter().map(|(pane, width)| resize(pane, *width)))
+        .collect::<Vec<_>>()
+        .join(" ; ");
+    // Only the retry marker may reach stdout; `resize_pane_widths` parses it.
+    let (otherwise, stdout) = match stale_layout {
+        StaleLayoutRepair::Report(index) => (
+            format!("display-message -p {STALE_LAYOUT_MARKER}{index}"),
+            "",
+        ),
+        StaleLayoutRepair::SidebarOnly => (resize(sidebar_id, width), " >/dev/null"),
+    };
+    format!(
+        "tmux if-shell -F -t {} {} {} {}{stdout} 2>/dev/null || true",
+        shell_quote(sidebar_id),
+        shell_quote(&window_layout_guard(layout)),
+        shell_quote(&guarded),
+        shell_quote(&otherwise),
+    )
+}
+
+/// An `if-shell -F` condition that holds while the window still has `layout`.
+///
+/// `run-shell` format-expands its script first, so `##` reaches `if-shell` as
+/// `#`; the layout's `,` and `}` are escaped as `#,` and `#}` for that pass.
+fn window_layout_guard(layout: &str) -> String {
+    let escaped = layout.replace(',', "##,").replace('}', "##}");
+    format!("##{{==:##{{window_layout}},{escaped}}}")
+}
+
 fn flat_content_width_repairs(
     panes: &[PaneInfo],
     sidebar_id: &str,
@@ -1845,13 +1935,63 @@ mod tests {
                     "list-panes".to_string(),
                     "-a".to_string(),
                     "-F".to_string(),
-                    pane_format().to_string(),
+                    format!("{}\t#{{window_layout}}", pane_format()),
                 ],
                 vec![
                     "run-shell".to_string(),
                     "tmux resize-pane -t '%1' -x 36 >/dev/null 2>&1 || true; tmux resize-pane -t '%2' -x 36 >/dev/null 2>&1 || true".to_string(),
                 ],
             ],
+        );
+    }
+
+    #[test]
+    fn proportional_sidebar_repair_is_guarded_by_the_listed_window_layout() {
+        let panes = parse_panes(concat!(
+            "%1\tproject\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\topensessions\topensessions-sidebar\t53\t39\t0\t52\n",
+            "%2\tproject\t@1\t0\t1\t1\t/dev/ttys2\t11\t/tmp\tamp\tAgent 1\t53\t39\t54\t106\n",
+            "%3\tproject\t@1\t0\t2\t0\t/dev/ttys3\t12\t/tmp\tamp\tAgent 2\t52\t39\t107\t158",
+        ));
+        let layouts = HashMap::from([(
+            "@1".to_string(),
+            "a1b2,159x39,0,0{53x39,0,0,1,53x39,54,0,2,52x39,107,0,3}".to_string(),
+        )]);
+
+        let guard = "'##{==:##{window_layout},a1b2##,159x39##,0##,0{53x39##,0##,0##,1##,53x39##,54##,0##,2##,52x39##,107##,0##,3##}}'";
+        let guarded = r"'resize-pane -t '\''%1'\'' -x 36 ; resize-pane -t '\''%2'\'' -x 62'";
+        assert_eq!(
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Report(4)),
+            format!(
+                "tmux if-shell -F -t '%1' {guard} {guarded} {} 2>/dev/null || true",
+                "'display-message -p opensessions-stale-layout:4'",
+            ),
+        );
+        assert_eq!(
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::SidebarOnly),
+            format!(
+                "tmux if-shell -F -t '%1' {guard} {guarded} {} >/dev/null 2>/dev/null || true",
+                r"'resize-pane -t '\''%1'\'' -x 36'",
+            ),
+        );
+
+        // An already-correct sidebar is guarded too, so its no-op resize
+        // cannot shrink a neighbor after the window changes size.
+        let panes = parse_panes(concat!(
+            "%1\tproject\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\topensessions\topensessions-sidebar\t36\t39\t0\t35\n",
+            "%2\tproject\t@1\t0\t1\t1\t/dev/ttys2\t11\t/tmp\tamp\tAgent 1\t123\t39\t37\t159",
+        ));
+        let layouts = HashMap::from([(
+            "@1".to_string(),
+            "c3d4,160x39,0,0{36x39,0,0,1,123x39,37,0,2}".to_string(),
+        )]);
+        assert_eq!(
+            sidebar_width_repair_script(&panes, &layouts, "%1", 36, StaleLayoutRepair::Report(0)),
+            concat!(
+                "tmux if-shell -F -t '%1' ",
+                "'##{==:##{window_layout},c3d4##,160x39##,0##,0{36x39##,0##,0##,1##,123x39##,37##,0##,2##}}' ",
+                r"'resize-pane -t '\''%1'\'' -x 36' ",
+                "'display-message -p opensessions-stale-layout:0' 2>/dev/null || true",
+            ),
         );
     }
 
