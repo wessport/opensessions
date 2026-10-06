@@ -130,6 +130,10 @@ release_start_lock() {
   rm -rf "$START_LOCK_DIR"
 }
 
+# Set to 1 when ensure_server launched a new server generation. A fresh server
+# restores the user's last recorded sidebar visibility during startup.
+SERVER_STARTED=0
+
 ensure_server() {
   unset OPENSESSIONS_WIDTH
 
@@ -169,6 +173,7 @@ ensure_server() {
   while [ "$attempt" -lt 30 ]; do
     sleep 0.1
     if server_alive; then
+      SERVER_STARTED=1
       release_start_lock
       return 0
     fi
@@ -179,6 +184,7 @@ ensure_server() {
   # child bind attempt. Treat a healthy endpoint as success; never surface an
   # "address already in use" startup failure when the server is actually up.
   if server_alive; then
+    SERVER_STARTED=1
     release_start_lock
     return 0
   fi

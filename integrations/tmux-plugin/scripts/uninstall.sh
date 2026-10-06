@@ -79,6 +79,9 @@ for key in $INDEX_KEYS; do
 done
 echo "  ✓ removed keybindings"
 
+# --- Remove recorded sidebar visibility ---
+tmux set-option -gu @opensessions_sidebar_visible 2>/dev/null || true
+
 # --- Remove environment variables ---
 tmux set-environment -gu OPENSESSIONS_DIR 2>/dev/null || true
 tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true

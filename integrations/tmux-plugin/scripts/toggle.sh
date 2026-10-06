@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ensure_server || exit 0
 
+# A server that was just started has already restored the user's last visible
+# choice. Toggling now would immediately hide the sidebars being asked for.
+if [ "$SERVER_STARTED" = 1 ] && tmux list-panes -a -F '#{pane_title}' 2>/dev/null | grep -q '^opensessions-sidebar$'; then
+  tmux switch-client -T root >/dev/null 2>&1
+  exit 0
+fi
+
 CTX=$(tmux display-message -p '#{client_tty}|#{session_name}|#{window_id}|#{pane_id}|#{pane_active}' 2>/dev/null)
 curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H "Authorization: Bearer $(auth_token)" -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"
 tmux switch-client -T root >/dev/null 2>&1

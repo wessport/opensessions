@@ -48,6 +48,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 
 - Global hooks for session changes, window selection, window creation, resize, and refresh
 - Sidebar stash session named `_os_stash` so hidden sidebars can be restored
+- Shown/hidden sidebar choice recorded per tmux server (`@opensessions_sidebar_visible`) and restored when the opensessions server restarts
 - Session creation popup using the bundled `sessionizer.sh` script
 
 ## Keyboard Shortcuts

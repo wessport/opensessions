@@ -1179,6 +1179,65 @@ fn tmux_sidebar_state_is_isolated_per_tmux_socket() {
         lab_a.port, lab_b.port,
         "isolated servers must use distinct ports"
     );
+
+    post_hook(lab_a.port, "/toggle", &lab_a.auth_token());
+    lab_a.wait_for_no_sidebar_processes();
+    assert_eq!(lab_a.sidebar_visibility_option(), "off");
+    assert_eq!(
+        lab_b.sidebar_visibility_option(),
+        "on",
+        "hiding the sidebar in one tmux server must not record it for another"
+    );
+    assert_eq!(lab_b.sidebar_panes().len(), SIDEBAR_SESSIONS.len());
+}
+
+#[test]
+fn tmux_sidebar_restarted_server_restores_visible_sidebars() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-restore-visible");
+    assert_eq!(lab.sidebar_visibility_option(), "on");
+
+    lab.terminate_server();
+    assert_eq!(
+        lab.sidebar_visibility_option(),
+        "on",
+        "server shutdown must not record the sidebar as hidden"
+    );
+
+    lab.start_server();
+    lab.post_ensure_sidebar("opensessions");
+
+    lab.wait_for_sidebar_pane_count(SIDEBAR_SESSIONS.len());
+    lab.wait_for_sidebar_connections();
+    let sessions = lab
+        .sidebar_panes()
+        .into_iter()
+        .map(|pane| pane.session)
+        .collect::<std::collections::HashSet<_>>();
+    for session in SIDEBAR_SESSIONS {
+        assert!(
+            sessions.contains(*session),
+            "restored server must respawn the sidebar in {session}; sidebars={sessions:?}"
+        );
+    }
+}
+
+#[test]
+fn tmux_sidebar_restarted_server_keeps_hidden_sidebar_hidden() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-restore-hidden");
+    post_hook(lab.port, "/toggle", &lab.auth_token());
+    lab.wait_for_no_sidebar_processes();
+    assert_eq!(lab.sidebar_visibility_option(), "off");
+
+    lab.terminate_server();
+    lab.start_server();
+    lab.post_ensure_sidebar("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    sleep(Duration::from_millis(800));
+
+    lab.assert_no_sidebar_panes("hidden sidebar must stay hidden after a server restart");
+    assert_eq!(lab.sidebar_visibility_option(), "off");
 }
 
 #[test]
@@ -2042,6 +2101,8 @@ for _ in range(3000):
         self.wait_for_server();
     }
 
+    /// Quit and start a new server generation. Sidebars were visible, so the
+    /// new server restores them on its own; toggling here would hide them.
     fn restart_server(&mut self) {
         if self.server_is_running() {
             post_hook(self.port, "/quit", &self.auth_token());
@@ -2049,7 +2110,45 @@ for _ in range(3000):
         }
         self.wait_for_no_sidebar_processes();
         self.start_server();
-        self.spawn_sidebars();
+        self.wait_for_sidebar_pane_count(SIDEBAR_SESSIONS.len());
+        self.wait_for_sidebar_connections();
+    }
+
+    fn terminate_server(&mut self) {
+        let server_pid = self
+            .server
+            .as_ref()
+            .expect("server process")
+            .id()
+            .to_string();
+        let status = Command::new("kill")
+            .args(["-TERM", &server_pid])
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success());
+        self.wait_for_server_exit();
+        self.wait_for_no_sidebar_processes();
+    }
+
+    fn post_ensure_sidebar(&self, session: &str) {
+        let context = self.tmux([
+            "display-message",
+            "-p",
+            "-t",
+            &exact_session_target(session),
+            "#{client_tty}|#{session_name}|#{window_id}|#{pane_id}|#{pane_active}",
+        ]);
+        post_body(
+            self.port,
+            "/ensure-sidebar",
+            "text/plain",
+            &context,
+            &self.auth_token(),
+        );
+    }
+
+    fn sidebar_visibility_option(&self) -> String {
+        self.tmux(["show-option", "-gqv", "@opensessions_sidebar_visible"])
     }
 
     fn wait_for_server(&self) {

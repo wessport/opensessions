@@ -12,7 +12,9 @@ The intended test surface is product E2E only: each test creates real fake git r
 | Explicit foreground sidebar resize persists once and fans out to every managed sidebar pane in the tmux server. | `tmux_sidebar_width_resize_fans_out_to_every_session_sidebar` |
 | `q` in a connected sidebar shuts down the server and every connected sidebar client. | `tmux_sidebar_quit_closes_the_server_and_every_sidebar_client` |
 | Two attached tmux clients can keep independent active rows instead of a global server focus row overriding every sidebar. | `tmux_sidebar_multiple_clients_keep_independent_active_rows` |
-| Two different tmux sockets have isolated ports, servers, width state, and sidebar state. | `tmux_sidebar_state_is_isolated_per_tmux_socket` |
+| Two different tmux sockets have isolated ports, servers, width state, and sidebar state, including recorded sidebar visibility. | `tmux_sidebar_state_is_isolated_per_tmux_socket` |
+| A restarted server restores visible sidebars in every window, and shutdown does not record the sidebar as hidden. | `tmux_sidebar_restarted_server_restores_visible_sidebars` |
+| A sidebar hidden by toggle stays hidden across a server restart, ensure requests, and session switches. | `tmux_sidebar_restarted_server_keeps_hidden_sidebar_hidden` |
 | `q` in a normal/main tmux pane does not quit opensessions. | `tmux_sidebar_q_in_main_pane_does_not_quit_opensessions` |
 | Pane topology repair must not let tmux permanently donate freed space to the sidebar. | `tmux_sidebar_pane_exit_does_not_steal_sidebar_width` |
 | Resizing and immediately switching sessions preserves the latest drag-owned width through handoff. | `tmux_sidebar_resize_immediately_before_switch_survives_handoff` |

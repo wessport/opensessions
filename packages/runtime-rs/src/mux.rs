@@ -116,6 +116,15 @@ pub trait MuxProvider: Send + Sync {
     fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str);
     fn cleanup_hooks(&self);
     fn set_sidebar_width_hint(&self, _width: u16) {}
+    /// The user's last explicit sidebar show/hide choice, stored in the mux
+    /// namespace so a restarted opensessions server can restore it. `None`
+    /// means no choice has been recorded for this mux server yet.
+    fn sidebar_visibility_preference(&self) -> Option<bool> {
+        None
+    }
+    /// Records an explicit show/hide choice. Shutdown paths must not call
+    /// this: stopping the server is not a user choice to hide the sidebar.
+    fn set_sidebar_visibility_preference(&self, _visible: bool) {}
     fn is_sidebar_mouse_resize_active(&self, _window_id: &str) -> bool {
         false
     }
