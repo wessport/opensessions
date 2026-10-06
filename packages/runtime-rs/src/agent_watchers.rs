@@ -89,6 +89,21 @@ pub fn amp_snapshot_from_log_jsonl(
     })
 }
 
+/// The Amp process that last wrote a thread log. Every Amp log line carries
+/// the writer's `pid` (as a string or number), which lets the server route a
+/// thread to the pane running that process without guessing from titles.
+pub fn amp_log_pid(raw: &str) -> Option<u32> {
+    raw.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|entry| match entry.get("pid")? {
+            Value::String(pid) => pid.parse::<u32>().ok(),
+            Value::Number(pid) => pid.as_u64().and_then(|pid| u32::try_from(pid).ok()),
+            _ => None,
+        })
+}
+
 pub fn claude_code_snapshot_from_jsonl(
     thread_id: &str,
     project_dir: &str,
@@ -764,6 +779,16 @@ mod tests {
         let snapshot = amp_snapshot_from_log_jsonl("thread", &done, 2_000).expect("snapshot");
         assert_eq!(snapshot.project_dir.as_deref(), Some("/repo"));
         assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn amp_log_pid_reads_the_latest_writer_process() {
+        let raw = r#"{"type":"agent_state","subtype":"idle","pid":"111"}
+{"message":"websocket message","pid":222}
+not json
+"#;
+        assert_eq!(amp_log_pid(raw), Some(222));
+        assert_eq!(amp_log_pid(r#"{"type":"agent_state"}"#), None);
     }
 
     #[test]

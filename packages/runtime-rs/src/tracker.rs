@@ -34,6 +34,9 @@ pub struct AgentTracker {
     instances: HashMap<String, HashMap<String, AgentEvent>>,
     event_timestamps: HashMap<String, Vec<u64>>,
     unseen_instances: HashSet<String>,
+    /// Rows restored from durable agent state at startup rather than from a
+    /// live event. Keys use the same `session\0instance` shape as unseen.
+    seeded_instances: HashSet<String>,
     active: HashSet<String>,
 }
 
@@ -43,11 +46,69 @@ impl AgentTracker {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
-        self.apply_event_with_options(&mut event, false);
+        self.apply_event_with_options(&mut event);
     }
 
-    pub fn apply_seed_event(&mut self, mut event: AgentEvent) {
-        self.apply_event_with_options(&mut event, true);
+    /// Restores an agent from durable state (for example its transcript)
+    /// after a server restart, keeping the agent's real last-activity time so
+    /// idle clocks survive restarts. A seed never replaces a row the tracker
+    /// already has, never claims a pane another row holds, is never unseen,
+    /// and is replaced by the next live event for that agent.
+    pub fn apply_seed_event(&mut self, mut event: AgentEvent) -> bool {
+        event.ts = event.ts.min(now_ms());
+        event.unseen = None;
+        let key = instance_key(&event.agent, event.thread_id.as_deref());
+        let conflicts = self.instances.get(&event.session).is_some_and(|instances| {
+            instances.iter().any(|(existing_key, existing)| {
+                *existing_key == key
+                    || match event.pane_id.as_deref() {
+                        Some(pane_id) => existing.pane_id.as_deref() == Some(pane_id),
+                        None => existing.agent == event.agent,
+                    }
+            })
+        });
+        if conflicts {
+            return false;
+        }
+        self.seeded_instances
+            .insert(self.unseen_key(&event.session, &key));
+        self.instances
+            .entry(event.session.clone())
+            .or_default()
+            .insert(key, event);
+        true
+    }
+
+    /// Drops seeded rows for `agent`/`thread_id` once their source shows
+    /// activity newer than the seed, so a restored idle clock can never
+    /// outlive real activity the live watchers could not attribute.
+    pub fn release_seeds_with_newer_activity(
+        &mut self,
+        agent: &str,
+        thread_id: &str,
+        activity_ts: u64,
+    ) -> bool {
+        let key = instance_key(agent, Some(thread_id));
+        let sessions = self
+            .instances
+            .iter()
+            .filter(|(session, instances)| {
+                self.is_seeded(session, &key)
+                    && instances.get(&key).is_some_and(|event| {
+                        let settled_ts = if event.status == AgentStatus::Hibernated {
+                            event.ts.saturating_add(HIBERNATE_SETTLE_MS)
+                        } else {
+                            event.ts
+                        };
+                        activity_ts > settled_ts
+                    })
+            })
+            .map(|(session, _)| session.clone())
+            .collect::<Vec<_>>();
+        for session in &sessions {
+            self.remove_instance(session, &key);
+        }
+        !sessions.is_empty()
     }
 
     pub fn get_state(&self, session: &str) -> Option<AgentEvent> {
@@ -121,6 +182,18 @@ impl AgentTracker {
         for (old_key, new_key) in renamed_unseen {
             self.unseen_instances.remove(&old_key);
             self.unseen_instances.insert(new_key);
+        }
+        let renamed_seeds = self
+            .seeded_instances
+            .iter()
+            .filter_map(|key| {
+                key.strip_prefix(&old_prefix)
+                    .map(|suffix| (key.clone(), format!("{new_name}\0{suffix}")))
+            })
+            .collect::<Vec<_>>();
+        for (old_key, new_key) in renamed_seeds {
+            self.seeded_instances.remove(&old_key);
+            self.seeded_instances.insert(new_key);
         }
         if self.active.remove(session) {
             self.active.insert(new_name.to_string());
@@ -740,7 +813,7 @@ impl AgentTracker {
             .unwrap_or_default()
     }
 
-    fn apply_event_with_options(&mut self, event: &mut AgentEvent, _seed: bool) {
+    fn apply_event_with_options(&mut self, event: &mut AgentEvent) {
         event.ts = event.ts.min(now_ms());
         let key = instance_key(&event.agent, event.thread_id.as_deref());
         if self
@@ -755,6 +828,7 @@ impl AgentTracker {
         {
             return;
         }
+        self.supersede_seeds(event, &key);
         let mut removed_unseen_keys = Vec::new();
         if is_terminal_status(event.status) {
             event.unseen = Some(true);
@@ -931,6 +1005,37 @@ impl AgentTracker {
             .remove(&self.unseen_key(session, &synthetic_key));
     }
 
+    /// A live event is authoritative over seeds for the same agent in its
+    /// session, except seeds bound to a different, known pane.
+    fn supersede_seeds(&mut self, event: &AgentEvent, key: &str) {
+        self.seeded_instances
+            .remove(&self.unseen_key(&event.session, key));
+        let Some(session_instances) = self.instances.get(&event.session) else {
+            return;
+        };
+        let superseded = session_instances
+            .iter()
+            .filter(|(seed_key, seed)| {
+                *seed_key != key
+                    && seed.agent == event.agent
+                    && self.is_seeded(&event.session, seed_key)
+                    && !matches!(
+                        (event.pane_id.as_deref(), seed.pane_id.as_deref()),
+                        (Some(event_pane), Some(seed_pane)) if event_pane != seed_pane
+                    )
+            })
+            .map(|(seed_key, _)| seed_key.clone())
+            .collect::<Vec<_>>();
+        for seed_key in superseded {
+            self.remove_instance(&event.session, &seed_key);
+        }
+    }
+
+    fn is_seeded(&self, session: &str, key: &str) -> bool {
+        self.seeded_instances
+            .contains(&self.unseen_key(session, key))
+    }
+
     fn remove_instance(&mut self, session: &str, key: &str) -> bool {
         let removed = self
             .instances
@@ -938,11 +1043,13 @@ impl AgentTracker {
             .is_some_and(|instances| instances.remove(key).is_some());
         if removed {
             self.unseen_instances.remove(&self.unseen_key(session, key));
+            self.seeded_instances.remove(&self.unseen_key(session, key));
         }
         removed
     }
 
     fn stamp_alive(&mut self, session: &str, key: &str, pane_id: &str) -> bool {
+        let seeded = self.is_seeded(session, key);
         let Some(event) = self
             .instances
             .get_mut(session)
@@ -953,6 +1060,17 @@ impl AgentTracker {
         // A hibernated agent's pane may still look like an agent pane (its
         // title survives the stopped process). Only a new event resumes it.
         if event.status == AgentStatus::Hibernated {
+            return false;
+        }
+        // Pane-bound seeds were matched to their exact pane through the
+        // agent's own process, so title heuristics must not move them.
+        if event.liveness == Some(AgentLiveness::Alive)
+            && event
+                .pane_id
+                .as_deref()
+                .is_some_and(|bound| bound != pane_id)
+            && seeded
+        {
             return false;
         }
 
@@ -1734,5 +1852,154 @@ mod tests {
         tracker.apply_event(done);
 
         assert_eq!(tracker.get_agents("work")[0].status, AgentStatus::Done);
+    }
+
+    const TWO_DAYS_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+
+    fn seed(thread_id: &str, ts: u64, pane_id: Option<&str>) -> AgentEvent {
+        let mut seed = terminal_event("amp", "work", Some(thread_id), None, pane_id);
+        seed.ts = ts;
+        seed
+    }
+
+    #[test]
+    fn seeded_agent_keeps_its_real_last_activity_without_becoming_unseen() {
+        let mut tracker = AgentTracker::new();
+        let now = now_ms();
+        let last_activity = now - TWO_DAYS_MS;
+
+        assert!(tracker.apply_seed_event(seed("T-old", last_activity, Some("%1"))));
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].ts, last_activity);
+        assert_eq!(agents[0].unseen, None);
+        assert!(!tracker.is_unseen("work"));
+        assert!(tracker.get_event_timestamps("work").is_empty());
+        assert_eq!(candidate_threads(&tracker, now), vec!["T-old".to_string()]);
+    }
+
+    #[test]
+    fn seeds_never_replace_agents_the_tracker_already_knows() {
+        let mut tracker = AgentTracker::new();
+        let mut live = event("amp", "work", Some("T-live"), None);
+        live.ts = now_ms();
+        tracker.apply_event(live);
+
+        assert!(!tracker.apply_seed_event(seed("T-live", 1_000, None)));
+        assert!(!tracker.apply_seed_event(seed("T-other", 1_000, None)));
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].thread_id.as_deref(), Some("T-live"));
+        assert_eq!(agents[0].status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn pane_bound_seeds_coexist_with_agents_in_other_panes() {
+        let mut tracker = AgentTracker::new();
+        assert!(tracker.apply_seed_event(seed("T-one", 1_000, Some("%1"))));
+        assert!(tracker.apply_seed_event(seed("T-two", 1_000, Some("%2"))));
+        assert!(!tracker.apply_seed_event(seed("T-three", 1_000, Some("%2"))));
+        assert!(!tracker.apply_seed_event(seed("T-unbound", 1_000, None)));
+
+        assert_eq!(tracker.active_pane_ids("work"), vec!["%1", "%2"]);
+    }
+
+    #[test]
+    fn live_events_replace_matching_seeds() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_seed_event(seed("T-one", 1_000, Some("%1")));
+        tracker.apply_seed_event(seed("T-two", 1_000, Some("%2")));
+
+        let mut live = terminal_event("amp", "work", Some("T-new"), None, Some("%2"));
+        live.ts = now_ms();
+        tracker.apply_event(live);
+
+        let threads = tracker
+            .get_agents("work")
+            .into_iter()
+            .filter_map(|agent| agent.thread_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            threads,
+            BTreeSet::from(["T-new".to_string(), "T-one".to_string()]),
+            "a live event in %2 replaces only the seed bound to %2"
+        );
+
+        let mut unbound = event("amp", "work", Some("T-unbound"), None);
+        unbound.ts = now_ms();
+        tracker.apply_event(unbound);
+        assert!(
+            tracker
+                .get_agents("work")
+                .iter()
+                .all(|agent| agent.thread_id.as_deref() != Some("T-one")),
+            "a live event with an unknown pane supersedes every seed of that agent"
+        );
+    }
+
+    #[test]
+    fn newer_activity_on_a_seeded_thread_releases_the_seed() {
+        let mut tracker = AgentTracker::new();
+        let last_activity = now_ms() - TWO_DAYS_MS;
+        tracker.apply_seed_event(seed("T-old", last_activity, Some("%1")));
+
+        assert!(!tracker.release_seeds_with_newer_activity("amp", "T-old", last_activity));
+        assert!(!tracker.release_seeds_with_newer_activity("amp", "T-else", now_ms()));
+        assert_eq!(tracker.get_agents("work").len(), 1);
+
+        assert!(tracker.release_seeds_with_newer_activity("amp", "T-old", last_activity + 1));
+        assert!(tracker.get_agents("work").is_empty());
+        assert!(candidate_threads(&tracker, now_ms()).is_empty());
+    }
+
+    #[test]
+    fn activity_never_releases_rows_that_came_from_live_events() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-live", AgentStatus::Done, "%1"));
+
+        assert!(!tracker.release_seeds_with_newer_activity("amp", "T-live", now_ms()));
+        assert_eq!(tracker.get_agents("work").len(), 1);
+    }
+
+    #[test]
+    fn pane_presence_does_not_move_a_pane_bound_seed_to_another_pane() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_seed_event(seed("T-old", 1_000, Some("%1")));
+
+        tracker.apply_pane_presence(
+            "work",
+            vec![
+                PanePresenceInput {
+                    agent: "amp".to_string(),
+                    pane_id: "%1".to_string(),
+                    active: false,
+                    thread_id: None,
+                    thread_name: None,
+                },
+                PanePresenceInput {
+                    agent: "amp".to_string(),
+                    pane_id: "%2".to_string(),
+                    active: true,
+                    thread_id: None,
+                    thread_name: Some("Something else".to_string()),
+                },
+            ],
+        );
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents[0].pane_id.as_deref(), Some("%1"));
+        assert_eq!(agents[0].liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn renaming_a_session_keeps_seeds_supersedable() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_seed_event(seed("T-old", 1_000, Some("%1")));
+        tracker.rename_session("work", "renamed");
+
+        assert!(tracker.release_seeds_with_newer_activity("amp", "T-old", 2_000));
+        assert!(tracker.get_agents("renamed").is_empty());
     }
 }
