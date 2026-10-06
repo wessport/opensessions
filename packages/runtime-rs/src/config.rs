@@ -37,6 +37,80 @@ pub struct OpensessionsConfig {
     pub detail_panel_height: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_auto_hibernate"
+    )]
+    pub auto_hibernate: Option<AutoHibernateConfig>,
+}
+
+/// Default idle age before a live idle agent process is hibernated.
+pub const DEFAULT_AUTO_HIBERNATE_IDLE_AFTER_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// `autoHibernate` in `config.json`. Missing fields use defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoHibernateConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_after_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoHibernateSettings {
+    pub enabled: bool,
+    pub idle_after_ms: u64,
+}
+
+impl Default for AutoHibernateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_after_ms: DEFAULT_AUTO_HIBERNATE_IDLE_AFTER_MS,
+        }
+    }
+}
+
+impl OpensessionsConfig {
+    /// Auto-hibernation is enabled by default; only an explicit
+    /// `"enabled": false` turns it off.
+    pub fn auto_hibernate_settings(&self) -> AutoHibernateSettings {
+        let config = self.auto_hibernate.unwrap_or_default();
+        AutoHibernateSettings {
+            enabled: config.enabled != Some(false),
+            idle_after_ms: config
+                .idle_after_ms
+                .filter(|idle_after_ms| *idle_after_ms > 0)
+                .unwrap_or(DEFAULT_AUTO_HIBERNATE_IDLE_AFTER_MS),
+        }
+    }
+}
+
+/// Malformed `autoHibernate` values fall back to defaults instead of
+/// invalidating the rest of the user's config.
+fn deserialize_auto_hibernate<'de, D>(
+    deserializer: D,
+) -> Result<Option<AutoHibernateConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Value::Object(map) = value else {
+        return Ok(None);
+    };
+    Ok(Some(AutoHibernateConfig {
+        enabled: map.get("enabled").and_then(Value::as_bool),
+        idle_after_ms: map.get("idleAfterMs").and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|ms| ms.is_finite() && *ms > 0.0)
+                    .map(|ms| ms as u64)
+            })
+        }),
+    }))
 }
 
 pub fn config_path_from_home(home: &Path) -> PathBuf {
@@ -106,6 +180,7 @@ fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
     insert_option(&mut map, "keybinding", updates.keybinding);
     insert_option(&mut map, "detailPanelHeight", updates.detail_panel_height);
     insert_option(&mut map, "sessionFilter", updates.session_filter);
+    insert_option(&mut map, "autoHibernate", updates.auto_hibernate);
 
     map
 }
@@ -132,5 +207,61 @@ fn merge_value(dst: &mut Value, src: Value) {
             }
         }
         (dst, src) => *dst = src,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> OpensessionsConfig {
+        serde_json::from_str(raw).expect("config parses")
+    }
+
+    #[test]
+    fn auto_hibernate_is_enabled_for_six_hours_when_missing() {
+        assert_eq!(
+            parse("{}").auto_hibernate_settings(),
+            AutoHibernateSettings {
+                enabled: true,
+                idle_after_ms: 21_600_000,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_hibernate_honours_idle_override() {
+        let config = parse(r#"{"autoHibernate":{"idleAfterMs":60000}}"#);
+        assert_eq!(
+            config.auto_hibernate_settings(),
+            AutoHibernateSettings {
+                enabled: true,
+                idle_after_ms: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_hibernate_can_be_disabled() {
+        let config = parse(r#"{"autoHibernate":{"enabled":false}}"#);
+        assert!(!config.auto_hibernate_settings().enabled);
+    }
+
+    #[test]
+    fn malformed_auto_hibernate_uses_defaults_without_dropping_other_settings() {
+        let config =
+            parse(r#"{"sidebarWidth":40,"autoHibernate":{"enabled":"no","idleAfterMs":-5}}"#);
+        assert_eq!(config.sidebar_width, Some(40));
+        assert_eq!(
+            config.auto_hibernate_settings(),
+            AutoHibernateSettings::default()
+        );
+
+        let config = parse(r#"{"autoHibernate":true,"sidebarWidth":40}"#);
+        assert_eq!(config.sidebar_width, Some(40));
+        assert_eq!(
+            config.auto_hibernate_settings(),
+            AutoHibernateSettings::default()
+        );
     }
 }

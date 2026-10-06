@@ -5,6 +5,20 @@ use crate::protocol::{AgentEvent, AgentLiveness, AgentStatus};
 const MAX_EVENT_TIMESTAMPS: usize = 30;
 const TERMINAL_PRUNE_MS: u64 = 5 * 60 * 1000;
 const SYNTHETIC_PANE_MARKER: &str = ":pane:";
+/// Non-resuming events this soon after hibernation are side effects of
+/// stopping the agent (for example a transcript flush on SIGTERM), not the
+/// user resuming the thread, so they must not overwrite `hibernated`.
+pub const HIBERNATE_SETTLE_MS: u64 = 60_000;
+
+/// A live, idle agent whose process can be stopped to free memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HibernationCandidate {
+    pub session: String,
+    pub agent: String,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+    pub pane_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanePresenceInput {
@@ -285,6 +299,81 @@ impl AgentTracker {
         }
     }
 
+    /// Live agents with a known pane that have been quiet for longer than
+    /// `idle_after_ms`. Active work and sessions the user is looking at
+    /// (`protected_sessions` plus tracker-active sessions) are never returned.
+    pub fn find_hibernation_candidates(
+        &self,
+        now_ms: u64,
+        idle_after_ms: u64,
+        protected_sessions: &HashSet<String>,
+    ) -> Vec<HibernationCandidate> {
+        let mut candidates = self
+            .instances
+            .iter()
+            .filter(|(session, _)| {
+                !self.active.contains(*session) && !protected_sessions.contains(*session)
+            })
+            .flat_map(|(session, instances)| {
+                instances
+                    .iter()
+                    .filter(|(key, _)| !is_synthetic_pane_key(key))
+                    .map(move |(_, event)| (session, event))
+            })
+            .filter(|(_, event)| {
+                event.liveness == Some(AgentLiveness::Alive)
+                    && is_hibernatable_status(event.status)
+                    && now_ms.saturating_sub(event.ts) > idle_after_ms
+            })
+            .filter_map(|(session, event)| {
+                Some(HibernationCandidate {
+                    session: session.clone(),
+                    agent: event.agent.clone(),
+                    thread_id: event.thread_id.clone(),
+                    thread_name: event.thread_name.clone(),
+                    pane_id: event.pane_id.clone()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            (&a.session, &a.agent, &a.thread_id, &a.pane_id).cmp(&(
+                &b.session,
+                &b.agent,
+                &b.thread_id,
+                &b.pane_id,
+            ))
+        });
+        candidates
+    }
+
+    /// Records that the candidate's agent process was stopped. The row stays
+    /// visible (restorable) with no pane and exited liveness.
+    pub fn mark_hibernated(&mut self, candidate: &HibernationCandidate, ts: u64) -> bool {
+        let Some(session_instances) = self.instances.get_mut(&candidate.session) else {
+            return false;
+        };
+        let mut marked_keys = Vec::new();
+        for (key, event) in session_instances.iter_mut() {
+            if event.agent != candidate.agent
+                || event.thread_id != candidate.thread_id
+                || event.pane_id.as_deref() != Some(candidate.pane_id.as_str())
+            {
+                continue;
+            }
+            event.status = AgentStatus::Hibernated;
+            event.ts = ts;
+            event.liveness = Some(AgentLiveness::Exited);
+            event.pane_id = None;
+            event.unseen = None;
+            marked_keys.push(key.clone());
+        }
+        for key in &marked_keys {
+            self.unseen_instances
+                .remove(&self.unseen_key(&candidate.session, key));
+        }
+        !marked_keys.is_empty()
+    }
+
     pub fn is_unseen(&self, session: &str) -> bool {
         let Some(session_instances) = self.instances.get(session) else {
             return false;
@@ -534,10 +623,17 @@ impl AgentTracker {
                 .get(session)
                 .expect("session instances exist")
                 .iter()
-                .filter(|(key, event)| event.agent == pane.agent && !is_synthetic_pane_key(key))
+                .filter(|(key, event)| {
+                    event.agent == pane.agent
+                        && !is_synthetic_pane_key(key)
+                        && event.status != AgentStatus::Hibernated
+                })
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
 
+            // Hibernated rows still claim panes whose title names their thread
+            // (titles can outlive the stopped agent), so the pane is not
+            // attributed to another row. `stamp_alive` keeps them exited.
             let named_watcher_entries = self
                 .instances
                 .get(session)
@@ -647,6 +743,18 @@ impl AgentTracker {
     fn apply_event_with_options(&mut self, event: &mut AgentEvent, _seed: bool) {
         event.ts = event.ts.min(now_ms());
         let key = instance_key(&event.agent, event.thread_id.as_deref());
+        if self
+            .instances
+            .get(&event.session)
+            .and_then(|instances| instances.get(&key))
+            .is_some_and(|prev| {
+                prev.status == AgentStatus::Hibernated
+                    && !is_resuming_status(event.status)
+                    && event.ts <= prev.ts.saturating_add(HIBERNATE_SETTLE_MS)
+            })
+        {
+            return;
+        }
         let mut removed_unseen_keys = Vec::new();
         if is_terminal_status(event.status) {
             event.unseen = Some(true);
@@ -842,6 +950,11 @@ impl AgentTracker {
         else {
             return false;
         };
+        // A hibernated agent's pane may still look like an agent pane (its
+        // title survives the stopped process). Only a new event resumes it.
+        if event.status == AgentStatus::Hibernated {
+            return false;
+        }
 
         let was_different = event.pane_id.as_deref() != Some(pane_id)
             || event.liveness != Some(AgentLiveness::Alive);
@@ -880,6 +993,24 @@ fn is_terminal_status(status: AgentStatus) -> bool {
     )
 }
 
+fn is_hibernatable_status(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Idle
+            | AgentStatus::Done
+            | AgentStatus::Error
+            | AgentStatus::Interrupted
+            | AgentStatus::Stale
+    )
+}
+
+fn is_resuming_status(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
+    )
+}
+
 fn status_priority(status: AgentStatus) -> u8 {
     match status {
         AgentStatus::ToolRunning => 7,
@@ -889,7 +1020,7 @@ fn status_priority(status: AgentStatus) -> u8 {
         AgentStatus::Interrupted => 3,
         AgentStatus::Waiting => 2,
         AgentStatus::Done => 1,
-        AgentStatus::Idle => 0,
+        AgentStatus::Idle | AgentStatus::Hibernated => 0,
     }
 }
 
@@ -1365,5 +1496,243 @@ mod tests {
 
         assert!(tracker.is_unseen("work"));
         assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+    }
+
+    const IDLE_AFTER_MS: u64 = 6 * 60 * 60 * 1000;
+
+    fn live_event(
+        session: &str,
+        thread_id: &str,
+        status: AgentStatus,
+        pane_id: &str,
+    ) -> AgentEvent {
+        let mut live = event("amp", session, Some(thread_id), Some(thread_id));
+        live.status = status;
+        live.ts = 1_000;
+        live.pane_id = Some(pane_id.to_string());
+        live.liveness = Some(AgentLiveness::Alive);
+        live
+    }
+
+    fn candidate_threads(tracker: &AgentTracker, now: u64) -> Vec<String> {
+        tracker
+            .find_hibernation_candidates(now, IDLE_AFTER_MS, &HashSet::new())
+            .into_iter()
+            .filter_map(|candidate| candidate.thread_id)
+            .collect()
+    }
+
+    #[test]
+    fn hibernation_candidates_include_only_quiet_statuses() {
+        let mut tracker = AgentTracker::new();
+        let statuses = [
+            ("idle", AgentStatus::Idle, true),
+            ("done", AgentStatus::Done, true),
+            ("error", AgentStatus::Error, true),
+            ("interrupted", AgentStatus::Interrupted, true),
+            ("stale", AgentStatus::Stale, true),
+            ("running", AgentStatus::Running, false),
+            ("tool-running", AgentStatus::ToolRunning, false),
+            ("waiting", AgentStatus::Waiting, false),
+            ("hibernated", AgentStatus::Hibernated, false),
+        ];
+        for (index, (thread_id, status, _)) in statuses.iter().enumerate() {
+            tracker.apply_event(live_event("work", thread_id, *status, &format!("%{index}")));
+        }
+
+        let mut expected = statuses
+            .iter()
+            .filter(|(_, _, expected)| *expected)
+            .map(|(thread_id, _, _)| thread_id.to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            candidate_threads(&tracker, 1_000 + IDLE_AFTER_MS + 1),
+            expected
+        );
+    }
+
+    #[test]
+    fn hibernation_candidates_require_strictly_exceeding_the_idle_threshold() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-1", AgentStatus::Done, "%1"));
+
+        assert!(candidate_threads(&tracker, 1_000 + IDLE_AFTER_MS).is_empty());
+        assert_eq!(
+            candidate_threads(&tracker, 1_000 + IDLE_AFTER_MS + 1),
+            ["T-1"]
+        );
+    }
+
+    #[test]
+    fn hibernation_candidates_skip_agents_without_a_live_pane() {
+        let mut tracker = AgentTracker::new();
+        let mut no_pane = live_event("work", "no-pane", AgentStatus::Done, "%1");
+        no_pane.pane_id = None;
+        no_pane.liveness = None;
+        tracker.apply_event(no_pane);
+        let mut exited = live_event("work", "exited", AgentStatus::Done, "%2");
+        exited.liveness = Some(AgentLiveness::Exited);
+        tracker.apply_event(exited);
+
+        assert!(candidate_threads(&tracker, 1_000 + IDLE_AFTER_MS + 1).is_empty());
+    }
+
+    #[test]
+    fn hibernation_candidates_skip_protected_and_active_sessions() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("focused", "T-focused", AgentStatus::Done, "%1"));
+        tracker.apply_event(live_event("active", "T-active", AgentStatus::Done, "%2"));
+        tracker.apply_event(live_event("background", "T-bg", AgentStatus::Done, "%3"));
+        tracker.set_active_sessions(["active".to_string()]);
+
+        let candidates = tracker.find_hibernation_candidates(
+            1_000 + IDLE_AFTER_MS + 1,
+            IDLE_AFTER_MS,
+            &HashSet::from(["focused".to_string()]),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![HibernationCandidate {
+                session: "background".to_string(),
+                agent: "amp".to_string(),
+                thread_id: Some("T-bg".to_string()),
+                thread_name: Some("T-bg".to_string()),
+                pane_id: "%3".to_string(),
+            }]
+        );
+    }
+
+    fn hibernate_one(tracker: &mut AgentTracker, hibernated_at: u64) -> HibernationCandidate {
+        let candidate = tracker
+            .find_hibernation_candidates(1_000 + IDLE_AFTER_MS + 1, IDLE_AFTER_MS, &HashSet::new())
+            .pop()
+            .expect("candidate");
+        assert!(tracker.mark_hibernated(&candidate, hibernated_at));
+        candidate
+    }
+
+    #[test]
+    fn marking_hibernated_keeps_a_restorable_row_without_a_pane() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-1", AgentStatus::Done, "%1"));
+        assert!(tracker.is_unseen("work"));
+
+        let hibernated_at = now_ms() - 10 * 60 * 1000;
+        let candidate = hibernate_one(&mut tracker, hibernated_at);
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, AgentStatus::Hibernated);
+        assert_eq!(agents[0].liveness, Some(AgentLiveness::Exited));
+        assert_eq!(agents[0].pane_id, None);
+        assert_eq!(agents[0].thread_name.as_deref(), Some("T-1"));
+        assert_eq!(agents[0].ts, hibernated_at);
+        assert!(!tracker.is_unseen("work"));
+        assert!(!tracker.mark_hibernated(&candidate, hibernated_at));
+
+        // Neither pruning pass deletes the hibernated row, and it is not
+        // hibernated twice.
+        tracker.prune_terminal();
+        tracker.prune_stuck(1);
+        assert_eq!(
+            tracker.get_agents("work")[0].status,
+            AgentStatus::Hibernated
+        );
+        assert!(candidate_threads(&tracker, u64::MAX).is_empty());
+        assert!(tracker.active_pane_ids("work").is_empty());
+    }
+
+    #[test]
+    fn pane_title_left_by_a_hibernated_agent_does_not_revive_it() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-1", AgentStatus::Done, "%1"));
+        hibernate_one(&mut tracker, now_ms());
+
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%1".to_string(),
+                active: false,
+                thread_id: None,
+                thread_name: Some("T-1".to_string()),
+            }],
+        );
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%1".to_string(),
+                active: false,
+                thread_id: None,
+                thread_name: None,
+            }],
+        );
+
+        let agent = tracker.get_agents("work").pop().unwrap();
+        assert_eq!(agent.status, AgentStatus::Hibernated);
+        assert_eq!(agent.liveness, Some(AgentLiveness::Exited));
+        assert_eq!(agent.pane_id, None);
+    }
+
+    #[test]
+    fn shutdown_side_effect_events_do_not_overwrite_hibernated() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-1", AgentStatus::Done, "%1"));
+        let hibernated_at = now_ms();
+        hibernate_one(&mut tracker, hibernated_at);
+
+        let mut flushed = event("amp", "work", Some("T-1"), None);
+        flushed.status = AgentStatus::Interrupted;
+        flushed.ts = hibernated_at + 500;
+        tracker.apply_event(flushed);
+
+        let agent = tracker.get_agents("work").pop().unwrap();
+        assert_eq!(agent.status, AgentStatus::Hibernated);
+        assert!(!tracker.is_unseen("work"));
+    }
+
+    #[test]
+    fn resuming_the_thread_supersedes_hibernated() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-1", AgentStatus::Done, "%1"));
+        hibernate_one(&mut tracker, now_ms());
+
+        let mut resumed = event("amp", "work", Some("T-1"), None);
+        resumed.ts = now_ms();
+        tracker.apply_event(resumed);
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%1".to_string(),
+                active: false,
+                thread_id: None,
+                thread_name: Some("T-1".to_string()),
+            }],
+        );
+
+        let agent = tracker.get_agents("work").pop().unwrap();
+        assert_eq!(agent.status, AgentStatus::Running);
+        assert_eq!(agent.thread_name.as_deref(), Some("T-1"));
+        assert_eq!(agent.pane_id.as_deref(), Some("%1"));
+        assert_eq!(agent.liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn later_quiet_events_supersede_hibernated_after_settling() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-1", AgentStatus::Done, "%1"));
+        let hibernated_at = now_ms() - HIBERNATE_SETTLE_MS - 1_000;
+        hibernate_one(&mut tracker, hibernated_at);
+
+        let mut done = event("amp", "work", Some("T-1"), None);
+        done.status = AgentStatus::Done;
+        done.ts = now_ms();
+        tracker.apply_event(done);
+
+        assert_eq!(tracker.get_agents("work")[0].status, AgentStatus::Done);
     }
 }

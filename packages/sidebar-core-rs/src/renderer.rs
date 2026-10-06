@@ -849,6 +849,7 @@ fn build_session_name_row(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AgentVisualKind {
+    Hibernated,
     DoneSeen,
     DoneUnseen,
     Running,
@@ -948,6 +949,7 @@ fn agent_visual_kind(agent: &AgentEvent) -> AgentVisualKind {
         AgentStatus::Running => AgentVisualKind::Running,
         AgentStatus::Done if agent.unseen == Some(true) => AgentVisualKind::DoneUnseen,
         AgentStatus::Done | AgentStatus::Idle => AgentVisualKind::DoneSeen,
+        AgentStatus::Hibernated => AgentVisualKind::Hibernated,
     }
 }
 
@@ -964,6 +966,7 @@ fn agent_visual_for_kind(palette: &Palette, kind: AgentVisualKind, spinner_ts: u
         AgentVisualKind::Running => agent_spinner(spinner_ts).to_string(),
         AgentVisualKind::DoneUnseen => "●".to_string(),
         AgentVisualKind::DoneSeen => "✓".to_string(),
+        AgentVisualKind::Hibernated => "◌".to_string(),
     };
     let color = match kind {
         AgentVisualKind::Error => palette.red,
@@ -974,6 +977,7 @@ fn agent_visual_for_kind(palette: &Palette, kind: AgentVisualKind, spinner_ts: u
         AgentVisualKind::Running => palette.yellow,
         AgentVisualKind::DoneUnseen => palette.teal,
         AgentVisualKind::DoneSeen => palette.green,
+        AgentVisualKind::Hibernated => palette.overlay0,
     };
     let label = match kind {
         AgentVisualKind::Error => "error",
@@ -984,6 +988,7 @@ fn agent_visual_for_kind(palette: &Palette, kind: AgentVisualKind, spinner_ts: u
         AgentVisualKind::Running => "working",
         AgentVisualKind::DoneUnseen => "done",
         AgentVisualKind::DoneSeen => "idle",
+        AgentVisualKind::Hibernated => "hibernated",
     };
     AgentVisual {
         kind,
@@ -2273,7 +2278,7 @@ fn agent_attention_signal(agent: &AgentEvent) -> AttentionSignal {
         AgentStatus::ToolRunning => AttentionSignal::ToolWorking,
         AgentStatus::Running => AttentionSignal::Working,
         AgentStatus::Done => AttentionSignal::DoneSeen,
-        AgentStatus::Idle => AttentionSignal::Idle,
+        AgentStatus::Idle | AgentStatus::Hibernated => AttentionSignal::Idle,
     }
 }
 
@@ -3776,6 +3781,35 @@ mod tests {
         assert_has_line(&all_lines, " agents 2                            all");
         assert_has_line(&all_lines, "  ⚙ opensessions · Query tmux for op…");
         assert_has_line(&all_lines, "  ● plane · Review PR");
+    }
+
+    #[test]
+    fn hibernated_agents_stay_visible_with_a_muted_restorable_marker() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Hibernated, Some("Old thread")));
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 40, 24);
+        assert_has_line(&lines, "  ◌ Old thread");
+        assert_has_line(&lines, "    hibernated · amp");
+
+        let palette = palette_for_theme(app.theme.as_deref());
+        let model = build_model(&app, 40, 24);
+        let glyph_colors = model
+            .lines
+            .iter()
+            .flat_map(|line| line.parts.iter())
+            .filter(|part| part.text == "◌")
+            .map(|part| part.style.fg)
+            .collect::<Vec<_>>();
+        assert!(
+            glyph_colors.len() >= 2,
+            "session badge and agent row both show the marker"
+        );
+        assert!(glyph_colors.iter().all(|fg| *fg == palette.overlay0));
     }
 
     #[test]

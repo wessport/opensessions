@@ -22,10 +22,14 @@ use opensessions_runtime::agent_watchers::{
     parse_codex_session_index, pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::config::{
-    OpensessionsConfig, SidebarPosition as ConfigSidebarPosition, load_config_from_home,
-    save_config_to_home,
+    AutoHibernateSettings, OpensessionsConfig, SidebarPosition as ConfigSidebarPosition,
+    load_config_from_home, save_config_to_home,
 };
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
+use opensessions_runtime::hibernate::{
+    AgentProcessTarget, HIBERNATE_POLL_INTERVAL_MS, HIBERNATE_TERM_GRACE, ProcessControl,
+    SystemProcessControl, find_agent_process, terminate_agent_processes,
+};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
@@ -415,6 +419,8 @@ pub struct ReadOnlyMuxStateSource {
     agent_tracker: Mutex<AgentTracker>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     tmux_socket_path: Option<PathBuf>,
+    auto_hibernate: AutoHibernateSettings,
+    process_control: Arc<dyn ProcessControl>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -475,6 +481,9 @@ pub fn default_state_source_from_env(
         {
             source = source.with_transparent_background(transparent);
         }
+        if let Some(config) = config.as_ref() {
+            source = source.with_auto_hibernate(config.auto_hibernate_settings());
+        }
         if let Some(height) = config.and_then(|config| config.detail_panel_height) {
             source = source.with_detail_panel_height(height);
         }
@@ -511,6 +520,8 @@ impl ReadOnlyMuxStateSource {
             agent_tracker: Mutex::new(AgentTracker::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             tmux_socket_path: None,
+            auto_hibernate: AutoHibernateSettings::default(),
+            process_control: Arc::new(SystemProcessControl),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -661,6 +672,111 @@ impl ReadOnlyMuxStateSource {
     pub fn with_now_ms(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.now_ms = Arc::new(now_ms);
         self
+    }
+
+    pub fn with_auto_hibernate(mut self, settings: AutoHibernateSettings) -> Self {
+        self.auto_hibernate = settings;
+        self
+    }
+
+    pub fn with_process_control(mut self, control: Arc<dyn ProcessControl>) -> Self {
+        self.process_control = control;
+        self
+    }
+
+    /// Stops the agent process in panes whose agent has been idle longer
+    /// than the configured threshold, keeping each row as `hibernated`.
+    /// Status still comes from the tracker; panes are only used to find the
+    /// process to stop. Sessions and panes the user is looking at are skipped.
+    fn hibernate_idle_agent_panes(&self) -> bool {
+        if !self.auto_hibernate.enabled {
+            return false;
+        }
+        let mut protected_sessions = HashSet::new();
+        if let Some(session) = self.focused_session.lock().unwrap().clone() {
+            protected_sessions.insert(session);
+        }
+        for provider in &self.providers {
+            if let Some(session) = provider.get_current_session() {
+                protected_sessions.insert(session);
+            }
+        }
+        let candidates = self
+            .agent_tracker
+            .lock()
+            .unwrap()
+            .find_hibernation_candidates(
+                (self.now_ms)(),
+                self.auto_hibernate.idle_after_ms,
+                &protected_sessions,
+            );
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let process_table = self.process_control.process_table();
+        let mut targets = Vec::<AgentProcessTarget>::new();
+        let mut planned = Vec::new();
+        for candidate in candidates {
+            let Some(provider) = self.provider_for_session(&candidate.session) else {
+                continue;
+            };
+            if provider.client_tty_for_pane(&candidate.pane_id).is_some() {
+                continue;
+            }
+            let Some(pane_pid) = provider.get_pane_pid(&candidate.pane_id) else {
+                debug_log(format!(
+                    "auto-hibernate: pane missing session={} pane={} agent={}",
+                    candidate.session, candidate.pane_id, candidate.agent,
+                ));
+                continue;
+            };
+            let Some(target) = find_agent_process(pane_pid, &candidate.agent, &process_table)
+            else {
+                debug_log(format!(
+                    "auto-hibernate: no {} process under pane={} pid={pane_pid}",
+                    candidate.agent, candidate.pane_id,
+                ));
+                continue;
+            };
+            let index = targets
+                .iter()
+                .position(|existing| existing.pid == target.pid)
+                .unwrap_or_else(|| {
+                    targets.push(target);
+                    targets.len() - 1
+                });
+            planned.push((candidate, index));
+        }
+        if targets.is_empty() {
+            return false;
+        }
+
+        let outcomes = terminate_agent_processes(
+            self.process_control.as_ref(),
+            &targets,
+            HIBERNATE_TERM_GRACE,
+        );
+        let hibernated_at = (self.now_ms)();
+        let mut tracker = self.agent_tracker.lock().unwrap();
+        let mut changed = false;
+        for (candidate, index) in planned {
+            let outcome = outcomes[index];
+            debug_log(format!(
+                "auto-hibernate: session={} pane={} agent={} thread={:?} pid={} terminated={} escalated={}",
+                candidate.session,
+                candidate.pane_id,
+                candidate.agent,
+                candidate.thread_id,
+                outcome.pid,
+                outcome.terminated,
+                outcome.escalated,
+            ));
+            if outcome.terminated {
+                changed = tracker.mark_hibernated(&candidate, hibernated_at) || changed;
+            }
+        }
+        changed
     }
 
     pub fn with_port_command_runner(mut self, runner: Arc<dyn PortCommandRunner>) -> Self {
@@ -827,10 +943,17 @@ impl StateSource for ReadOnlyMuxStateSource {
             )),
             tokio::spawn(run_tmux_state_poll_loop(
                 self.clone(),
-                state_updates,
+                state_updates.clone(),
                 shutdown.clone(),
             )),
         ];
+        if self.auto_hibernate.enabled {
+            tasks.push(tokio::spawn(run_auto_hibernate_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )));
+        }
         if self.tmux_socket_path.is_some() {
             let liveness_source = self.clone();
             tasks.push(tokio::task::spawn_blocking(move || {
@@ -2164,6 +2287,42 @@ async fn run_sidebar_lifecycle_loop(
     }
 }
 
+/// Every few minutes, stop agent processes that have idled past the
+/// configured threshold so idle agents do not hold memory for weeks.
+async fn run_auto_hibernate_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+) {
+    let mut shutdown_rx = shutdown.subscribe();
+    let period = Duration::from_millis(HIBERNATE_POLL_INTERVAL_MS);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = interval.tick() => {
+                let hibernate_source = source.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    hibernate_source.hibernate_idle_agent_panes()
+                })
+                .await
+                .unwrap_or(false);
+                if changed {
+                    debug_log("auto_hibernate_loop: hibernated idle agents, broadcasting");
+                    let snapshot_source = source.clone();
+                    if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
+                        snapshot_source.snapshot_json()
+                    }).await {
+                        let _ = state_updates.send(snapshot);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn run_sidebar_width_repair_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     shutdown: broadcast::Sender<()>,
@@ -2894,6 +3053,7 @@ fn parse_agent_status(value: &str) -> Option<AgentStatus> {
         "waiting" => Some(AgentStatus::Waiting),
         "interrupted" => Some(AgentStatus::Interrupted),
         "stale" => Some(AgentStatus::Stale),
+        "hibernated" => Some(AgentStatus::Hibernated),
         _ => None,
     }
 }
@@ -4559,6 +4719,204 @@ mod tests {
             }
             None
         }
+    }
+
+    struct HibernateTestProvider;
+
+    impl MuxProvider for HibernateTestProvider {
+        fn name(&self) -> &str {
+            "hibernate-test"
+        }
+
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            ["focused", "background"]
+                .into_iter()
+                .map(|name| opensessions_runtime::mux::MuxSessionInfo {
+                    name: name.to_string(),
+                    created_at: 0,
+                    dir: String::new(),
+                    windows: 1,
+                })
+                .collect()
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("focused".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_pid(&self, pane_id: &str) -> Option<u32> {
+            match pane_id {
+                "%1" => Some(100),
+                "%2" => Some(200),
+                "%3" => Some(300),
+                "%visible" => Some(400),
+                _ => None,
+            }
+        }
+        fn client_tty_for_pane(&self, pane_id: &str) -> Option<String> {
+            (pane_id == "%visible").then(|| "/dev/ttys009".to_string())
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    /// Every process ignores SIGTERM, like Amp.
+    #[derive(Default)]
+    struct TermIgnoringProcesses {
+        signals: Mutex<Vec<(u32, opensessions_runtime::hibernate::Signal)>>,
+    }
+
+    impl ProcessControl for TermIgnoringProcesses {
+        fn process_table(&self) -> Vec<opensessions_runtime::hibernate::ProcessEntry> {
+            opensessions_runtime::hibernate::parse_process_table(
+                "100 1 -zsh\n\
+                 101 100 /Users/me/.amp/bin/amp threads continue T-bg\n\
+                 102 101 /Users/me/.amp/bin/amp run plugin-runtime.ts\n\
+                 200 1 -zsh\n\
+                 201 200 /Users/me/.amp/bin/amp\n\
+                 300 1 -zsh\n\
+                 301 300 vim notes.md\n\
+                 400 1 -zsh\n\
+                 401 400 /Users/me/.amp/bin/amp\n",
+            )
+        }
+
+        fn signal(&self, pid: u32, signal: opensessions_runtime::hibernate::Signal) -> bool {
+            self.signals.lock().unwrap().push((pid, signal));
+            true
+        }
+
+        fn sleep(&self, _duration: Duration) {}
+    }
+
+    const HIBERNATE_TEST_NOW: u64 = 1_000 + 6 * 60 * 60 * 1000 + 1;
+
+    fn hibernate_test_source(
+        settings: AutoHibernateSettings,
+    ) -> (ReadOnlyMuxStateSource, Arc<TermIgnoringProcesses>) {
+        let processes = Arc::new(TermIgnoringProcesses::default());
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(HibernateTestProvider)])
+            .with_auto_hibernate(settings)
+            .with_process_control(processes.clone())
+            .with_now_ms(|| HIBERNATE_TEST_NOW);
+        for (session, thread_id, status, pane_id) in [
+            ("background", "T-bg", "done", "%1"),
+            ("focused", "T-focused", "idle", "%2"),
+            ("background", "T-no-agent", "idle", "%3"),
+            ("background", "T-visible", "idle", "%visible"),
+            ("background", "T-working", "running", "%4"),
+        ] {
+            source
+                .apply_agent_event(&serde_json::json!({
+                    "agent": "amp",
+                    "tmuxSession": session,
+                    "threadId": thread_id,
+                    "threadName": thread_id,
+                    "status": status,
+                    "paneId": pane_id,
+                    "ts": 1_000,
+                }))
+                .expect("apply agent event");
+        }
+        (source, processes)
+    }
+
+    fn agent_status(source: &ReadOnlyMuxStateSource, session: &str, thread_id: &str) -> AgentEvent {
+        source
+            .agent_tracker
+            .lock()
+            .unwrap()
+            .get_agents(session)
+            .into_iter()
+            .find(|agent| agent.thread_id.as_deref() == Some(thread_id))
+            .expect("tracked agent")
+    }
+
+    #[test]
+    fn auto_hibernate_kills_only_the_idle_background_agent_process() {
+        use opensessions_runtime::hibernate::Signal;
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings::default());
+
+        assert!(source.hibernate_idle_agent_panes());
+
+        assert_eq!(
+            *processes.signals.lock().unwrap(),
+            vec![
+                (101, Signal::Term),
+                (101, Signal::Kill),
+                (102, Signal::Kill)
+            ],
+            "SIGTERM-ignoring agent is escalated; shells and other panes are untouched"
+        );
+        let hibernated = agent_status(&source, "background", "T-bg");
+        assert_eq!(hibernated.status, AgentStatus::Hibernated);
+        assert_eq!(hibernated.liveness, Some(AgentLiveness::Exited));
+        assert_eq!(hibernated.pane_id, None);
+        assert_eq!(hibernated.ts, HIBERNATE_TEST_NOW);
+        for (session, thread_id, status) in [
+            ("focused", "T-focused", AgentStatus::Idle),
+            ("background", "T-no-agent", AgentStatus::Idle),
+            ("background", "T-visible", AgentStatus::Idle),
+            ("background", "T-working", AgentStatus::Running),
+        ] {
+            assert_eq!(agent_status(&source, session, thread_id).status, status);
+        }
+
+        let snapshot = source.snapshot_json();
+        assert!(snapshot.contains(r#""status":"hibernated""#), "{snapshot}");
+
+        processes.signals.lock().unwrap().clear();
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_hibernate_does_nothing_when_disabled() {
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings {
+            enabled: false,
+            idle_after_ms: 1,
+        });
+
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+        assert_eq!(
+            agent_status(&source, "background", "T-bg").status,
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn auto_hibernate_waits_for_the_configured_idle_threshold() {
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings {
+            enabled: true,
+            idle_after_ms: HIBERNATE_TEST_NOW,
+        });
+
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hibernated_is_an_accepted_external_status() {
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(HibernateTestProvider)]);
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "my-agent",
+                "tmuxSession": "background",
+                "status": "hibernated",
+            }))
+            .expect("hibernated status accepted");
     }
 
     struct PortTestProvider;

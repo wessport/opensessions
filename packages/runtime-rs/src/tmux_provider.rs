@@ -712,6 +712,24 @@ impl MuxProvider for TmuxProvider {
             .collect()
     }
 
+    fn get_pane_pid(&self, pane_id: &str) -> Option<u32> {
+        if pane_id.is_empty() {
+            return None;
+        }
+        let output = self
+            .client
+            .run(&["display-message", "-t", pane_id, "-p", "#{pane_pid}"]);
+        if !output.ok() {
+            return None;
+        }
+        output
+            .stdout
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 1)
+    }
+
     fn get_pane_count(&self, name: &str) -> u32 {
         self.client.get_pane_count(name)
     }
@@ -1847,5 +1865,50 @@ mod tests {
             "-t".to_string(),
             "%3".to_string(),
         ]));
+    }
+
+    struct PanePidRunner {
+        output: CommandOutput,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CommandRunner for PanePidRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            self.output.clone()
+        }
+    }
+
+    fn pane_pid_provider(exit_code: i32, stdout: &str) -> (Arc<PanePidRunner>, TmuxProvider) {
+        let runner = Arc::new(PanePidRunner {
+            output: CommandOutput {
+                exit_code,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            },
+            calls: Mutex::new(Vec::new()),
+        });
+        (runner.clone(), TmuxProvider::new(runner))
+    }
+
+    #[test]
+    fn pane_pid_targets_the_exact_pane() {
+        let (runner, provider) = pane_pid_provider(0, "4242");
+
+        assert_eq!(provider.get_pane_pid("%7"), Some(4242));
+        assert_eq!(
+            runner.calls.lock().unwrap()[0],
+            ["display-message", "-t", "%7", "-p", "#{pane_pid}"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+    }
+
+    #[test]
+    fn pane_pid_is_unknown_for_missing_panes_or_bogus_output() {
+        assert_eq!(pane_pid_provider(1, "").1.get_pane_pid("%7"), None);
+        assert_eq!(pane_pid_provider(0, "").1.get_pane_pid("%7"), None);
+        assert_eq!(pane_pid_provider(0, "1").1.get_pane_pid("%7"), None);
+        assert_eq!(pane_pid_provider(0, "4242").1.get_pane_pid(""), None);
     }
 }

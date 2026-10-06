@@ -34,6 +34,29 @@ If the file does not exist, opensessions falls back to defaults.
 | `sidebarPosition` | `"left" | "right"` | `"left"` | active | Sidebar placement |
 | `port` | `number` | none | parsed only | Present in the config type; use `OPENSESSIONS_PORT`/tmux-scoped environment for runtime port overrides today |
 | `keybinding` | `string` | none | parsed only | Present in the config type, but keybindings are configured outside this file today |
+| `autoHibernate` | `{ "enabled"?: boolean, "idleAfterMs"?: number }` | `{ "enabled": true, "idleAfterMs": 21600000 }` | active | Stops idle agent processes to free memory; see below |
+
+## Auto-Hibernate
+
+Idle CLI agents keep hundreds of megabytes resident for as long as their tmux pane stays open. Every 5 minutes the server looks for live agents that have been `idle`, `done`, `error`, `interrupted`, or `stale` for longer than `idleAfterMs` (default 6 hours) and stops only the agent process inside that pane. It sends `SIGTERM`, then `SIGKILL` after one second if the agent ignores `SIGTERM` (Amp does). The pane, its shell, and the tmux session are never killed, and only agent-named descendants of the pane's own process are signalled.
+
+Running, tool-running, and waiting agents are never hibernated, nor are agents in the current session or in a pane that a tmux client is showing. The agent row stays in the sidebar as `hibernated` (`◌`) so the thread can be resumed later, for example with `amp threads continue <thread-id>`.
+
+Built-in hibernation recognizes Amp, Claude Code, Codex, OpenCode, Pi, and Droid processes. Hibernation state is in memory, so it is lost when the server restarts.
+
+To disable auto-hibernation or change the threshold:
+
+```json
+{
+  "autoHibernate": { "enabled": false }
+}
+```
+
+```json
+{
+  "autoHibernate": { "idleAfterMs": 43200000 }
+}
+```
 
 ## Built-In Themes
 

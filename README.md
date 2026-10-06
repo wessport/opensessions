@@ -200,7 +200,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 - The app is local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden.
 - Non-liveness HTTP endpoints require the bearer token scoped to that tmux socket; an unauthenticated request is rejected.
 - Fork installs do not silently fetch upstream release binaries. Publish compatible release artifacts and set `OPENSESSIONS_RELEASE_BASE`, or set `OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1` and build locally.
-- `theme`, `transparentBackground`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
+- `theme`, `transparentBackground`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, `autoHibernate`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
 - tmux is the only supported mux today.
 
