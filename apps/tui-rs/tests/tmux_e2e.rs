@@ -1943,6 +1943,24 @@ fn get_liveness(port: u16) -> String {
     response
 }
 
+fn server_answers_liveness(port: u16) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .is_err()
+        || stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response.starts_with("HTTP/1.1 200 OK")
+}
+
 fn post_hook(port: u16, path: &str, token: &str) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect /refresh");
     let request = format!(
@@ -2273,13 +2291,17 @@ for _ in range(3000):
         self.tmux(["show-option", "-gqv", "@opensessions_sidebar_visible"])
     }
 
+    /// Ready means serving, the same check `server_alive` uses in
+    /// `server-common.sh`. The server binds and publishes its token before
+    /// its startup snapshot and hook setup, so a bare TCP connect succeeds
+    /// seconds before any request is handled.
     fn wait_for_server(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let listening = TcpStream::connect(("127.0.0.1", self.port)).is_ok();
+            let serving = server_answers_liveness(self.port);
             let token_ready =
                 fs::read_to_string(self.token_file()).is_ok_and(|token| !token.trim().is_empty());
-            if listening && token_ready {
+            if serving && token_ready {
                 return;
             }
             sleep(Duration::from_millis(100));
