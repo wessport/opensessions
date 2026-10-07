@@ -234,3 +234,78 @@ exit 0
     killServer();
   }, 15000);
 });
+
+describe("even-horizontal.sh", () => {
+  const realTmux = spawnSync("sh", ["-c", "command -v tmux"], { encoding: "utf8" }).stdout.trim();
+
+  // failJoin: shell `case` pattern of join-pane argument lists to reject.
+  function privateTmux(failJoin = "") {
+    const dir = tempDir("os-evenh-", "/tmp");
+    const socket = join(dir, "s");
+    const bin = join(dir, "bin");
+    const emptyPlugin = join(dir, "plugin");
+    mkdirSync(bin);
+    mkdirSync(emptyPlugin);
+    writeExecutable(
+      join(bin, "tmux"),
+      `#!/bin/sh
+case "$*" in
+  ${failJoin || "__never__"}) exit 1 ;;
+esac
+exec "${realTmux}" -S "${socket}" "$@"
+`,
+    );
+    const tmux = (...args: string[]) =>
+      spawnSync(realTmux, ["-S", socket, ...args], { encoding: "utf8" }).stdout.trim();
+    cleanups.push(() => tmux("kill-server"));
+    spawnSync(realTmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "main", "-x", "200", "-y", "50", "sleep 600"]);
+    tmux("set-option", "-g", "allow-rename", "off");
+    // No server binary and an unreachable port: ensure-sidebar.sh fails fast.
+    tmux("set-environment", "-g", "OPENSESSIONS_PORT", "1");
+    tmux("set-environment", "-g", "OPENSESSIONS_DIR", emptyPlugin);
+    const windowId = tmux("display-message", "-p", "-t", "main", "#{window_id}");
+    const sidebar = tmux("display-message", "-p", "-t", "main", "#{pane_id}");
+    tmux("select-pane", "-t", sidebar, "-T", "opensessions-sidebar");
+    const a = tmux("split-window", "-h", "-P", "-F", "#{pane_id}", "-t", sidebar, "sleep 600");
+    tmux("split-window", "-h", "-P", "-F", "#{pane_id}", "-t", a, "sleep 600");
+    tmux("resize-pane", "-t", sidebar, "-x", "30");
+    tmux("resize-pane", "-t", a, "-x", "20");
+    const run = () =>
+      spawnSync("sh", [join(scriptsDir, "even-horizontal.sh"), windowId, a], {
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMUX: `${socket},1,0` },
+        encoding: "utf8",
+      });
+    const panes = () =>
+      tmux("list-panes", "-t", windowId, "-F", "#{pane_id} #{pane_title} #{pane_width} #{pane_left}")
+        .split("\n")
+        .map((line) => {
+          const [id, title, width, left] = line.split(" ");
+          return { id, title, width: Number(width), left: Number(left) };
+        });
+    const stashPanes = () => tmux("list-panes", "-s", "-t", "_os_stash", "-F", "#{pane_id}");
+    return { run, panes, stashPanes, sidebar };
+  }
+
+  test.skipIf(!realTmux)("spreads the other panes and keeps the sidebar at its edge and width", () => {
+    const { run, panes, sidebar } = privateTmux();
+    expect(run().status).toBe(0);
+    const result = panes();
+    expect(result[0]).toMatchObject({ id: sidebar, title: "opensessions-sidebar", width: 30, left: 0 });
+    expect(result).toHaveLength(3);
+    expect(Math.abs(result[1].width - result[2].width)).toBeLessThanOrEqual(1);
+  }, 20000);
+
+  test.skipIf(!realTmux)("rejoins the sidebar when the full-height restore fails", () => {
+    const { run, panes, stashPanes, sidebar } = privateTmux('"join-pane -hb -d -f "*');
+    expect(run().status).toBe(0);
+    expect(panes().map((pane) => pane.id)).toContain(sidebar);
+    expect(stashPanes()).not.toContain(sidebar);
+  }, 20000);
+
+  test.skipIf(!realTmux)("never strands the sidebar in the stash when every rejoin fails", () => {
+    const { run, panes, stashPanes, sidebar } = privateTmux('"join-pane -hb "*');
+    expect(run().status).toBe(0);
+    expect(panes().map((pane) => pane.id)).not.toContain(sidebar);
+    expect(stashPanes()).not.toContain(sidebar);
+  }, 20000);
+});
