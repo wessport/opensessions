@@ -56,6 +56,7 @@ Expected shutdown behavior:
 - the server marks the sidebar lifecycle as `closing…`, announced from the last built state so shutdown never waits on tmux, Git, or port discovery
 - the server broadcasts `quit` to websocket sidebar clients
 - the server waits briefly for clients to receive the quit frame, then removes hooks and pid file
+- that cleanup holds the identity lock from its ownership check to its last tmux command; a successor generation publishes its identity under the same lock before installing hooks or spawning sidebars, so an exiting server never unsets a successor's hooks or kills its sidebars, and skips cleanup entirely once a newer generation owns the identity
 - restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
 - shutdown is not a user choice to hide the sidebar: no shutdown path (`q`, `/quit`, SIGTERM, the tmux namespace disappearing) changes the recorded sidebar visibility
 
