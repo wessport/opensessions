@@ -145,6 +145,13 @@ auth_token() {
 # up after a fixed number of polls.
 START_TIMEOUT="${OPENSESSIONS_START_TIMEOUT:-30}"
 
+# `date +%s` has whole-second resolution, so `now + N` can expire after as
+# little as N-1 seconds. Add one second so every wait lasts at least
+# START_TIMEOUT.
+start_deadline() {
+  printf '%s\n' "$(( $(date +%s) + START_TIMEOUT + 1 ))"
+}
+
 # The start lock is a file holding its owner's pid, process start time, and a
 # nonce. It is published with `ln`, which atomically refuses an existing
 # target, so a lock never exists without its owner recorded. A lock is stale
@@ -229,7 +236,7 @@ break_stale_start_lock() {
 # live launcher, and SERVER_START_OBSERVED=1 when that launcher's server came
 # up while waiting (a fresh start by someone else).
 acquire_start_lock() {
-  deadline=$(( $(date +%s) + START_TIMEOUT ))
+  deadline=$(start_deadline)
   saw_live_launcher=0
   breaker_seen_at=""
   pidless_record=""
@@ -358,7 +365,7 @@ ensure_server() {
 
   # Keep waiting while the launched server is still running; stop early only
   # when it exits (for example, another server already owns the port).
-  deadline=$(( $(date +%s) + START_TIMEOUT ))
+  deadline=$(start_deadline)
   while kill -0 "$server_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 0.1
     if launched_server_answering "$server_pid"; then
