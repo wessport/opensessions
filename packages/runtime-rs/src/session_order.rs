@@ -161,17 +161,13 @@ impl SessionOrder {
         let Some(path) = &self.persist_path else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
         let value = if self.hidden.is_empty() {
             serde_json::json!(self.order)
         } else {
             serde_json::json!({ "order": self.order, "hidden": self.hidden })
         };
         let encoded = serde_json::to_string(&value).map_err(io::Error::other)?;
-        fs::write(path, format!("{encoded}\n"))
+        crate::config::write_file_atomically(path, &format!("{encoded}\n"))
     }
 }
 
