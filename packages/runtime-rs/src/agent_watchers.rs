@@ -276,7 +276,9 @@ pub fn opencode_snapshot_from_row(
         last_user_prompt,
         project_dir: (!directory.is_empty()).then(|| directory.to_string()),
         status,
-        ts: now_ms,
+        // The session's real update time, like the file mtimes other
+        // watchers use, so unchanged sessions are not reapplied every poll.
+        ts: time_updated,
     })
 }
 
@@ -918,6 +920,22 @@ not json
         );
         let name = "rollout-日本語のセッション名前ファイル";
         assert_eq!(codex_thread_id_from_path(&format!("/s/{name}.jsonl")), name);
+    }
+
+    #[test]
+    fn opencode_snapshot_is_stamped_with_the_session_update_time() {
+        let last_message = r#"{"role":"assistant","finish":"stop"}"#;
+        let snapshot_at = |now_ms| {
+            opencode_snapshot_from_row("ses_1", None, "/repo", 1_000, last_message, None, now_ms)
+                .expect("snapshot")
+        };
+
+        assert_eq!(snapshot_at(5_000).ts, 1_000);
+        assert_eq!(
+            snapshot_at(5_000),
+            snapshot_at(9_000),
+            "an unchanged session yields the same snapshot on every poll"
+        );
     }
 
     #[test]
