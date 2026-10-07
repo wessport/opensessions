@@ -1,12 +1,31 @@
 #!/usr/bin/env sh
 
+trim_space() {
+  value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# First 16 hex characters of the SHA-256 of the argument's bytes.
+sha256_prefix16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -c1-16
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-16
+  else
+    printf '%s' "$1" | openssl dgst -sha256 | awk '{print substr($NF, 1, 16)}'
+  fi
+}
+
 server_key() {
-  if [ -n "$OPENSESSIONS_SERVER_KEY" ]; then
-    printf '%s\n' "$OPENSESSIONS_SERVER_KEY"
+  explicit_key="$(trim_space "${OPENSESSIONS_SERVER_KEY:-}")"
+  if [ -n "$explicit_key" ]; then
+    printf '%s\n' "$explicit_key"
     return
   fi
 
-  if [ -z "$TMUX" ]; then
+  if [ -z "${TMUX:-}" ]; then
     return
   fi
 
@@ -22,13 +41,31 @@ server_key() {
     fi
   fi
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$socket_path" | sha256sum | cut -c1-16
-  elif command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$socket_path" | shasum -a 256 | cut -c1-16
-  else
-    printf '%s' "$socket_path" | openssl dgst -sha256 | awk '{print substr($NF, 1, 16)}'
-  fi
+  sha256_prefix16 "$socket_path"
+}
+
+# Server key -> port offset (0..19999). Keep identical to
+# resolve_server_port_with_base in packages/runtime-rs/src/shared.rs and
+# portForServerKey in integrations/amp and integrations/pi-extension:
+#   1-15 ASCII digits     -> decimal value          (legacy numeric keys)
+#   only hex digits       -> first 8 hex digits     (socket-derived SHA keys)
+#   anything else         -> first 8 hex digits of SHA-256(key)
+server_port_offset() {
+  key="$1"
+  case "$key" in
+    *[!0-9]*) ;;
+    *)
+      if [ "${#key}" -lt 16 ]; then
+        awk -v key="$key" 'BEGIN { printf "%d\n", (key + 0) % 20000 }'
+        return
+      fi
+      ;;
+  esac
+  case "$key" in
+    *[!0-9a-fA-F]*) key="$(sha256_prefix16 "$key")" ;;
+  esac
+  key="$(printf '%s' "$key" | cut -c1-8)"
+  printf '%s\n' "$(( 0x$key % 20000 ))"
 }
 
 SERVER_KEY="$(server_key)"
@@ -41,14 +78,7 @@ TMUX_OPENSESSIONS_TOKEN_FILE="$(tmux show-environment -g OPENSESSIONS_TOKEN_FILE
 if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
   PORT="$TMUX_OPENSESSIONS_PORT"
 elif [ -n "$SERVER_KEY" ]; then
-  PORT_SUFFIX="$(printf '%s' "$SERVER_KEY" | cut -c1-8)"
-  case "$SERVER_KEY" in
-    [0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9])
-      PORT_SUFFIX="$(awk -v key="$SERVER_KEY" 'BEGIN { print (key + 0) % 20000 }')"
-      ;;
-    *) PORT_SUFFIX=$((0x$PORT_SUFFIX % 20000)) ;;
-  esac
-  PORT=$((PORT_BASE + PORT_SUFFIX))
+  PORT=$((PORT_BASE + $(server_port_offset "$SERVER_KEY")))
 else
   PORT="7391"
 fi

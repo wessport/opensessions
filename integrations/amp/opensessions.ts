@@ -32,7 +32,7 @@ import { createHash } from "crypto";
 import { join } from "path";
 import { homedir } from "os";
 
-const PLUGIN_LOG_PATH = "/tmp/opensessions-plugin.log";
+const PLUGIN_LOG_PATH = process.env.OPENSESSIONS_AMP_PLUGIN_LOG || "/tmp/opensessions-plugin.log";
 function plog(msg: string): void {
   try { appendFileSync(PLUGIN_LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
 }
@@ -120,13 +120,23 @@ async function fetchThreadTitle(threadId: string): Promise<string | null> {
  * Port resolution — matches the tmux-scoped opensessions server namespace.
  * Rust servers map the canonical socket SHA key into the 22000–41999 range.
  */
-function hashServerKey(input: string): string {
+export function hashServerKey(input: string): string {
   return createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
-function portForServerKey(key: string): number | null {
-  const legacy = /^\d{1,5}$/.test(key) ? Number.parseInt(key, 10) : null;
-  const value = legacy ?? Number.parseInt(key.slice(0, 8), 16);
+/**
+ * Server key -> port. Keep identical to server_port_offset in
+ * packages/runtime-rs/src/shared.rs and integrations/tmux-plugin/scripts/
+ * server-common.sh. After trimming: 1-15 digits are a legacy decimal key;
+ * hex-only keys (socket-derived SHA keys) use their first 8 hex digits; any
+ * other key uses the first 8 hex digits of its SHA-256.
+ */
+export function portForServerKey(rawKey: string): number | null {
+  const key = rawKey.trim();
+  if (!key) return null;
+  const value = /^\d{1,15}$/.test(key)
+    ? Number.parseInt(key, 10)
+    : Number.parseInt((/^[0-9a-fA-F]+$/.test(key) ? key : hashServerKey(key)).slice(0, 8), 16);
   return Number.isFinite(value) ? RUST_SERVER_PORT_BASE + (value % 20000) : null;
 }
 
@@ -169,7 +179,7 @@ function resolveServerUrls(): string[] {
   // sessions and no-ops events for folders it does not own.
   try {
     for (const entry of readdirSync("/tmp")) {
-      const match = /^opensessions\.([0-9a-f]{16}|\d{1,5})\.pid$/.exec(entry);
+      const match = /^opensessions\.([A-Za-z0-9_-]+)\.pid$/.exec(entry);
       if (!match) continue;
       if (!pidFileIsAlive(join("/tmp", entry))) continue;
       const key = match[1];

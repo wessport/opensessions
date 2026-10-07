@@ -34,13 +34,23 @@ const REQUEST_TIMEOUT_MS = 750;
  * server port is derived from a hash of the tmux socket path so concurrent
  * tmux servers on the same machine get independent opensessions servers.
  */
-function hashServerKey(input: string): string {
+export function hashServerKey(input: string): string {
   return createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
-function portForServerKey(key: string): number | null {
-  const legacy = /^\d{1,5}$/.test(key) ? Number.parseInt(key, 10) : null;
-  const value = legacy ?? Number.parseInt(key.slice(0, 8), 16);
+/**
+ * Server key -> port. Keep identical to server_port_offset in
+ * packages/runtime-rs/src/shared.rs and integrations/tmux-plugin/scripts/
+ * server-common.sh. After trimming: 1-15 digits are a legacy decimal key;
+ * hex-only keys (socket-derived SHA keys) use their first 8 hex digits; any
+ * other key uses the first 8 hex digits of its SHA-256.
+ */
+export function portForServerKey(rawKey: string): number | null {
+  const key = rawKey.trim();
+  if (!key) return null;
+  const value = /^\d{1,15}$/.test(key)
+    ? Number.parseInt(key, 10)
+    : Number.parseInt((/^[0-9a-fA-F]+$/.test(key) ? key : hashServerKey(key)).slice(0, 8), 16);
   return Number.isFinite(value) ? RUST_SERVER_PORT_BASE + (value % 20000) : null;
 }
 

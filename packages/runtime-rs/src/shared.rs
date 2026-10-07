@@ -135,18 +135,44 @@ pub fn resolve_server_port_with_base(
         return DEFAULT_SERVER_PORT;
     };
 
-    let trimmed = server_key.trim();
-    let hex_prefix: String = trimmed.chars().take(8).collect();
-    // Legacy keys were short decimal numbers. Canonical SHA-derived keys are
-    // always 16 hexadecimal characters, even when their prefix contains only
-    // digits, so key length—not prefix contents—distinguishes the formats.
-    let key = if trimmed.len() < 16 && trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        trimmed.parse::<u32>()
+    match server_port_offset(server_key) {
+        Some(offset) => (base + offset) as u16,
+        None => DEFAULT_SERVER_PORT,
+    }
+}
+
+/// Map a server key to a port offset in `0..20_000`, or `None` for an empty key.
+///
+/// The rule is shared by `integrations/tmux-plugin/scripts/server-common.sh`
+/// (`server_port_offset`) and the Amp and Pi integrations (`portForServerKey`);
+/// keep all four implementations identical. After trimming whitespace:
+///
+/// 1. 1–15 ASCII digits: legacy numeric key, decimal value.
+/// 2. Only hexadecimal digits: socket-derived SHA key, first 8 hex digits.
+///    Canonical keys are always 16 hex characters, so length—not
+///    contents—distinguishes them from legacy numeric keys.
+/// 3. Anything else: first 8 hex digits of `SHA-256(key)`, so arbitrary
+///    explicit keys such as `work` still get a stable per-key port.
+pub fn server_port_offset(server_key: &str) -> Option<u32> {
+    let key = server_key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if key.len() < 16 && key.bytes().all(|byte| byte.is_ascii_digit()) {
+        let value = key.parse::<u64>().ok()?;
+        return Some((value % 20_000) as u32);
+    }
+    let hashed;
+    let hex = if key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        key
     } else {
-        u32::from_str_radix(&hex_prefix, 16)
+        hashed = hash_server_key(key);
+        &hashed
     };
-    key.map(|key| (base + key % 20_000) as u16)
-        .unwrap_or(DEFAULT_SERVER_PORT)
+    let prefix = &hex[..hex.len().min(8)];
+    u32::from_str_radix(prefix, 16)
+        .ok()
+        .map(|value| value % 20_000)
 }
 
 pub fn resolve_server_host(explicit: Option<&str>) -> String {
@@ -192,7 +218,7 @@ pub fn resolve_server_settings(env: impl Fn(&str) -> Option<String>) -> ServerSe
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_server_key, resolve_server_port_with_base};
+    use super::{OpensessionsEndpoint, hash_server_key, resolve_server_port_with_base};
 
     #[test]
     fn server_key_hashes_utf8_bytes() {
@@ -227,6 +253,59 @@ mod tests {
         assert_eq!(
             resolve_server_port_with_base(Some("12345678abcdef00"), None, 22_000),
             41_896
+        );
+    }
+
+    /// Shared vectors; keep in sync with scripts/server-key.test.ts, which
+    /// checks the shell, Amp, and Pi implementations against the same table.
+    #[test]
+    fn explicit_keys_map_to_the_same_ports_as_shell_and_typescript() {
+        for (key, port) in [
+            ("123", 22_123),
+            ("00123", 22_123),
+            ("  123\n", 22_123),
+            ("123456", 25_456),
+            ("999999999999999", 41_999),
+            ("1234567890123456", 41_896),
+            ("12345678abcdef00", 41_896),
+            ("DEADBEEF", 30_559),
+            ("work", 23_687),
+            ("deadbeefzz", 29_937),
+        ] {
+            assert_eq!(
+                resolve_server_port_with_base(Some(key), None, 22_000),
+                port,
+                "key {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_key_and_explicit_port_keep_their_precedence() {
+        assert_eq!(
+            resolve_server_port_with_base(Some("  "), None, 22_000),
+            super::DEFAULT_SERVER_PORT
+        );
+        assert_eq!(
+            resolve_server_port_with_base(Some("work"), Some(" 4242 "), 22_000),
+            4242
+        );
+    }
+
+    #[test]
+    fn endpoint_trims_explicit_key_for_port_and_files() {
+        let endpoint = OpensessionsEndpoint::from_env(|name| match name {
+            "OPENSESSIONS_SERVER_KEY" => Some(" work ".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            endpoint.server_key.as_ref().map(|key| key.as_str()),
+            Some("work")
+        );
+        assert_eq!(endpoint.port, 23_687);
+        assert_eq!(
+            endpoint.token_file,
+            std::path::PathBuf::from("/tmp/opensessions.work.token")
         );
     }
 }
