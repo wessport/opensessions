@@ -206,9 +206,10 @@ impl AgentTracker {
             return false;
         }
 
-        if let Some(session_instances) = self.instances.get(session) {
-            for key in session_instances.keys() {
-                self.unseen_instances.remove(&self.unseen_key(session, key));
+        if let Some(session_instances) = self.instances.get_mut(session) {
+            for (key, event) in session_instances.iter_mut() {
+                event.unseen = None;
+                self.unseen_instances.remove(&format!("{session}\0{key}"));
             }
         }
         true
@@ -354,7 +355,7 @@ impl AgentTracker {
                 let keys = session_instances
                     .iter()
                     .filter(|(key, event)| {
-                        is_terminal_status(event.status)
+                        is_prunable_status(event.status)
                             && !unseen_instances.contains(&format!("{session}\0{key}"))
                             && event.liveness != Some(AgentLiveness::Alive)
                             && now.saturating_sub(event.ts) > TERMINAL_PRUNE_MS
@@ -1133,11 +1134,19 @@ fn is_synthetic_pane_key(key: &str) -> bool {
     key.contains(SYNTHETIC_PANE_MARKER)
 }
 
+/// Terminal states per CONTRACTS.md; only these make a row unseen.
 fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Done | AgentStatus::Error | AgentStatus::Interrupted | AgentStatus::Stale
+        AgentStatus::Done | AgentStatus::Error | AgentStatus::Interrupted
     )
+}
+
+/// Rows `prune_terminal` may drop once they are old, seen, and paneless.
+/// `stale` is not terminal, but a stale row with no live pane is as dead as
+/// a finished one.
+fn is_prunable_status(status: AgentStatus) -> bool {
+    is_terminal_status(status) || status == AgentStatus::Stale
 }
 
 fn is_hibernatable_status(status: AgentStatus) -> bool {
@@ -1643,6 +1652,43 @@ mod tests {
 
         assert!(tracker.is_unseen("work"));
         assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+    }
+
+    #[test]
+    fn stale_events_are_not_terminal_and_do_not_mark_rows_unseen() {
+        let mut tracker = AgentTracker::new();
+        let mut stale = event("claude-code", "work", Some("T-1"), None);
+        stale.status = AgentStatus::Stale;
+        tracker.apply_event(stale);
+
+        assert!(!tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, None);
+    }
+
+    #[test]
+    fn stale_rows_without_a_live_pane_are_still_pruned() {
+        let mut tracker = AgentTracker::new();
+        let mut stale = event("claude-code", "work", Some("T-1"), None);
+        stale.status = AgentStatus::Stale;
+        stale.ts = now_ms() - TERMINAL_PRUNE_MS - 1_000;
+        tracker.apply_event(stale);
+
+        tracker.prune_terminal();
+
+        assert!(tracker.get_agents("work").is_empty());
+    }
+
+    #[test]
+    fn mark_seen_clears_the_unseen_flag_reported_on_rows() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event("amp", "work", Some("T-1"), None, None));
+        assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+
+        assert!(tracker.mark_seen("work"));
+
+        assert!(!tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, None);
+        assert_eq!(tracker.get_state("work").unwrap().unseen, None);
     }
 
     const IDLE_AFTER_MS: u64 = 6 * 60 * 60 * 1000;
