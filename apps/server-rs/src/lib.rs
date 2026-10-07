@@ -4399,6 +4399,7 @@ async fn run_accept_loop(
         MAX_CONCURRENT_CONNECTIONS - RESERVED_HTTP_CONNECTIONS,
     ));
     let state_operation_lock = Arc::new(AsyncMutex::new(()));
+    let ingestion_lock = Arc::new(AsyncMutex::new(()));
     let (state_refreshes, refresh_requests) = mpsc::channel(1);
     tokio::spawn(run_coalesced_state_refreshes(
         state_source.clone(),
@@ -4446,6 +4447,7 @@ async fn run_accept_loop(
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 let connection_auth_token = auth_token.clone();
                 let connection_state_operation_lock = Arc::clone(&state_operation_lock);
+                let connection_ingestion_lock = Arc::clone(&ingestion_lock);
                 let connection_state_refreshes = state_refreshes.clone();
                 let connection_server_identity = server_identity.clone();
                 let connection_websocket_limit = Arc::clone(&websocket_limit);
@@ -4460,6 +4462,7 @@ async fn run_accept_loop(
                         connection_shutdown_announcement,
                         connection_auth_token,
                         connection_state_operation_lock,
+                        connection_ingestion_lock,
                         connection_state_refreshes,
                         connection_server_identity,
                         connection_websocket_limit,
@@ -4601,6 +4604,32 @@ where
         .map_err(ServerError::from)
 }
 
+/// Runs agent-event and Pi runtime ingestion on the blocking pool without the
+/// state operation lock. Ingestion only updates the server's own registries
+/// (plus a short session lookup), so it must not queue behind a full snapshot
+/// or a tmux mutation that holds that lock for seconds: senders such as the
+/// Amp plugin give up after 750 ms. `ingestion_lock` applies these requests one
+/// at a time in arrival order; the resulting sidebar state is published by the
+/// coalesced refresh worker rather than per event.
+async fn run_state_ingestion_blocking<R, F>(
+    state_source: &Option<Arc<dyn StateSource>>,
+    ingestion_lock: &AsyncMutex<()>,
+    operation: F,
+) -> Result<Option<R>, ServerError>
+where
+    R: Send + 'static,
+    F: FnOnce(&dyn StateSource) -> R + Send + 'static,
+{
+    let Some(state_source) = state_source.clone() else {
+        return Ok(None);
+    };
+    let _ingestion_guard = ingestion_lock.lock().await;
+    tokio::task::spawn_blocking(move || operation(state_source.as_ref()))
+        .await
+        .map(Some)
+        .map_err(ServerError::from)
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: broadcast::Sender<()>,
@@ -4610,6 +4639,7 @@ async fn handle_connection(
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
     state_operation_lock: Arc<AsyncMutex<()>>,
+    ingestion_lock: Arc<AsyncMutex<()>>,
     state_refreshes: mpsc::Sender<()>,
     server_identity: Option<String>,
     websocket_limit: Arc<Semaphore>,
@@ -4735,12 +4765,11 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        let result =
-            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
-                source.handle_agent_event_json(&body)
-            })
-            .await?
-            .unwrap_or(Err(AgentEventError::CouldNotResolveSession));
+        let result = run_state_ingestion_blocking(&state_source, &ingestion_lock, move |source| {
+            source.handle_agent_event_json(&body)
+        })
+        .await?
+        .unwrap_or(Err(AgentEventError::CouldNotResolveSession));
         match result {
             Ok(()) => {
                 let _ = state_refreshes.try_send(());
@@ -4774,7 +4803,7 @@ async fn handle_connection(
             return Ok(());
         };
         if let Some(Err(err)) =
-            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+            run_state_ingestion_blocking(&state_source, &ingestion_lock, move |source| {
                 source.handle_pi_runtime_upsert(&body)
             })
             .await?
@@ -4808,7 +4837,7 @@ async fn handle_connection(
             return Ok(());
         };
         if let Some(Err(err)) =
-            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+            run_state_ingestion_blocking(&state_source, &ingestion_lock, move |source| {
                 source.handle_pi_runtime_delete(&body)
             })
             .await?
@@ -7199,6 +7228,197 @@ mod tests {
             switched_before_release,
             "interactive switching must bypass unrelated full-state work"
         );
+    }
+
+    /// A one-session mux whose sidebar pane listing, part of every full
+    /// snapshot, stalls while `slow` is set, like tmux under fork pressure.
+    struct StallingSnapshotMux {
+        slow: Arc<AtomicBool>,
+        stalled_calls: Arc<AtomicUsize>,
+    }
+
+    impl MuxProvider for StallingSnapshotMux {
+        fn name(&self) -> &str {
+            "stalling-snapshot"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            vec![opensessions_runtime::mux::MuxSessionInfo {
+                name: "work".to_string(),
+                created_at: 0,
+                dir: String::new(),
+                windows: 1,
+            }]
+        }
+        fn list_visible_sidebar_pane_ids(&self) -> Vec<String> {
+            if self.slow.load(Ordering::SeqCst) {
+                self.stalled_calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1_500));
+            }
+            Vec::new()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("work".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    async fn http_exchange(addr: SocketAddr, request: String) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("server should answer")
+            .expect("read response");
+        response
+    }
+
+    fn agent_event_request(token: &str, thread: &str, status: &str) -> String {
+        let body = format!(
+            r#"{{"agent":"amp","status":"{status}","tmuxSession":"work","threadId":"{thread}"}}"#
+        );
+        format!(
+            "POST /api/agent-event HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn agent_event_burst_is_answered_while_a_slow_snapshot_is_in_flight() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-event-burst-{}-{id}", process::id()));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let agent_home = root.with_extension("home");
+        fs::create_dir_all(&agent_home).expect("agent home");
+        let slow = Arc::new(AtomicBool::new(false));
+        let stalled_calls = Arc::new(AtomicUsize::new(0));
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(StallingSnapshotMux {
+            slow: Arc::clone(&slow),
+            stalled_calls: Arc::clone(&stalled_calls),
+        })])
+        .with_agent_state_home(&agent_home)
+        .with_auto_hibernate(AutoHibernateSettings {
+            enabled: false,
+            idle_after_ms: 0,
+        });
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(source),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+
+        slow.store(true, Ordering::SeqCst);
+        let refresh = tokio::spawn(http_exchange(
+            addr,
+            format!(
+                "POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stalled_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slow snapshot should start");
+
+        // Ten Amp plugins reloading at once, each with the plugin's 750 ms budget.
+        let burst = (0..10)
+            .map(|index| {
+                let request = agent_event_request(&token, &format!("T-{index}"), "running");
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let response = http_exchange(addr, request).await;
+                    (started.elapsed(), response)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut slowest = Duration::ZERO;
+        for request in burst {
+            let (elapsed, response) = request.await.expect("burst request");
+            assert!(
+                response.starts_with(b"HTTP/1.1 204 No Content"),
+                "unexpected response: {}",
+                String::from_utf8_lossy(&response)
+            );
+            slowest = slowest.max(elapsed);
+        }
+        // One sender's later event must still win over its earlier one.
+        let sequential_started = Instant::now();
+        for status in ["running", "waiting"] {
+            let response = http_exchange(addr, agent_event_request(&token, "T-0", status)).await;
+            assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+        }
+        let sequential = sequential_started.elapsed();
+
+        let _ = refresh.await;
+        slow.store(false, Ordering::SeqCst);
+        let refreshed = http_exchange(
+            addr,
+            format!(
+                "POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(refreshed.starts_with(b"HTTP/1.1 200 OK"));
+        let uri = format!("ws://{addr}").parse().expect("ws uri");
+        let (mut websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("authorization"),
+            )
+            .expect("add authorization header")
+            .connect()
+            .await
+            .expect("connect websocket");
+        let _ = websocket.next().await.expect("hello").expect("hello frame");
+        let state = websocket
+            .next()
+            .await
+            .expect("initial state")
+            .expect("initial state frame");
+        let state: Value = serde_json::from_str(state.as_text().expect("text state")).unwrap();
+        let agents = state["sessions"][0]["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        server.shutdown().await.expect("stop server");
+        let _ = fs::remove_dir_all(&agent_home);
+
+        assert!(
+            slowest < Duration::from_millis(750),
+            "agent events waited {slowest:?} behind an unrelated snapshot"
+        );
+        assert!(
+            sequential < Duration::from_millis(750),
+            "sequential agent events waited {sequential:?}"
+        );
+        assert_eq!(agents.len(), 10, "every burst event is applied: {agents:?}");
+        let latest = agents
+            .iter()
+            .find(|agent| agent["threadId"] == "T-0")
+            .expect("thread T-0");
+        assert_eq!(latest["status"], "waiting");
     }
 
     #[tokio::test]
