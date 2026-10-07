@@ -138,10 +138,11 @@ auth_token() {
   cat "$TOKEN_FILE" 2>/dev/null
 }
 
-# A cold start answers `server_alive` only after the server's first snapshot
-# and hook setup, which can take several seconds on a busy machine (git, ps,
-# lsof). Launchers and lock waiters wait this long while the start is still
-# making progress, instead of giving up after a fixed number of polls.
+# A cold start answers `server_alive` only after the server has installed its
+# hooks and restored recorded sidebars (it reports "initializing" until then),
+# which can take several seconds on a busy machine. Launchers and lock waiters
+# wait this long while the start is still making progress, instead of giving
+# up after a fixed number of polls.
 START_TIMEOUT="${OPENSESSIONS_START_TIMEOUT:-30}"
 
 # The start lock is a file holding its owner's pid, process start time, and a
