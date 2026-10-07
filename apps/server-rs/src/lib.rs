@@ -39,7 +39,7 @@ use opensessions_runtime::project_dir_session::{
 };
 use opensessions_runtime::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
-    SessionFilterMode, WindowData,
+    ServerState, SessionFilterMode, WindowData,
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
@@ -433,6 +433,9 @@ pub struct ReadOnlyMuxStateSource {
     agent_state_home: Option<PathBuf>,
     /// Agent panes found for writer pids recorded in agent state files.
     agent_pane_routes: Mutex<AgentPaneRouteCache>,
+    /// Last full state built, so shutdown can announce `closing…` without
+    /// running tmux, Git, or port discovery.
+    last_state: Mutex<Option<ServerState>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -536,6 +539,7 @@ impl ReadOnlyMuxStateSource {
             process_control: Arc::new(SystemProcessControl),
             agent_state_home: std::env::var_os("HOME").map(PathBuf::from),
             agent_pane_routes: Mutex::new(AgentPaneRouteCache::default()),
+            last_state: Mutex::new(None),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -1480,15 +1484,26 @@ impl StateSource for ReadOnlyMuxStateSource {
             now_ms: (self.now_ms)(),
         });
 
-        serde_json::to_string(&ServerMessage::State(state)).expect("state must serialize")
+        let payload = serde_json::to_string(&ServerMessage::State(state.clone()))
+            .expect("state must serialize");
+        *self.last_state.lock().unwrap() = Some(state);
+        payload
     }
 
+    /// Announces `closing…` from the last built state. Shutdown runs on the
+    /// runtime thread and must not wait for tmux, Git, or port discovery.
     fn begin_shutdown(&self) -> Option<String> {
-        {
+        let sidebar_state = {
             let mut coordinator = self.sidebar_coordinator.lock().unwrap();
             coordinator.begin_closing();
-        }
-        Some(self.snapshot_json())
+            coordinator.state()
+        };
+        let mut state = self.last_state.lock().unwrap().clone()?;
+        state.initializing = sidebar_state.initializing;
+        state.init_label =
+            (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label);
+        state.sidebar_width = sidebar_state.width;
+        serde_json::to_string(&ServerMessage::State(state)).ok()
     }
 
     fn handle_client_command(&self, command: &Value) -> Option<String> {
@@ -7439,5 +7454,21 @@ mod tests {
             locks_available,
             "shared state stayed locked while the snapshot ran tmux commands"
         );
+    }
+
+    #[test]
+    fn shutdown_announces_closing_without_running_mux_commands() {
+        let provider = Arc::new(FlakySessionsTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.snapshot_json();
+        provider.failing.store(true, Ordering::SeqCst);
+
+        let payload = source.begin_shutdown().expect("closing state");
+
+        let state: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["initLabel"], "closing…");
+        // The announcement reuses the last state; a fresh snapshot would
+        // have seen the now-failing listing and dropped both sessions.
+        assert_eq!(state["sessions"].as_array().map(Vec::len), Some(2));
     }
 }
