@@ -1,5 +1,11 @@
 #!/usr/bin/env sh
 # Ensure the current window has a sidebar pane.
+#
+# Asks the server for the same repair its after-select-window hook performs
+# (POST /ensure-sidebar for the current client/window), starting the server if
+# needed. Not bound to a key by default: run it by hand or from your own
+# binding, e.g. `run-shell "sh .../ensure-sidebar.sh"`, to re-create a missing
+# sidebar. even-horizontal.sh also uses it as its last-resort recovery.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/server-common.sh"

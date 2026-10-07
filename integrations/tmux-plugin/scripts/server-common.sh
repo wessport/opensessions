@@ -68,12 +68,22 @@ server_port_offset() {
   printf '%s\n' "$(( 0x$key % 20000 ))"
 }
 
+# Print the value of a tmux global environment variable. `show-environment`
+# prints NAME=value for set variables and -NAME for variables marked for
+# removal; values may themselves contain '='.
+tmux_global_env() {
+  env_line="$(tmux show-environment -g "$1" 2>/dev/null)" || return 0
+  case "$env_line" in
+    "$1="*) printf '%s\n' "${env_line#*=}" ;;
+  esac
+}
+
 SERVER_KEY="$(server_key)"
 PORT_BASE=22000
-TMUX_OPENSESSIONS_PORT="$(tmux show-environment -g OPENSESSIONS_PORT 2>/dev/null | cut -d= -f2)"
-TMUX_OPENSESSIONS_HOST="$(tmux show-environment -g OPENSESSIONS_HOST 2>/dev/null | cut -d= -f2)"
-TMUX_OPENSESSIONS_PID_FILE="$(tmux show-environment -g OPENSESSIONS_PID_FILE 2>/dev/null | cut -d= -f2)"
-TMUX_OPENSESSIONS_TOKEN_FILE="$(tmux show-environment -g OPENSESSIONS_TOKEN_FILE 2>/dev/null | cut -d= -f2)"
+TMUX_OPENSESSIONS_PORT="$(tmux_global_env OPENSESSIONS_PORT)"
+TMUX_OPENSESSIONS_HOST="$(tmux_global_env OPENSESSIONS_HOST)"
+TMUX_OPENSESSIONS_PID_FILE="$(tmux_global_env OPENSESSIONS_PID_FILE)"
+TMUX_OPENSESSIONS_TOKEN_FILE="$(tmux_global_env OPENSESSIONS_TOKEN_FILE)"
 
 if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
   PORT="$TMUX_OPENSESSIONS_PORT"
@@ -98,7 +108,7 @@ else
   PID_FILE="/tmp/opensessions.pid"
 fi
 
-PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
+PLUGIN_DIR="$(tmux_global_env OPENSESSIONS_DIR)"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
 START_LOCK_DIR="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
