@@ -94,3 +94,143 @@ describe("uninstall.sh", () => {
     expect(hooks).not.toContain("opensessions");
   }, 20000);
 });
+
+describe("toggle.sh after a server start", () => {
+  // A fake opensessions-server: binds the port, publishes its pid file, then
+  // answers the identity probe after FAKE_READY_MS. FAKE_SLOW_PROBES makes the
+  // first identity probes slower than server_alive's 200ms timeout.
+  const fakeServer = `#!${process.execPath}
+import { appendFileSync, writeFileSync } from "node:fs";
+const env = process.env;
+const readyAt = Date.now() + Number(env.FAKE_READY_MS ?? 0);
+let slowProbes = Number(env.FAKE_SLOW_PROBES ?? 0);
+try {
+  Bun.serve({
+    hostname: "127.0.0.1",
+    port: Number(env.OPENSESSIONS_PORT),
+    async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (path === "/") {
+        if (slowProbes > 0) { slowProbes--; await Bun.sleep(400); }
+        if (Date.now() < readyAt) return new Response("starting", { status: 503 });
+        return new Response("opensessions server " + env.OPENSESSIONS_SERVER_KEY);
+      }
+      appendFileSync(env.FAKE_LOG, path + " " + (req.headers.get("authorization") ?? "") + "\\n");
+      return new Response(null, { status: 204 });
+    },
+  });
+} catch {
+  process.exit(1);
+}
+writeFileSync(env.OPENSESSIONS_PID_FILE, String(process.pid));
+setTimeout(() => process.exit(0), Number(env.FAKE_LIFETIME_MS ?? 10000));
+`;
+
+  async function fixture() {
+    const dir = tempDir("os-toggle-", "/tmp");
+    const pluginDir = join(dir, "plugin");
+    const bin = join(dir, "fakebin");
+    mkdirSync(join(pluginDir, "bin"), { recursive: true });
+    mkdirSync(bin);
+    writeExecutable(join(pluginDir, "bin/opensessions-server"), fakeServer);
+    const port = await freePort();
+    const key = `toggletest${process.pid}${port}`;
+    const files = {
+      log: join(dir, "requests.log"),
+      pid: join(dir, "server.pid"),
+      token: join(dir, "server.token"),
+    };
+    writeFileSync(files.log, "");
+    writeFileSync(files.token, "secret");
+    // Fake tmux: reports a restored sidebar and serves the plugin env.
+    writeExecutable(
+      join(bin, "tmux"),
+      `#!/bin/sh
+case "$1 $3" in
+  "show-environment OPENSESSIONS_PORT") echo "OPENSESSIONS_PORT=${port}" ;;
+  "show-environment OPENSESSIONS_PID_FILE") echo "OPENSESSIONS_PID_FILE=${files.pid}" ;;
+  "show-environment OPENSESSIONS_TOKEN_FILE") echo "OPENSESSIONS_TOKEN_FILE=${files.token}" ;;
+  "show-environment OPENSESSIONS_DIR") echo "OPENSESSIONS_DIR=${pluginDir}" ;;
+  "show-environment "*) exit 1 ;;
+esac
+case "$1" in
+  list-panes) echo opensessions-sidebar ;;
+  display-message) echo "/dev/ttys999|main|@1|%1|1" ;;
+esac
+exit 0
+`,
+    );
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      PATH: `${bin}:${process.env.PATH}`,
+      OPENSESSIONS_SERVER_KEY: key,
+      FAKE_LOG: files.log,
+    };
+    delete env.TMUX;
+    const killServer = () => {
+      try {
+        process.kill(Number(readFileSync(files.pid, "utf8")), "SIGTERM");
+      } catch {}
+    };
+    cleanups.push(killServer);
+    cleanups.push(() => {
+      for (const suffix of ["server.log", "start.lock"]) {
+        rmSync(`/tmp/opensessions.${key}.${suffix}`, { recursive: true, force: true });
+      }
+    });
+
+    const runToggle = (extraEnv: Record<string, string> = {}, script = "toggle.sh") =>
+      new Promise<number>((done) => {
+        const child = spawn("sh", [join(scriptsDir, script)], { env: { ...env, ...extraEnv }, stdio: "ignore" });
+        child.on("exit", (code) => done(code ?? -1));
+      });
+    const startServer = (extraEnv: Record<string, string>) =>
+      spawn(join(pluginDir, "bin/opensessions-server"), [], {
+        env: {
+          ...env,
+          ...extraEnv,
+          OPENSESSIONS_PORT: String(port),
+          OPENSESSIONS_PID_FILE: files.pid,
+        },
+        stdio: "ignore",
+      });
+    const toggles = () => readFileSync(files.log, "utf8").split("\n").filter((line) => line.startsWith("/toggle"));
+    return { runToggle, startServer, toggles, killServer, files };
+  }
+
+  async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error("timed out");
+      await Bun.sleep(25);
+    }
+  }
+
+  test("toggles an already-running server with the auth token", async () => {
+    const { runToggle, startServer, toggles, killServer, files } = await fixture();
+    startServer({});
+    await waitFor(() => existsSync(files.pid));
+    expect(await runToggle()).toBe(0);
+    expect(toggles()).toEqual(["/toggle Bearer secret"]);
+    killServer();
+  }, 15000);
+
+  test("a second press waiting on a cold start does not hide restored sidebars", async () => {
+    const { runToggle, toggles, killServer } = await fixture();
+    const first = runToggle({ FAKE_READY_MS: "1000" });
+    await Bun.sleep(150);
+    const second = runToggle();
+    expect(await Promise.all([first, second])).toEqual([0, 0]);
+    expect(toggles()).toEqual([]);
+    killServer();
+  }, 15000);
+
+  test("a slow running server is toggled even when its probe timed out", async () => {
+    const { runToggle, startServer, toggles, killServer, files } = await fixture();
+    startServer({ FAKE_SLOW_PROBES: "2" });
+    await waitFor(() => existsSync(files.pid));
+    expect(await runToggle()).toBe(0);
+    expect(toggles()).toEqual(["/toggle Bearer secret"]);
+    killServer();
+  }, 15000);
+});

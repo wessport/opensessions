@@ -6,9 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ensure_server || exit 0
 
-# A server that was just started has already restored the user's last visible
-# choice. Toggling now would immediately hide the sidebars being asked for.
-if [ "$SERVER_STARTED" = 1 ] && tmux list-panes -a -F '#{pane_title}' 2>/dev/null | grep -q '^opensessions-sidebar$'; then
+# A server generation that just started (launched by this invocation, or by the
+# launcher this invocation waited on) has already restored the user's last
+# visible choice. Toggling now would immediately hide the sidebars being asked
+# for. A server that was already running is always toggled.
+if server_freshly_started && tmux list-panes -a -F '#{pane_title}' 2>/dev/null | grep -q '^opensessions-sidebar$'; then
   tmux switch-client -T root >/dev/null 2>&1
   exit 0
 fi
