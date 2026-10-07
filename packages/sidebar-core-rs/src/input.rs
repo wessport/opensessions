@@ -254,6 +254,11 @@ fn apply_width_slider_key(app: &mut App, key: UiKey) {
 }
 
 pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
+    if app.is_modal_open() {
+        apply_modal_mouse(app, event);
+        return;
+    }
+
     match event {
         UiMouse::ScrollUp {
             x: _,
@@ -325,6 +330,23 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
     }
 }
 
+/// Modals own input, so the sidebar behind them never sees the mouse. A
+/// click cancels a y/n confirmation, matching "any key but y cancels";
+/// scrolling and hovering are ignored so they cannot dismiss it by accident.
+/// Editing modals (rename, theme, width, windows) ignore the mouse and keep
+/// their keyboard Esc/Enter semantics.
+fn apply_modal_mouse(app: &mut App, event: UiMouse) {
+    match event {
+        UiMouse::Click { .. }
+            if matches!(app.modal, Modal::QuitConfirm | Modal::KillConfirm { .. }) =>
+        {
+            app.modal = Modal::None;
+        }
+        UiMouse::DragEnd => app.resize_drag_state = None,
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,29 +355,53 @@ mod tests {
         AgentPanelScope, ClientCommand, ServerMessage, ServerState, SessionData, WindowData,
     };
 
+    fn session_data(name: &str) -> SessionData {
+        SessionData {
+            name: name.to_string(),
+            created_at: 0,
+            dir: format!("/tmp/{name}"),
+            branch: String::new(),
+            dirty: false,
+            changed_files: 0,
+            insertions: 0,
+            deletions: 0,
+            is_worktree: false,
+            unseen: false,
+            panes: 3,
+            ports: Vec::new(),
+            local_links: Vec::new(),
+            windows: 3,
+            uptime: String::new(),
+            agent_state: None,
+            agents: Vec::new(),
+            event_timestamps: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    fn app_with_sessions(names: &[&str]) -> App {
+        App::from_state(ServerState {
+            sessions: names.iter().map(|name| session_data(name)).collect(),
+            focused_session: Some(names[0].to_string()),
+            current_session: Some(names[0].to_string()),
+            visible_sidebar_pane_ids: Vec::new(),
+            theme: None,
+            transparent_background: false,
+            session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
+            sidebar_width: 36,
+            detail_panel_height: 10,
+            settings_revision: 0,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 0,
+        })
+    }
+
     fn app_with_windows() -> App {
         let mut app = App::from_state(ServerState {
-            sessions: vec![SessionData {
-                name: "project".to_string(),
-                created_at: 0,
-                dir: "/tmp/project".to_string(),
-                branch: String::new(),
-                dirty: false,
-                changed_files: 0,
-                insertions: 0,
-                deletions: 0,
-                is_worktree: false,
-                unseen: false,
-                panes: 3,
-                ports: Vec::new(),
-                local_links: Vec::new(),
-                windows: 3,
-                uptime: String::new(),
-                agent_state: None,
-                agents: Vec::new(),
-                event_timestamps: Vec::new(),
-                metadata: None,
-            }],
+            sessions: vec![session_data("project")],
             focused_session: Some("project".to_string()),
             current_session: Some("project".to_string()),
             visible_sidebar_pane_ids: Vec::new(),
@@ -550,6 +596,146 @@ mod tests {
             assert_eq!(app.modal, Modal::None, "{key:?} should cancel");
             assert!(app.drain_commands().is_empty(), "{key:?} must not quit");
             assert!(app.quit_deadline.is_none(), "{key:?} must not arm quit");
+        }
+    }
+
+    const W: u16 = 36;
+    const H: u16 = 40;
+
+    /// Row of the `other` session in a two-session sidebar with no modal.
+    fn other_session_row(app: &App) -> u16 {
+        crate::renderer::compute_hit_map(app, W, H)
+            .iter()
+            .position(|hit| *hit == Some(crate::renderer::HitTarget::Session("other".to_string())))
+            .expect("other session row") as u16
+    }
+
+    fn every_mouse_event(app: &App, session_row: u16) -> Vec<UiMouse> {
+        let separator = detail_separator_row(app, W, H);
+        vec![
+            UiMouse::Click {
+                x: 2,
+                y: session_row,
+                width: W,
+                height: H,
+            },
+            UiMouse::Click {
+                x: 2,
+                y: separator,
+                width: W,
+                height: H,
+            },
+            UiMouse::ScrollDown {
+                x: 2,
+                y: session_row,
+                width: W,
+                height: H,
+            },
+            UiMouse::ScrollUp {
+                x: 2,
+                y: H - 4,
+                width: W,
+                height: H,
+            },
+            UiMouse::Move {
+                x: 2,
+                y: session_row,
+                width: W,
+                height: H,
+            },
+            UiMouse::Drag {
+                y: separator.saturating_sub(5),
+            },
+            UiMouse::DragEnd,
+        ]
+    }
+
+    #[test]
+    fn mouse_input_does_not_reach_the_sidebar_behind_an_editing_modal() {
+        let base = app_with_sessions(&["project", "other"]);
+        let row = other_session_row(&base);
+        let modals = [
+            Modal::RenameSession {
+                original_name: "project".to_string(),
+                draft: "project".to_string(),
+            },
+            Modal::ThemePicker {
+                query: String::new(),
+                selected: 0,
+                original_theme: None,
+                original_transparent_background: false,
+            },
+            Modal::WidthSlider { draft_width: 36 },
+            Modal::WindowManager {
+                session: "project".to_string(),
+                windows: Vec::new(),
+                selected: 0,
+                marked: Default::default(),
+                confirming: false,
+            },
+        ];
+        for modal in modals {
+            for event in every_mouse_event(&base, row) {
+                let mut app = app_with_sessions(&["project", "other"]);
+                app.modal = modal.clone();
+
+                apply_ui_mouse(&mut app, event);
+
+                assert_eq!(app.modal, modal, "{event:?} must not change the modal");
+                assert!(
+                    app.drain_commands().is_empty(),
+                    "{event:?} leaked to the sidebar"
+                );
+                assert!(
+                    app.drain_launches().is_empty(),
+                    "{event:?} launched behind the modal"
+                );
+                assert_eq!(
+                    app.resize_drag_state, None,
+                    "{event:?} started a panel drag"
+                );
+                assert_eq!(app.detail_panel_height, 10, "{event:?} resized the panel");
+                assert_eq!(app.flash_target, None, "{event:?} flashed a row");
+                assert_eq!(app.hover_target, None, "{event:?} hovered a row");
+                assert_eq!(app.focused_session_name(), Some("project"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_cancels_a_confirmation_without_activating_what_is_under_it() {
+        let base = app_with_sessions(&["project", "other"]);
+        let row = other_session_row(&base);
+        let confirmations = [
+            Modal::QuitConfirm,
+            Modal::KillConfirm {
+                target: crate::app::KillTarget::Session("project".to_string()),
+            },
+        ];
+        for modal in confirmations {
+            for event in every_mouse_event(&base, row) {
+                let mut app = app_with_sessions(&["project", "other"]);
+                app.modal = modal.clone();
+
+                apply_ui_mouse(&mut app, event);
+
+                if matches!(event, UiMouse::Click { .. }) {
+                    assert_eq!(app.modal, Modal::None, "a click should cancel {modal:?}");
+                } else {
+                    assert_eq!(app.modal, modal, "{event:?} must not answer {modal:?}");
+                }
+                assert!(
+                    app.drain_commands().is_empty(),
+                    "{event:?} leaked to the sidebar"
+                );
+                assert!(app.quit_deadline.is_none(), "{event:?} must not arm quit");
+                assert_eq!(
+                    app.resize_drag_state, None,
+                    "{event:?} started a panel drag"
+                );
+                assert_eq!(app.flash_target, None, "{event:?} flashed a row");
+                assert_eq!(app.focused_session_name(), Some("project"));
+            }
         }
     }
 }
