@@ -159,7 +159,12 @@ All other tmux options fall back to the defaults shown in the table above.
 | `OPENSESSIONS_DIR` | tmux helper scripts and server | Helps helper scripts find the repo checkout |
 | `OPENSESSIONS_HOST` | server, sidebar, helper shell scripts | Runtime host override; normally `127.0.0.1` |
 | `OPENSESSIONS_PORT` | server, sidebar, helper shell scripts | Runtime port override; normally derived from the tmux socket/server key |
-| `OPENSESSIONS_SERVER_KEY` | server, sidebar, helper shell scripts | Stable key used to derive per-tmux-socket ports and PID files |
+| `OPENSESSIONS_SERVER_KEY` | server, sidebar, helper shell scripts, Amp/Pi integrations | Explicit server key replacing the tmux-socket-derived key; selects the port, PID file, and token file. See [Server key and port](#server-key-and-port) |
+| `OPENSESSIONS_PID_FILE` | server, helper shell scripts | PID file override; default `/tmp/opensessions.<key>.pid` |
+| `OPENSESSIONS_TOKEN_FILE` | server, sidebar, helper shell scripts, Amp/Pi integrations | Bearer token file override; default `/tmp/opensessions.<key>.token` |
+| `OPENSESSIONS_URL` | Amp/Pi integrations | Explicit server base URL, tried before derived endpoints |
+| `OPENSESSIONS_RELEASE_BASE` | TPM bootstrap, `scripts/postinstall.js` | Release download base for prebuilt binaries (required for fork installs) |
+| `OPENSESSIONS_DEBUG_LOG` | server | Append debug lines to this file; unset disables debug logging |
 | `OPENSESSIONS_LAZYDIFF` | sidebar | Explicit lazydiff binary path override. By default the sidebar prefers the bundled sibling binary in `bin/`, then `lazydiff` on `PATH` |
 | `OPENSESSIONS_SKIP_BINARY_DOWNLOAD` | TPM bootstrap | Set to `1` to skip prebuilt binary downloads and use a local `target/` build |
 | `OPENSESSIONS_WIDTH` | ignored | Deprecated stale bootstrap variable; width is controlled by persisted `sidebarWidth` |
@@ -171,8 +176,33 @@ All other tmux options fall back to the defaults shown in the table above.
 | Path | Purpose |
 | --- | --- |
 | `~/.config/opensessions/session-order.json` | Persisted custom session ordering |
-| `/tmp/opensessions.pid` | PID file used by server bootstrap logic |
-| `/tmp/opensessions-debug.log` | Best-effort debug log written by the server and providers |
+| `/tmp/opensessions.<key>.pid` | Server PID file used by bootstrap and integration discovery (`/tmp/opensessions.pid` without a key) |
+| `/tmp/opensessions.<key>.token` | Bearer token for authenticated endpoints (`/tmp/opensessions.token` without a key) |
+| `/tmp/opensessions.<key>.server.log` | Server output when a helper script starts the server |
+| `$OPENSESSIONS_DEBUG_LOG` | Debug log, only when the variable is set |
+
+## Server Key And Port
+
+Each tmux server gets its own opensessions server. The server key is
+`OPENSESSIONS_SERVER_KEY` (surrounding whitespace trimmed) when set; otherwise
+the first 16 hex characters of the SHA-256 of the canonical tmux socket path
+from `$TMUX`. Without either, the key is empty and the defaults are port
+`7391`, `/tmp/opensessions.pid`, and `/tmp/opensessions.token`.
+
+An explicit port (`OPENSESSIONS_PORT`, or the tmux global environment for the
+helper scripts) always wins. Otherwise the port is `22000 + offset`, where the
+offset is computed from the key the same way by the server, sidebar, tmux
+scripts, and the Amp and Pi integrations:
+
+| Key | Offset |
+| --- | --- |
+| 1–15 ASCII digits (legacy numeric key) | decimal value mod 20000 |
+| hexadecimal digits only (socket-derived keys) | first 8 hex digits as a number, mod 20000 |
+| anything else, e.g. `work` | first 8 hex digits of the key's SHA-256, mod 20000 |
+
+So `123` and `123456` map to ports 22123 and 25456, and `work` maps to 23687.
+The key also names the PID and token files, so prefer keys made of letters,
+digits, `-`, and `_`.
 
 ## Mux Detection Rules
 

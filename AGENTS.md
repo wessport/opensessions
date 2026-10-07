@@ -117,7 +117,7 @@ cargo test -p opensessions-sidebar --test tmux_e2e -- --nocapture
 cargo build --release                          # Build local dev binaries
 cargo run -p opensessions-server               # Start server directly
 cargo run -p opensessions-sidebar              # Start sidebar directly
-bun test scripts/postinstall.test.ts           # Postinstall helper tests
+bun test scripts/                              # Script tests: postinstall, tmux plugin scripts, Amp/Pi helpers
 ```
 
 Use `rtk` prefixes when running shell commands, per the user-level instructions.
