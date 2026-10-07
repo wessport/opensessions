@@ -190,12 +190,14 @@ impl TmuxClient {
 
     pub fn list_panes(&self, scope: PaneScope<'_>) -> Vec<PaneInfo> {
         let mut args = vec!["list-panes"];
+        let session_target;
         match scope {
             PaneScope::All => args.push("-a"),
-            PaneScope::Session(target) => {
+            PaneScope::Session(name) => {
+                session_target = exact_session_window_target(name);
                 args.push("-s");
                 args.push("-t");
-                args.push(target);
+                args.push(&session_target);
             }
             PaneScope::Window(target) => {
                 args.push("-t");
@@ -205,6 +207,11 @@ impl TmuxClient {
         args.push("-F");
         args.push(pane_format());
         parse_panes(&self.run(&args).stdout)
+    }
+
+    /// Switches to the session named exactly `session_name`.
+    pub fn switch_client_to_session(&self, session_name: &str, client_tty: Option<&str>) {
+        self.switch_client(&exact_session_target(session_name), client_tty);
     }
 
     pub fn switch_client(&self, target: &str, client_tty: Option<&str>) {
@@ -252,8 +259,11 @@ impl TmuxClient {
         self.run(&args).stdout
     }
 
-    pub fn kill_session(&self, target: &str) {
-        self.run(&["kill-session", "-t", target]);
+    /// Kills the session named exactly `session_name`. A plain `-t name`
+    /// would fall back to prefix and pattern matches and could kill another
+    /// session (`api` matching `api-v2`) once `name` is already gone.
+    pub fn kill_session(&self, session_name: &str) {
+        self.run(&["kill-session", "-t", &exact_session_target(session_name)]);
     }
 
     pub fn rename_session(&self, target: &str, new_name: &str) -> bool {
@@ -265,7 +275,7 @@ impl TmuxClient {
         self.run(&[
             "unlink-window",
             "-t",
-            &format!("{session_name}:{window_id}"),
+            &format!("={session_name}:{window_id}"),
         ]);
     }
 
@@ -546,12 +556,15 @@ impl TmuxClient {
         })
     }
 
-    pub fn get_session_dir(&self, target: &str) -> String {
-        self.display("#{pane_current_path}", Some(target))
+    pub fn get_session_dir(&self, session_name: &str) -> String {
+        self.display(
+            "#{pane_current_path}",
+            Some(&exact_session_window_target(session_name)),
+        )
     }
 
-    pub fn get_pane_count(&self, target: &str) -> u32 {
-        self.list_panes(PaneScope::Session(target)).len() as u32
+    pub fn get_pane_count(&self, session_name: &str) -> u32 {
+        self.list_panes(PaneScope::Session(session_name)).len() as u32
     }
 
     pub fn get_all_pane_counts(&self) -> HashMap<String, u32> {
@@ -661,8 +674,21 @@ impl TmuxClient {
 
 pub enum PaneScope<'a> {
     All,
+    /// Every pane of the session with exactly this name.
     Session(&'a str),
     Window(&'a str),
+}
+
+/// tmux resolves a bare `-t name` by exact match, then prefix, then pattern,
+/// so a missing `api` silently targets `api-v2`. `=` forces an exact match.
+fn exact_session_target(session_name: &str) -> String {
+    format!("={session_name}")
+}
+
+/// Exact session match for window- and pane-scoped targets: the trailing `:`
+/// selects that session's current window (and its active pane).
+fn exact_session_window_target(session_name: &str) -> String {
+    format!("={session_name}:")
 }
 
 #[derive(Clone)]
@@ -708,7 +734,7 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
-        self.client.switch_client(name, client_tty);
+        self.client.switch_client_to_session(name, client_tty);
         self.client.select_sidebar_pane_for_session(name);
     }
 
@@ -722,7 +748,7 @@ impl MuxProvider for TmuxProvider {
         fallback_session: &str,
         _preferred_client_tty: Option<&str>,
     ) -> bool {
-        let fallback_target = format!("={fallback_session}:");
+        let fallback_target = exact_session_window_target(fallback_session);
         let mut switched = false;
         for client in self.client.list_clients() {
             if client.session_name == session_name {
@@ -970,7 +996,8 @@ impl MuxProvider for TmuxProvider {
         if !is_session_window {
             return;
         }
-        self.client.switch_client(session_name, client_tty);
+        self.client
+            .switch_client_to_session(session_name, client_tty);
         self.client.select_window(window_id);
     }
 
@@ -1189,7 +1216,7 @@ impl MuxProvider for TmuxProvider {
                     for client in self.client.list_clients() {
                         if client.session_name == *session_name {
                             self.client
-                                .switch_client(fallback_session, Some(&client.tty));
+                                .switch_client_to_session(fallback_session, Some(&client.tty));
                         }
                     }
                 }
@@ -1912,9 +1939,9 @@ mod tests {
 
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls
-                .iter()
-                .any(|call| { call == &["switch-client", "-c", "/dev/ttys001", "-t", "project",] })
+            calls.iter().any(|call| {
+                call == &["switch-client", "-c", "/dev/ttys001", "-t", "=project"]
+            })
         );
         assert!(
             calls
@@ -1924,7 +1951,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|call| call == &["unlink-window", "-t", "project:@2"])
+                .any(|call| call == &["unlink-window", "-t", "=project:@2"])
         );
         assert!(
             calls
@@ -1935,7 +1962,7 @@ mod tests {
             matches!(
                 call.first().map(String::as_str),
                 Some("unlink-window" | "kill-window")
-            ) && !matches!(call.last().map(String::as_str), Some("project:@2" | "@4"))
+            ) && !matches!(call.last().map(String::as_str), Some("=project:@2" | "@4"))
         }));
     }
 
