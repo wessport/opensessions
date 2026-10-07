@@ -45,6 +45,14 @@ pub struct AgentPane {
     pub thread_name: Option<String>,
 }
 
+/// A pane an attached client is currently showing, and the session it is
+/// shown in (a linked window can show one pane in several sessions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewedPane {
+    pub session_name: String,
+    pub pane_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientFocus {
     pub client_tty: Option<String>,
@@ -170,6 +178,12 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn list_sidebar_panes(&self, _session_name: Option<&str>) -> Vec<SidebarPane> {
+        Vec::new()
+    }
+
+    /// Every pane in the active window of every session an attached client
+    /// is viewing. Used to protect what the user can see; never status.
+    fn list_viewed_panes(&self) -> Vec<ViewedPane> {
         Vec::new()
     }
 

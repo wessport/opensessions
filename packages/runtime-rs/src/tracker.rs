@@ -37,7 +37,6 @@ pub struct AgentTracker {
     /// Rows restored from durable agent state at startup rather than from a
     /// live event. Keys use the same `session\0instance` shape as unseen.
     seeded_instances: HashSet<String>,
-    active: HashSet<String>,
 }
 
 impl AgentTracker {
@@ -194,9 +193,6 @@ impl AgentTracker {
         for (old_key, new_key) in renamed_seeds {
             self.seeded_instances.remove(&old_key);
             self.seeded_instances.insert(new_key);
-        }
-        if self.active.remove(session) {
-            self.active.insert(new_name.to_string());
         }
     }
 
@@ -384,8 +380,8 @@ impl AgentTracker {
     /// (in any session; pane ids are global) is quiet, and no busy row of
     /// the same agent in its session has an unknown pane, because that row
     /// may be served by the same process (for example after Claude's
-    /// `/clear`). Sessions the user is looking at (`protected_sessions`
-    /// plus tracker-active sessions) are never returned.
+    /// `/clear`). Sessions the user is looking at (`protected_sessions`,
+    /// supplied by the server from tmux) are never returned.
     pub fn find_hibernation_candidates(
         &self,
         now_ms: u64,
@@ -419,7 +415,6 @@ impl AgentTracker {
         let mut candidates = rows()
             .filter(|(session, key, event)| {
                 !is_synthetic_pane_key(key)
-                    && !self.active.contains(*session)
                     && !protected_sessions.contains(*session)
                     && event.liveness == Some(AgentLiveness::Alive)
                     && is_quiet(event)
@@ -501,8 +496,6 @@ impl AgentTracker {
     }
 
     pub fn handle_focus(&mut self, session: &str) -> bool {
-        self.active.clear();
-        self.active.insert(session.to_string());
         if self.unseen_instance_count(session) == 1 {
             return self.mark_single_unseen_seen(session);
         }
@@ -620,11 +613,6 @@ impl AgentTracker {
                 || changed;
         }
         changed
-    }
-
-    pub fn set_active_sessions(&mut self, sessions: impl IntoIterator<Item = String>) {
-        self.active.clear();
-        self.active.extend(sessions);
     }
 
     pub fn apply_pane_presence(
@@ -1880,12 +1868,10 @@ mod tests {
     }
 
     #[test]
-    fn hibernation_candidates_skip_protected_and_active_sessions() {
+    fn hibernation_candidates_skip_protected_sessions() {
         let mut tracker = AgentTracker::new();
         tracker.apply_event(live_event("focused", "T-focused", AgentStatus::Done, "%1"));
-        tracker.apply_event(live_event("active", "T-active", AgentStatus::Done, "%2"));
         tracker.apply_event(live_event("background", "T-bg", AgentStatus::Done, "%3"));
-        tracker.set_active_sessions(["active".to_string()]);
 
         let candidates = tracker.find_hibernation_candidates(
             1_000 + IDLE_AFTER_MS + 1,

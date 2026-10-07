@@ -1043,20 +1043,13 @@ impl ReadOnlyMuxStateSource {
     /// Stops the agent process in panes whose agent has been idle longer
     /// than the configured threshold, keeping each row as `hibernated`.
     /// Status still comes from the tracker; panes are only used to find the
-    /// process to stop. Sessions and panes the user is looking at are skipped.
+    /// process to stop. Every session an attached client is viewing, and
+    /// every pane a client can see, is skipped.
     fn hibernate_idle_agent_panes(&self) -> bool {
         if !self.auto_hibernate.enabled {
             return false;
         }
-        let mut protected_sessions = HashSet::new();
-        if let Some(session) = self.focused_session.lock().unwrap().clone() {
-            protected_sessions.insert(session);
-        }
-        for provider in &self.providers {
-            if let Some(session) = provider.get_current_session() {
-                protected_sessions.insert(session);
-            }
-        }
+        let (protected_sessions, protected_panes) = self.viewed_sessions_and_panes();
         let candidates = self
             .agent_tracker
             .lock()
@@ -1096,7 +1089,9 @@ impl ReadOnlyMuxStateSource {
             let Some(provider) = self.provider_for_session(&candidate.session) else {
                 continue;
             };
-            if provider.client_tty_for_pane(&candidate.pane_id).is_some() {
+            if protected_panes.contains(&candidate.pane_id)
+                || provider.client_tty_for_pane(&candidate.pane_id).is_some()
+            {
                 continue;
             }
             let Some(pane_pid) = provider.get_pane_pid(&candidate.pane_id) else {
@@ -1182,6 +1177,27 @@ impl ReadOnlyMuxStateSource {
             }
         }
         changed
+    }
+
+    /// Sessions and panes the user may be looking at: the focused session,
+    /// each provider's current session, and every session and pane shown
+    /// to an attached client.
+    fn viewed_sessions_and_panes(&self) -> (HashSet<String>, HashSet<String>) {
+        let mut sessions = HashSet::new();
+        let mut panes = HashSet::new();
+        if let Some(session) = self.focused_session.lock().unwrap().clone() {
+            sessions.insert(session);
+        }
+        for provider in &self.providers {
+            if let Some(session) = provider.get_current_session() {
+                sessions.insert(session);
+            }
+            for viewed in provider.list_viewed_panes() {
+                sessions.insert(viewed.session_name);
+                panes.insert(viewed.pane_id);
+            }
+        }
+        (sessions, panes)
     }
 
     /// Pids of the Amp processes that last wrote busy threads (not quiet
@@ -5442,7 +5458,7 @@ mod tests {
         }
 
         fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
-            ["focused", "background"]
+            ["focused", "background", "viewed"]
                 .into_iter()
                 .map(|name| opensessions_runtime::mux::MuxSessionInfo {
                     name: name.to_string(),
@@ -5466,11 +5482,25 @@ mod tests {
                 "%2" => Some(200),
                 "%3" => Some(300),
                 "%visible" => Some(400),
+                "%5" => Some(500),
+                "%6" => Some(600),
                 _ => None,
             }
         }
         fn client_tty_for_pane(&self, pane_id: &str) -> Option<String> {
             (pane_id == "%visible").then(|| "/dev/ttys009".to_string())
+        }
+        /// A second client shows session `viewed`, whose active window holds
+        /// `%5` and a window linked from `background` holding `%6`; neither
+        /// is that client's active pane.
+        fn list_viewed_panes(&self) -> Vec<opensessions_runtime::mux::ViewedPane> {
+            ["%5", "%6"]
+                .into_iter()
+                .map(|pane_id| opensessions_runtime::mux::ViewedPane {
+                    session_name: "viewed".to_string(),
+                    pane_id: pane_id.to_string(),
+                })
+                .collect()
         }
         fn get_pane_count(&self, _name: &str) -> u32 {
             1
@@ -5503,7 +5533,11 @@ mod tests {
                  300 1 -zsh\n\
                  301 300 vim notes.md\n\
                  400 1 -zsh\n\
-                 401 400 /Users/me/.amp/bin/amp\n",
+                 401 400 /Users/me/.amp/bin/amp\n\
+                 500 1 -zsh\n\
+                 501 500 /Users/me/.amp/bin/amp\n\
+                 600 1 -zsh\n\
+                 601 600 /Users/me/.amp/bin/amp\n",
             )
         }
 
@@ -5531,6 +5565,8 @@ mod tests {
             ("background", "T-no-agent", "idle", "%3"),
             ("background", "T-visible", "idle", "%visible"),
             ("background", "T-working", "running", "%4"),
+            ("viewed", "T-viewed", "done", "%5"),
+            ("background", "T-linked", "done", "%6"),
         ] {
             source
                 .apply_agent_event(&serde_json::json!({
@@ -5594,6 +5630,29 @@ mod tests {
         processes.signals.lock().unwrap().clear();
         assert!(!source.hibernate_idle_agent_panes());
         assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_hibernate_protects_every_session_and_pane_a_client_is_viewing() {
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings::default());
+
+        assert!(source.hibernate_idle_agent_panes());
+
+        let signalled = processes
+            .signals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect::<HashSet<_>>();
+        assert!(!signalled.contains(&501), "{signalled:?}");
+        assert!(!signalled.contains(&601), "{signalled:?}");
+        for (session, thread_id) in [("viewed", "T-viewed"), ("background", "T-linked")] {
+            assert_eq!(
+                agent_status(&source, session, thread_id).status,
+                AgentStatus::Done
+            );
+        }
     }
 
     #[test]
