@@ -154,3 +154,30 @@ fn session_targets_never_fall_back_to_prefix_matches() {
     provider.kill_session("api-v2");
     assert_eq!(lab.session_names(), vec!["keep"]);
 }
+
+#[test]
+fn rename_reports_the_name_tmux_actually_assigned() {
+    let Some(lab) = PrivateTmux::start("draft") else {
+        return;
+    };
+    lab.tmux(&["new-session", "-d", "-s", "api-v2"]);
+    let provider = lab.provider();
+
+    // tmux replaces `.`/`:` and expands formats in new names.
+    assert_eq!(
+        provider.rename_session("draft", "v1.2:x").as_deref(),
+        Some("v1_2_x")
+    );
+    let expanded = provider
+        .rename_session("v1_2_x", "n#{session_id}")
+        .expect("renamed");
+    assert!(expanded.starts_with("n$"), "{expanded}");
+    assert_eq!(
+        provider.rename_session(&expanded, "plain name").as_deref(),
+        Some("plain name")
+    );
+
+    // A missing source never falls back to a prefix match.
+    assert_eq!(provider.rename_session("api", "stolen"), None);
+    assert_eq!(lab.session_names(), vec!["api-v2", "plain name"]);
+}

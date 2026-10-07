@@ -1494,13 +1494,18 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if new_name.is_empty() || new_name == name {
                     return None;
                 }
-                if !provider.rename_session(name, new_name) {
+                // The mux may sanitize the requested name; every reference
+                // must follow the name the session actually has now.
+                let Some(new_name) = provider
+                    .rename_session(name, new_name)
+                    .filter(|actual| actual != name)
+                else {
                     return Some(self.snapshot_json());
-                }
-                self.rename_session_references(name, new_name);
+                };
+                self.rename_session_references(name, &new_name);
                 serde_json::to_string(&ServerMessage::ReIdentify {
                     old_name: name.to_string(),
-                    new_name: new_name.to_string(),
+                    new_name,
                 })
                 .ok()
             }
@@ -6150,12 +6155,13 @@ mod tests {
             String::new()
         }
         fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
-        fn rename_session(&self, name: &str, new_name: &str) -> bool {
+        fn rename_session(&self, name: &str, new_name: &str) -> Option<String> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((name.to_string(), new_name.to_string()));
-            true
+            // Like tmux, replace characters that are invalid in names.
+            Some(new_name.replace(['.', ':'], "_"))
         }
         fn kill_session(&self, _name: &str) {}
         fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
@@ -6324,6 +6330,32 @@ mod tests {
                 .get("descriptive-name")
                 .map(String::as_str),
             Some("%1")
+        );
+    }
+
+    #[test]
+    fn rename_follows_the_name_the_mux_actually_assigned() {
+        let provider = Arc::new(RenameTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        *source.focused_session.lock().unwrap() = Some("draft".to_string());
+
+        let response = source.handle_client_command(&serde_json::json!({
+            "type": "rename-session",
+            "name": "draft",
+            "newName": "v1.2:x",
+        }));
+
+        assert_eq!(
+            response,
+            serde_json::to_string(&ServerMessage::ReIdentify {
+                old_name: "draft".to_string(),
+                new_name: "v1_2_x".to_string(),
+            })
+            .ok()
+        );
+        assert_eq!(
+            source.focused_session.lock().unwrap().as_deref(),
+            Some("v1_2_x")
         );
     }
 

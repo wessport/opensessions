@@ -266,9 +266,35 @@ impl TmuxClient {
         self.run(&["kill-session", "-t", &exact_session_target(session_name)]);
     }
 
-    pub fn rename_session(&self, target: &str, new_name: &str) -> bool {
-        self.run(&["rename-session", "-t", &format!("={target}"), new_name])
-            .ok()
+    /// Renames the session named exactly `target` and returns the resulting
+    /// name. tmux sanitizes names (`.`/`:` become `_`) and format-expands
+    /// them (`#{session_id}`), so the name is read back by stable session id.
+    pub fn rename_session(&self, target: &str, new_name: &str) -> Option<String> {
+        let session_id = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &exact_session_window_target(target),
+            "#{session_id}",
+        ]);
+        let session_id = session_id.stdout.trim();
+        if !session_id.starts_with('$') {
+            return None;
+        }
+        let renamed = self.run(&[
+            "rename-session",
+            "-t",
+            session_id,
+            new_name,
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            session_id,
+            "#{session_name}",
+        ]);
+        let actual = renamed.stdout.trim();
+        (renamed.ok() && !actual.is_empty()).then(|| actual.to_string())
     }
 
     pub fn unlink_window(&self, session_name: &str, window_id: &str) {
@@ -807,7 +833,7 @@ impl MuxProvider for TmuxProvider {
         self.client.new_session(name, dir);
     }
 
-    fn rename_session(&self, name: &str, new_name: &str) -> bool {
+    fn rename_session(&self, name: &str, new_name: &str) -> Option<String> {
         self.client.rename_session(name, new_name)
     }
 
@@ -1812,24 +1838,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_session_uses_an_exact_tmux_target() {
-        let runner = Arc::new(RecordingRunner::default());
-        let provider = TmuxProvider::new(runner.clone());
-
-        assert!(provider.rename_session("draft", "descriptive name"));
-
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[vec![
-                "rename-session".to_string(),
-                "-t".to_string(),
-                "=draft".to_string(),
-                "descriptive name".to_string(),
-            ]]
-        );
-    }
-
-    #[test]
     fn visible_sidebars_require_an_attached_client_and_active_window() {
         let runner = Arc::new(VisibilityRunner::default());
         let provider = TmuxProvider::new(runner.clone());
@@ -1939,9 +1947,9 @@ mod tests {
 
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|call| {
-                call == &["switch-client", "-c", "/dev/ttys001", "-t", "=project"]
-            })
+            calls
+                .iter()
+                .any(|call| { call == &["switch-client", "-c", "/dev/ttys001", "-t", "=project"] })
         );
         assert!(
             calls
