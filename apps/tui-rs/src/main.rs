@@ -9,7 +9,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_sidebar::app::{App, LaunchTarget, Modal};
-use opensessions_sidebar::cli::{Args, resolve_endpoint_from_env};
+use opensessions_sidebar::cli::{Args, resolve_endpoint};
 use opensessions_sidebar::client::{
     connect_ws_path_with_token, decode_server_message, encode_client_command,
     send_quit_with_http_fallback, validate_hello,
@@ -30,8 +30,6 @@ use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
-const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
-const DEFAULT_SERVER_PORT: u16 = 7_391;
 const SIDEBAR_WIDTH_DEBOUNCE_MS: u64 = 80;
 
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -71,17 +69,9 @@ fn debug_log(line: impl AsRef<str>) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let env = resolve_endpoint_from_env(|key| std::env::var(key).ok());
-    let server_host = if args.server_host == DEFAULT_SERVER_HOST {
-        env.server_host
-    } else {
-        args.server_host
-    };
-    let server_port = if args.server_port == DEFAULT_SERVER_PORT {
-        env.server_port
-    } else {
-        args.server_port
-    };
+    let env = resolve_endpoint(&args, |key| std::env::var(key).ok());
+    let server_host = env.server_host.clone();
+    let server_port = env.server_port;
     let auth_token = std::fs::read_to_string(&env.token_file)
         .with_context(|| format!("read opensessions token {}", env.token_file))?;
 
