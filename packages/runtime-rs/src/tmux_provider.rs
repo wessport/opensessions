@@ -1095,42 +1095,27 @@ impl MuxProvider for TmuxProvider {
         _thread_id: Option<&str>,
         thread_name: Option<&str>,
     ) -> Option<String> {
-        let panes = self
+        // This pane may be killed, so never guess: an Amp thread must match
+        // its "<thread> - amp - <dir>" title exactly, and otherwise the
+        // session must have exactly one pane running the agent.
+        let mut agent_panes = self
             .client
             .list_panes(PaneScope::Session(session))
             .into_iter()
             .filter(|pane| pane.title != "opensessions-sidebar")
-            .collect::<Vec<_>>();
+            .filter(|pane| agent_from_pane(pane).as_deref() == Some(agent));
 
         if agent == "amp"
             && let Some(thread_name) = thread_name
         {
-            let matches = panes
-                .iter()
-                .filter(|pane| {
-                    pane.title.to_lowercase().starts_with("amp - ")
-                        && pane.title.contains(thread_name)
-                })
+            let matches = agent_panes
+                .filter(|pane| thread_name_from_pane(pane, agent).as_deref() == Some(thread_name))
                 .collect::<Vec<_>>();
-            if matches.len() == 1 {
-                return Some(matches[0].id.clone());
-            }
+            return (matches.len() == 1).then(|| matches[0].id.clone());
         }
 
-        let patterns = match agent {
-            "amp" => &["amp"][..],
-            "claude-code" => &["claude"][..],
-            "codex" => &["codex"][..],
-            "opencode" => &["opencode"][..],
-            _ => return None,
-        };
-        panes
-            .into_iter()
-            .find(|pane| {
-                let title = pane.title.to_lowercase();
-                patterns.iter().any(|pattern| title.contains(pattern))
-            })
-            .map(|pane| pane.id)
+        let pane = agent_panes.next()?;
+        agent_panes.next().is_none().then_some(pane.id)
     }
 
     fn resize_sidebar_pane(&self, pane_id: &str, width: u16) {
@@ -1528,6 +1513,41 @@ mod agent_pane_tests {
                 pane("%9", "amp", None),
                 pane("%10", "amp", Some("Debug cursor")),
             ]
+        );
+    }
+
+    #[test]
+    fn resolving_an_amp_pane_matches_the_real_title_format_or_fails() {
+        let two_amp_panes = provider(vec![
+            ("%1", "zsh", "sample.rs"),
+            ("%2", "node", "Fix focus - amp - repo"),
+            ("%3", "node", "Fix focus later - amp - repo"),
+        ]);
+        let resolve =
+            |thread_name| two_amp_panes.resolve_agent_pane_id("work", "amp", None, thread_name);
+
+        assert_eq!(resolve(Some("Fix focus")).as_deref(), Some("%2"));
+        assert_eq!(resolve(Some("Fix focus later")).as_deref(), Some("%3"));
+        assert_eq!(
+            resolve(Some("Unknown thread")),
+            None,
+            "a thread with no matching pane is not guessed"
+        );
+        assert_eq!(resolve(None), None, "two Amp panes are ambiguous");
+
+        let single = provider(vec![
+            ("%1", "zsh", "sample.rs"),
+            ("%2", "node", "Fix focus - amp - repo"),
+        ]);
+        assert_eq!(
+            single
+                .resolve_agent_pane_id("work", "amp", None, None)
+                .as_deref(),
+            Some("%2")
+        );
+        assert_eq!(
+            single.resolve_agent_pane_id("work", "codex", None, None),
+            None
         );
     }
 }
