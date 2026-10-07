@@ -350,3 +350,130 @@ fn sidebar_windows_honour_remain_on_exit_failed() {
     );
     assert_eq!(pane_dead(&lab, &setup.content[0]), Some(true));
 }
+
+/// A tmux client attached through a pseudo-terminal, or `None` when
+/// python3 is not installed. Killed on drop.
+struct AttachedClient(std::process::Child);
+
+impl AttachedClient {
+    fn attach(lab: &PrivateTmux, session: &str) -> Option<Self> {
+        let script = r#"
+import os, pty, select, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp("tmux", ["tmux", "-L", sys.argv[1], "attach-session", "-t", "=" + sys.argv[2]])
+while True:
+    ready, _, _ = select.select([fd], [], [], 0.2)
+    try:
+        if ready and not os.read(fd, 65536):
+            break
+    except OSError:
+        break
+"#;
+        let child = Command::new("python3")
+            .env_remove("TMUX")
+            .args(["-c", script, &lab.socket, session])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let client = Self(child);
+        assert!(
+            wait_until(Duration::from_secs(5), || client_sessions(lab)
+                .contains(&session.to_string())),
+            "client never attached to {session}"
+        );
+        Some(client)
+    }
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn client_sessions(lab: &PrivateTmux) -> Vec<String> {
+    lab.stdout(&["list-clients", "-F", "#{client_session}"])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Sessions `zeta`, `work`, `alpha` created in that order (usually within
+/// one second), with a client attached to `work`, whose only window holds a
+/// fake sidebar and one content pane that exits after one Enter keypress.
+fn closing_session_lab() -> Option<(PrivateTmux, TmuxProvider, String, AttachedClient)> {
+    let lab = PrivateTmux::start("zeta")?;
+    lab.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "work",
+        "sh -c 'read line; exit 0'",
+    ]);
+    lab.tmux(&["new-session", "-d", "-s", "alpha"]);
+    let provider = lab.provider();
+    let content = lab.stdout(&["display-message", "-p", "-t", "=work:", "#{pane_id}"]);
+    let window = lab.stdout(&["display-message", "-p", "-t", "=work:", "#{window_id}"]);
+    let sidebar = lab.stdout(&[
+        "split-window",
+        "-hbf",
+        "-d",
+        "-l",
+        "20",
+        "-t",
+        &content,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "sleep 600",
+    ]);
+    lab.tmux(&["select-pane", "-t", &sidebar, "-T", "opensessions-sidebar"]);
+    // Hooks point at a closed port; their HTTP calls fail fast and silently.
+    provider.setup_hooks("127.0.0.1", 9, "/nonexistent/opensessions.token");
+    provider.prepare_sidebar_window(&window);
+    let client = AttachedClient::attach(&lab, "work")?;
+    Some((lab, provider, content, client))
+}
+
+/// The sidebar lists sessions in creation order and falls back to the
+/// previous one; tmux-side cleanup must agree instead of using name order.
+#[test]
+fn closing_the_last_content_pane_falls_back_to_the_previously_created_session() {
+    let Some((lab, _provider, content, _client)) = closing_session_lab() else {
+        return;
+    };
+
+    exit_pane(&lab, &content);
+
+    assert!(
+        wait_until(Duration::from_secs(5), || !lab
+            .session_names()
+            .contains(&"work".to_string())),
+        "work was not closed: {:?}",
+        lab.session_names()
+    );
+    assert_eq!(client_sessions(&lab), vec!["zeta".to_string()]);
+}
+
+#[test]
+fn killing_the_last_content_pane_falls_back_to_the_previously_created_session() {
+    let Some((lab, _provider, content, _client)) = closing_session_lab() else {
+        return;
+    };
+
+    lab.tmux(&["kill-pane", "-t", &content]);
+
+    assert!(
+        wait_until(Duration::from_secs(5), || !lab
+            .session_names()
+            .contains(&"work".to_string())),
+        "work was not closed: {:?}",
+        lab.session_names()
+    );
+    assert_eq!(client_sessions(&lab), vec!["zeta".to_string()]);
+}

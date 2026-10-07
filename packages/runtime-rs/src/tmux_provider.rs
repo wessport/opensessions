@@ -853,7 +853,10 @@ impl MuxProvider for TmuxProvider {
 
     fn try_list_sessions(&self) -> Option<Vec<MuxSessionInfo>> {
         let active_dirs = self.client.get_active_session_dirs();
-        let sessions = self.client.try_list_sessions()?;
+        let mut sessions = self.client.try_list_sessions()?;
+        // tmux lists sessions by name and `#{session_created}` has
+        // whole-second resolution; `$N` session ids increase with creation.
+        sessions.sort_by_key(|session| session_creation_seq(&session.id));
         let sessions = sessions
             .into_iter()
             .filter(|session| session.name != STASH_SESSION)
@@ -1863,6 +1866,14 @@ fn parse_panes(raw: &str) -> Vec<PaneInfo> {
         .collect()
 }
 
+/// Creation sequence from a tmux session id such as `$12`; unparsable ids
+/// sort last.
+fn session_creation_seq(id: &str) -> u64 {
+    id.strip_prefix('$')
+        .and_then(|seq| seq.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
 fn split(line: &str) -> Vec<&str> {
     line.split(SEP).collect()
 }
@@ -2560,5 +2571,42 @@ mod tests {
         provider.cleanup_hooks();
 
         assert_eq!(provider.sidebar_visibility_preference(), Some(true));
+    }
+
+    #[test]
+    fn sessions_are_listed_in_creation_order_not_tmux_name_order() {
+        struct SameSecondSessionsRunner;
+
+        impl CommandRunner for SameSecondSessionsRunner {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                // tmux lists sessions by name; `$N` ids follow creation, and
+                // `#{session_created}` only has whole-second resolution.
+                let stdout = if args.first().map(String::as_str) == Some("list-sessions") {
+                    concat!(
+                        "$1\talpha\t1791401685\t0\t1\t/a\n",
+                        "$10\tmid\t1791401685\t0\t1\t/m\n",
+                        "$9\tzeta\t1791401685\t0\t1\t/z\n",
+                    )
+                } else {
+                    ""
+                };
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+
+        let provider = TmuxProvider::new(Arc::new(SameSecondSessionsRunner));
+
+        let names = provider
+            .try_list_sessions()
+            .expect("listing succeeds")
+            .into_iter()
+            .map(|session| session.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["alpha", "zeta", "mid"]);
     }
 }
