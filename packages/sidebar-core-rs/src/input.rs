@@ -221,7 +221,7 @@ fn apply_theme_picker_key(app: &mut App, key: UiKey) {
 
 fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
     match key {
-        UiKey::Char('y') => {
+        UiKey::Char('y' | 'Y') => {
             if matches!(app.modal, Modal::KillConfirm { .. }) {
                 app.confirm_kill_target();
             }
@@ -234,7 +234,7 @@ fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
 
 fn apply_quit_confirm_key(app: &mut App, key: UiKey) {
     match key {
-        UiKey::Char('y') => app.confirm_quit(),
+        UiKey::Char('y' | 'Y') => app.confirm_quit(),
         _ => app.modal = Modal::None,
     }
 }
@@ -737,5 +737,25 @@ mod tests {
                 assert_eq!(app.focused_session_name(), Some("project"));
             }
         }
+    }
+
+    #[test]
+    fn uppercase_y_confirms_quit_and_kill_like_lowercase() {
+        let mut app = app_with_sessions(&["project", "other"]);
+        apply_ui_key(&mut app, UiKey::Char('q'));
+        apply_ui_key(&mut app, UiKey::Char('Y'));
+        assert_eq!(app.modal, Modal::None);
+        assert_eq!(app.drain_commands(), vec![ClientCommand::Quit]);
+
+        let mut app = app_with_sessions(&["project", "other"]);
+        app.modal = Modal::KillConfirm {
+            target: crate::app::KillTarget::Session("other".to_string()),
+        };
+        apply_ui_key(&mut app, UiKey::Char('Y'));
+        assert_eq!(app.modal, Modal::None);
+        assert!(matches!(
+            app.drain_commands().as_slice(),
+            [ClientCommand::KillSession { name, .. }] if name == "other"
+        ));
     }
 }
