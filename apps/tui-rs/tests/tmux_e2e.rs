@@ -2956,7 +2956,7 @@ for _ in range(3000):
     fn wait_for_sidebar_mode(&self, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let log = fs::read_to_string(self.root.join("debug.log")).unwrap_or_default();
+            let log = self.debug_log_contents();
             if log.contains(&format!("snapshot_json mode={expected}")) {
                 return;
             }
@@ -2969,17 +2969,23 @@ for _ in range(3000):
     }
 
     fn debug_log_occurrences(&self, needle: &str) -> usize {
-        fs::read_to_string(self.root.join("debug.log"))
-            .unwrap_or_default()
-            .matches(needle)
-            .count()
+        self.debug_log_contents().matches(needle).count()
+    }
+
+    /// The debug log rotates to `debug.log.1` past its size cap, so waits and
+    /// counts read the rotated file first, then the current one.
+    fn debug_log_contents(&self) -> String {
+        ["debug.log.1", "debug.log"]
+            .iter()
+            .filter_map(|name| fs::read_to_string(self.root.join(name)).ok())
+            .collect()
     }
 
     fn wait_for_sidebar_connections(&self) {
         let panes = self.sidebar_panes();
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let log = fs::read_to_string(self.root.join("debug.log")).unwrap_or_default();
+            let log = self.debug_log_contents();
             if panes.iter().all(|pane| {
                 log.lines().any(|line| {
                     line.contains("identify-pane")
@@ -3352,7 +3358,10 @@ for _ in range(3000):
         for entry in fs::read_dir(&self.root).expect("read e2e root") {
             let entry = entry.expect("read e2e log entry");
             let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "log") {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            if name.is_some_and(|name| name.ends_with(".log") || name.ends_with(".log.1")) {
                 logs.push_str(&format!("\n--- {} ---\n", path.display()));
                 logs.push_str(&fs::read_to_string(&path).unwrap_or_else(|err| err.to_string()));
             }
