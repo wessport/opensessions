@@ -3998,11 +3998,33 @@ fn publish_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io:
     publish_identity_locked(pid_file, token_file, token)
 }
 
-fn cleanup_owned_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+/// Removes this generation's mux hooks, sidebar clients, and identity files.
+///
+/// The identity lock is held from the ownership check through the last
+/// cleanup command: a successor generation publishes its identity under the
+/// same lock before it installs hooks or spawns sidebars, so it can neither
+/// slip in between the check and cleanup nor have its own hooks unset.
+fn cleanup_owned_generation(
+    pid_file: &Path,
+    token_file: &Path,
+    token: &str,
+    state_source: Option<&dyn StateSource>,
+) -> std::io::Result<()> {
     let _identity_lock = lock_identity(pid_file)?;
     if !owns_identity_generation(pid_file, token_file, token) {
+        debug_log("shutdown: a newer generation owns the identity; skipping mux cleanup");
         return Ok(());
     }
+    if let Some(source) = state_source
+        && source.mux_namespace_available()
+    {
+        source.cleanup_mux_hooks();
+        source.cleanup_sidebar_clients();
+    }
+    remove_identity_files(pid_file, token_file)
+}
+
+fn remove_identity_files(pid_file: &Path, token_file: &Path) -> std::io::Result<()> {
     match fs::remove_file(pid_file) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4147,14 +4169,17 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         identity_task.abort();
         let _ = identity_task.await;
         state_cache_task.abort();
-        if owns_identity_generation(&config.pid_file, &token_file, &token)
-            && let Some(source) = cleanup_state_source.as_ref()
-            && source.mux_namespace_available()
-        {
-            source.cleanup_mux_hooks();
-            source.cleanup_sidebar_clients();
-        }
-        let cleanup_result = cleanup_owned_identity(&config.pid_file, &token_file, &token);
+        // Dozens of tmux commands: keep them off the runtime thread.
+        let cleanup_result = tokio::task::spawn_blocking(move || {
+            cleanup_owned_generation(
+                &config.pid_file,
+                &token_file,
+                &token,
+                cleanup_state_source.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)));
         match (result, cleanup_result) {
             (Err(err), _) => Err(err),
             (Ok(()), Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
@@ -6802,7 +6827,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let cleanup = std::thread::spawn(move || {
             started_tx.send(()).expect("signal cleanup start");
-            cleanup_owned_identity(&cleanup_pid, &cleanup_token, &cleanup_old_token)
+            cleanup_owned_generation(&cleanup_pid, &cleanup_token, &cleanup_old_token, None)
         });
         started_rx.recv().expect("cleanup started");
         std::thread::sleep(Duration::from_millis(25));
@@ -7488,5 +7513,91 @@ mod tests {
 
         assert!(provider.spawned_windows().is_empty());
         assert_eq!(provider.sidebar_visibility_preference(), None);
+    }
+
+    /// Parks in `cleanup_mux_hooks` until released.
+    struct BlockingCleanupSource {
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl StateSource for BlockingCleanupSource {
+        fn snapshot_json(&self) -> String {
+            "{}".to_string()
+        }
+
+        fn cleanup_mux_hooks(&self) {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successor_cannot_publish_until_shutdown_cleanup_finishes() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-successor-{}-{id}", process::id()));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, pid_file.clone())
+                .with_token_file(token_file.clone())
+                .with_state_source(BlockingCleanupSource {
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(Some(release_rx)),
+                }),
+        )
+        .await
+        .expect("start server");
+        // A successor generation starting while cleanup runs publishes its
+        // identity first. Everything below runs off the runtime thread, so
+        // it also observes a cleanup that blocks that thread.
+        let successor_token = "c".repeat(64);
+        let successor_pid = pid_file.clone();
+        let successor_token_file = token_file.clone();
+        let successor_token_value = successor_token.clone();
+        let successor = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown cleanup started");
+            let (published_tx, published_rx) = std::sync::mpsc::channel();
+            let publisher = std::thread::spawn(move || {
+                publish_identity(
+                    &successor_pid,
+                    &successor_token_file,
+                    &successor_token_value,
+                )
+                .expect("publish successor");
+                let _ = published_tx.send(());
+            });
+            let published_during_cleanup = published_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_ok();
+            let _ = release_tx.send(());
+            publisher.join().expect("successor published");
+            published_during_cleanup
+        });
+        server.shutdown().await.expect("shutdown");
+        let published_during_cleanup = successor.join().expect("successor thread");
+
+        let successor_kept = fs::read_to_string(&token_file).ok() == Some(successor_token);
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&token_file);
+        let _ = fs::remove_file(root.with_extension("identity.lock"));
+        assert!(
+            !published_during_cleanup,
+            "a successor published while the old generation was still cleaning up"
+        );
+        assert!(
+            successor_kept,
+            "old generation removed the successor identity"
+        );
     }
 }
