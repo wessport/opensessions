@@ -134,10 +134,16 @@ auth_token() {
 # making progress, instead of giving up after a fixed number of polls.
 START_TIMEOUT="${OPENSESSIONS_START_TIMEOUT:-30}"
 
+# Returns 0 with the lock held, 1 on failure, or 2 when a server became
+# reachable while waiting. Sets saw_live_launcher=1 when it had to wait on a
+# live launcher, and SERVER_START_OBSERVED=1 when that launcher's server came
+# up while waiting (a fresh start by someone else).
 acquire_start_lock() {
   deadline=$(( $(date +%s) + START_TIMEOUT ))
+  saw_live_launcher=0
   while ! mkdir "$START_LOCK_DIR" 2>/dev/null; do
     if server_alive; then
+      [ "$saw_live_launcher" -eq 0 ] || SERVER_START_OBSERVED=1
       return 2
     fi
 
@@ -149,6 +155,8 @@ acquire_start_lock() {
       rm -rf "$START_LOCK_DIR"
       continue
     fi
+    # No pid yet means the launcher has just created the lock.
+    saw_live_launcher=1
 
     if [ "$(date +%s)" -ge "$deadline" ]; then
       show_startup_error "opensessions: server start lock timed out. Remove $START_LOCK_DIR if no launcher is active."
@@ -165,9 +173,25 @@ release_start_lock() {
   rm -rf "$START_LOCK_DIR"
 }
 
-# Set to 1 when ensure_server launched a new server generation. A fresh server
-# restores the user's last recorded sidebar visibility during startup.
+# Set to 1 when this ensure_server call launched the server generation that is
+# now answering. A fresh server restores the user's last recorded sidebar
+# visibility during startup.
 SERVER_STARTED=0
+# Set to 1 when this call waited on another launcher's in-progress start and
+# that start brought the server up, so it has just restored sidebars too.
+SERVER_START_OBSERVED=0
+
+# True when the answering server is the process this invocation launched. The
+# server publishes its pid file only after binding the port.
+launched_server_answering() {
+  kill -0 "$1" 2>/dev/null && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$1" ] && server_alive
+}
+
+# True when a fresh server generation, started by this invocation or by the
+# launcher it waited on, is now serving.
+server_freshly_started() {
+  [ "$SERVER_STARTED" = 1 ] || [ "$SERVER_START_OBSERVED" = 1 ]
+}
 
 ensure_server() {
   unset OPENSESSIONS_WIDTH
@@ -186,6 +210,8 @@ ensure_server() {
   fi
 
   if server_alive; then
+    # The launcher we waited on released the lock after its server came up.
+    [ "$saw_live_launcher" -eq 0 ] || SERVER_START_OBSERVED=1
     release_start_lock
     return 0
   fi
@@ -206,22 +232,28 @@ ensure_server() {
   server_pid=$!
 
   # Keep waiting while the launched server is still running; stop early only
-  # when it exits (for example, another launcher's server owns the port).
+  # when it exits (for example, another server already owns the port).
   deadline=$(( $(date +%s) + START_TIMEOUT ))
   while kill -0 "$server_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 0.1
-    if server_alive; then
+    if launched_server_answering "$server_pid"; then
       SERVER_STARTED=1
       release_start_lock
       return 0
     fi
   done
 
-  # A concurrent launcher may have won the race between our final poll and the
-  # child bind attempt. Treat a healthy endpoint as success; never surface an
-  # "address already in use" startup failure when the server is actually up.
-  if server_alive; then
+  # Our server exited (or is still starting at the deadline) but an endpoint
+  # answers: a server was already running, e.g. one too slow for the 200ms
+  # liveness probe. Use it, but it did not just restore sidebars, so leave
+  # SERVER_STARTED=0. Never surface an "address already in use" startup failure
+  # when the server is actually up.
+  if launched_server_answering "$server_pid"; then
     SERVER_STARTED=1
+    release_start_lock
+    return 0
+  fi
+  if server_alive; then
     release_start_lock
     return 0
   fi
