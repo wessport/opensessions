@@ -67,8 +67,23 @@ pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_CONCURRENT_CONNECTIONS: usize = 128;
-const RESERVED_HTTP_CONNECTIONS: usize = 8;
+/// Descriptors kept free for everything that is not a client connection:
+/// stdio, the listener, identity and log files, and the pipes of concurrent
+/// tmux, Git, `ps`, and `lsof` children.
+const FD_HEADROOM: u64 = 96;
+/// Startup raises the soft descriptor limit toward this (bounded by the hard
+/// limit). macOS defaults to a soft limit of 256 and rejects soft limits above
+/// `OPEN_MAX` (10240) when the hard limit is unlimited.
+const FD_SOFT_LIMIT_TARGET: u64 = 8_192;
+const MIN_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_CONCURRENT_CONNECTIONS: usize = 2_048;
+const MIN_RESERVED_HTTP_CONNECTIONS: usize = 8;
+const MIN_PASSIVE_WEBSOCKETS: usize = 4;
+/// Websocket path sidebars connect on. Every visited window keeps one sidebar
+/// connection, so sidebars may use the whole websocket capacity while other
+/// (passive) websocket clients are limited to a share of it.
+pub const SIDEBAR_WEBSOCKET_PATH: &str = "/?client=sidebar";
+const MAX_CONNECTIONS_ENV: &str = "OPENSESSIONS_MAX_CONNECTIONS";
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
 const IDENTITY_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,6 +115,133 @@ const OPENCODE_SQL_SEP: char = '\u{1f}';
 const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
 const MIN_DETAIL_PANEL_HEIGHT: u16 = 4;
 const MAX_DETAIL_PANEL_HEIGHT: u16 = 60;
+
+/// Connection caps derived from the process descriptor limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLimits {
+    /// All concurrent connections, HTTP and websocket.
+    pub total: usize,
+    /// Websockets; the remainder stays available for HTTP hooks and probes.
+    pub websockets: usize,
+    /// Websockets that did not connect as a sidebar.
+    pub passive_websockets: usize,
+}
+
+impl ConnectionLimits {
+    /// Bounds connections by the soft descriptor limit less `FD_HEADROOM`,
+    /// never above `MAX_CONCURRENT_CONNECTIONS`. A configured cap can lower,
+    /// but not raise, that bound.
+    pub fn from_fd_limit(fd_soft_limit: u64, configured: Option<usize>) -> Self {
+        let fd_budget =
+            usize::try_from(fd_soft_limit.saturating_sub(FD_HEADROOM)).unwrap_or(usize::MAX);
+        let hard_cap = fd_budget.clamp(MIN_CONCURRENT_CONNECTIONS, MAX_CONCURRENT_CONNECTIONS);
+        let total = configured.map_or(hard_cap, |configured| {
+            configured.clamp(MIN_CONCURRENT_CONNECTIONS, hard_cap)
+        });
+        let reserved_http = (total / 16).max(MIN_RESERVED_HTTP_CONNECTIONS);
+        let websockets = total - reserved_http;
+        let passive_websockets = (websockets / 8)
+            .max(MIN_PASSIVE_WEBSOCKETS)
+            .min(websockets / 2);
+        Self {
+            total,
+            websockets,
+            passive_websockets,
+        }
+    }
+}
+
+/// Reads `OPENSESSIONS_MAX_CONNECTIONS`, a positive connection cap.
+pub fn max_connections_from_env(env: impl Fn(&str) -> Option<String>) -> Option<usize> {
+    env(MAX_CONNECTIONS_ENV)?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit > 0)
+}
+
+/// Returns the (soft, hard) `RLIMIT_NOFILE` descriptor limits.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is not `u64` on every unix target.
+fn descriptor_limits() -> Option<(u64, u64)> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the provided, properly sized struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    Some((limit.rlim_cur as u64, limit.rlim_max as u64))
+}
+
+#[cfg(not(unix))]
+fn descriptor_limits() -> Option<(u64, u64)> {
+    None
+}
+
+/// Raises the soft descriptor limit toward `FD_SOFT_LIMIT_TARGET`, bounded by
+/// the hard limit, and returns the resulting soft limit. Never lowers it.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is not `u64` on every unix target.
+pub fn raise_fd_soft_limit() -> Option<u64> {
+    let (soft, hard) = descriptor_limits()?;
+    let target = hard.min(FD_SOFT_LIMIT_TARGET);
+    if soft >= target {
+        return Some(soft);
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    // SAFETY: setrlimit only reads the provided, properly sized struct.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        Some(target)
+    } else {
+        Some(soft)
+    }
+}
+
+#[cfg(not(unix))]
+pub fn raise_fd_soft_limit() -> Option<u64> {
+    None
+}
+
+/// Websocket admission: every websocket takes a websocket slot, and clients
+/// that did not connect as sidebars also take a passive slot, so passive
+/// clients can never crowd out sidebars.
+#[derive(Debug, Clone)]
+struct WebsocketCapacity {
+    websockets: Arc<Semaphore>,
+    passive: Arc<Semaphore>,
+}
+
+impl WebsocketCapacity {
+    fn new(limits: ConnectionLimits) -> Self {
+        Self {
+            websockets: Arc::new(Semaphore::new(limits.websockets)),
+            passive: Arc::new(Semaphore::new(limits.passive_websockets)),
+        }
+    }
+
+    /// Permits are released when the returned guard drops, which happens as
+    /// soon as the connection's handler returns.
+    fn try_admit(
+        &self,
+        sidebar: bool,
+    ) -> Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    )> {
+        let passive = if sidebar {
+            None
+        } else {
+            Some(Arc::clone(&self.passive).try_acquire_owned().ok()?)
+        };
+        let websocket = Arc::clone(&self.websockets).try_acquire_owned().ok()?;
+        Some((websocket, passive))
+    }
+}
 
 #[derive(Debug, Default)]
 struct ShutdownAnnouncement {
@@ -4042,6 +4184,7 @@ pub struct ServerConfig {
     pub pid_file: PathBuf,
     pub token_file: PathBuf,
     pub server_identity: Option<String>,
+    pub max_connections: Option<usize>,
     state_source: Option<Arc<dyn StateSource>>,
 }
 
@@ -4053,8 +4196,16 @@ impl ServerConfig {
             pid_file: pid_file.into(),
             token_file: PathBuf::new(),
             server_identity: None,
+            max_connections: None,
             state_source: None,
         }
+    }
+
+    /// Lowers the connection cap below the one derived from the descriptor
+    /// limit; it can never exceed that bound.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
+        self
     }
 
     pub fn with_token_file(mut self, token_file: impl Into<PathBuf>) -> Self {
@@ -4331,13 +4482,35 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         Arc::clone(&latest_state),
     ));
     let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
-    if let Some(source) = config.state_source.clone() {
-        *latest_state.write().unwrap() = Some(source.snapshot_json());
-        let _background_tasks = source
-            .clone()
-            .start_background_tasks(state_updates.clone(), shutdown.clone());
-        source.setup_mux_hooks(&config.host, addr.port(), &token_file.to_string_lossy());
-    }
+    let connection_limits = ConnectionLimits::from_fd_limit(
+        descriptor_limits().map_or(256, |(soft, _)| soft),
+        config.max_connections,
+    );
+    debug_log(format!("connection limits: {connection_limits:?}"));
+    let state_operation_lock = Arc::new(AsyncMutex::new(()));
+    let startup_ready = Arc::new(AtomicBool::new(config.state_source.is_none()));
+    // Serve from here on: hook setup and the first snapshot (Git per session,
+    // system-wide ps and lsof) run on the blocking pool. The startup task
+    // holds the state operation lock from before the first accept, so every
+    // state request queues behind it exactly as it used to queue in the
+    // listen backlog.
+    let startup_task = config.state_source.clone().map(|source| {
+        let startup_guard = Arc::clone(&state_operation_lock)
+            .try_lock_owned()
+            .expect("a new state operation lock is uncontended");
+        tokio::spawn(initialize_state_source(StartupContext {
+            source,
+            startup_guard,
+            host: config.host.clone(),
+            port: addr.port(),
+            token_file: token_file.to_string_lossy().into_owned(),
+            startup_ready: Arc::clone(&startup_ready),
+            latest_state: Arc::clone(&latest_state),
+            state_updates: state_updates.clone(),
+            shutdown: shutdown.clone(),
+            shutdown_announcement: Arc::clone(&shutdown_announcement),
+        }))
+    });
     let task_shutdown = shutdown.clone();
     let state_source = config.state_source.clone();
     let cleanup_state_source = state_source.clone();
@@ -4353,8 +4526,15 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             loop_shutdown_announcement,
             token.clone(),
             server_identity,
+            state_operation_lock,
+            startup_ready,
+            connection_limits,
         )
         .await;
+        // Never remove hooks while startup may still be installing them.
+        if let Some(startup_task) = startup_task {
+            let _ = startup_task.await;
+        }
         identity_task.abort();
         let _ = identity_task.await;
         state_cache_task.abort();
@@ -4383,6 +4563,64 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     })
 }
 
+struct StartupContext {
+    source: Arc<dyn StateSource>,
+    startup_guard: tokio::sync::OwnedMutexGuard<()>,
+    host: String,
+    port: u16,
+    token_file: String,
+    startup_ready: Arc<AtomicBool>,
+    latest_state: Arc<RwLock<Option<String>>>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+    shutdown_announcement: Arc<ShutdownAnnouncement>,
+}
+
+/// Installs mux hooks (restoring recorded sidebars), then builds and publishes
+/// the one initial snapshot, then starts the background loops, all while the
+/// accept loop is already serving liveness and ingestion.
+///
+/// The state operation lock is held throughout, so requests that need state
+/// run after the initial snapshot and their newer payloads are published after
+/// it. Background loops, which publish snapshots without that lock, start only
+/// once the initial snapshot is published, so it can never overwrite them.
+async fn initialize_state_source(context: StartupContext) {
+    let StartupContext {
+        source,
+        startup_guard,
+        host,
+        port,
+        token_file,
+        startup_ready,
+        latest_state,
+        state_updates,
+        shutdown,
+        shutdown_announcement,
+    } = context;
+    let hook_source = Arc::clone(&source);
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || hook_source.setup_mux_hooks(&host, port, &token_file))
+            .await
+    {
+        debug_log(format!("startup: mux hook setup failed: {error}"));
+    }
+    startup_ready.store(true, Ordering::Release);
+    if shutdown_announcement.is_announced() {
+        return;
+    }
+    let snapshot_source = Arc::clone(&source);
+    match tokio::task::spawn_blocking(move || snapshot_source.snapshot_json()).await {
+        Ok(snapshot) if !shutdown_announcement.is_announced() => {
+            *latest_state.write().unwrap() = Some(snapshot.clone());
+            let _ = state_updates.send(snapshot);
+        }
+        Ok(_) => return,
+        Err(error) => debug_log(format!("startup: initial snapshot failed: {error}")),
+    }
+    drop(startup_guard);
+    let _background_tasks = source.start_background_tasks(state_updates, shutdown);
+}
+
 async fn run_accept_loop(
     listener: TcpListener,
     shutdown: broadcast::Sender<()>,
@@ -4393,12 +4631,13 @@ async fn run_accept_loop(
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
     server_identity: Option<String>,
+    state_operation_lock: Arc<AsyncMutex<()>>,
+    startup_ready: Arc<AtomicBool>,
+    connection_limits: ConnectionLimits,
 ) -> Result<(), ServerError> {
-    let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    let websocket_limit = Arc::new(Semaphore::new(
-        MAX_CONCURRENT_CONNECTIONS - RESERVED_HTTP_CONNECTIONS,
-    ));
-    let state_operation_lock = Arc::new(AsyncMutex::new(()));
+    let connection_limit = Arc::new(Semaphore::new(connection_limits.total));
+    let websocket_capacity = WebsocketCapacity::new(connection_limits);
+    let ingestion_lock = Arc::new(AsyncMutex::new(()));
     let (state_refreshes, refresh_requests) = mpsc::channel(1);
     tokio::spawn(run_coalesced_state_refreshes(
         state_source.clone(),
@@ -4437,6 +4676,11 @@ async fn run_accept_loop(
                     }
                 };
                 let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                    // Refuse without blocking the accept loop; the reply is
+                    // best effort and the descriptor is closed right away.
+                    let _ = stream.try_write(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nconnection capacity",
+                    );
                     continue;
                 };
                 let connection_shutdown = shutdown.clone();
@@ -4446,9 +4690,11 @@ async fn run_accept_loop(
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 let connection_auth_token = auth_token.clone();
                 let connection_state_operation_lock = Arc::clone(&state_operation_lock);
+                let connection_ingestion_lock = Arc::clone(&ingestion_lock);
                 let connection_state_refreshes = state_refreshes.clone();
                 let connection_server_identity = server_identity.clone();
-                let connection_websocket_limit = Arc::clone(&websocket_limit);
+                let connection_websocket_capacity = websocket_capacity.clone();
+                let connection_startup_ready = Arc::clone(&startup_ready);
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let _ = handle_connection(
@@ -4460,9 +4706,11 @@ async fn run_accept_loop(
                         connection_shutdown_announcement,
                         connection_auth_token,
                         connection_state_operation_lock,
+                        connection_ingestion_lock,
                         connection_state_refreshes,
                         connection_server_identity,
-                        connection_websocket_limit,
+                        connection_websocket_capacity,
+                        connection_startup_ready,
                     )
                     .await;
                 });
@@ -4601,6 +4849,32 @@ where
         .map_err(ServerError::from)
 }
 
+/// Runs agent-event and Pi runtime ingestion on the blocking pool without the
+/// state operation lock. Ingestion only updates the server's own registries
+/// (plus a short session lookup), so it must not queue behind a full snapshot
+/// or a tmux mutation that holds that lock for seconds: senders such as the
+/// Amp plugin give up after 750 ms. `ingestion_lock` applies these requests one
+/// at a time in arrival order; the resulting sidebar state is published by the
+/// coalesced refresh worker rather than per event.
+async fn run_state_ingestion_blocking<R, F>(
+    state_source: &Option<Arc<dyn StateSource>>,
+    ingestion_lock: &AsyncMutex<()>,
+    operation: F,
+) -> Result<Option<R>, ServerError>
+where
+    R: Send + 'static,
+    F: FnOnce(&dyn StateSource) -> R + Send + 'static,
+{
+    let Some(state_source) = state_source.clone() else {
+        return Ok(None);
+    };
+    let _ingestion_guard = ingestion_lock.lock().await;
+    tokio::task::spawn_blocking(move || operation(state_source.as_ref()))
+        .await
+        .map(Some)
+        .map_err(ServerError::from)
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: broadcast::Sender<()>,
@@ -4610,9 +4884,11 @@ async fn handle_connection(
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
     state_operation_lock: Arc<AsyncMutex<()>>,
+    ingestion_lock: Arc<AsyncMutex<()>>,
     state_refreshes: mpsc::Sender<()>,
     server_identity: Option<String>,
-    websocket_limit: Arc<Semaphore>,
+    websocket_capacity: WebsocketCapacity,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), ServerError> {
     let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
         .await
@@ -4735,12 +5011,11 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        let result =
-            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
-                source.handle_agent_event_json(&body)
-            })
-            .await?
-            .unwrap_or(Err(AgentEventError::CouldNotResolveSession));
+        let result = run_state_ingestion_blocking(&state_source, &ingestion_lock, move |source| {
+            source.handle_agent_event_json(&body)
+        })
+        .await?
+        .unwrap_or(Err(AgentEventError::CouldNotResolveSession));
         match result {
             Ok(()) => {
                 let _ = state_refreshes.try_send(());
@@ -4774,7 +5049,7 @@ async fn handle_connection(
             return Ok(());
         };
         if let Some(Err(err)) =
-            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+            run_state_ingestion_blocking(&state_source, &ingestion_lock, move |source| {
                 source.handle_pi_runtime_upsert(&body)
             })
             .await?
@@ -4808,7 +5083,7 @@ async fn handle_connection(
             return Ok(());
         };
         if let Some(Err(err)) =
-            run_state_source_blocking(&state_source, &state_operation_lock, move |source| {
+            run_state_ingestion_blocking(&state_source, &ingestion_lock, move |source| {
                 source.handle_pi_runtime_delete(&body)
             })
             .await?
@@ -4877,7 +5152,8 @@ async fn handle_connection(
     }
 
     if parsed.is_websocket_upgrade() {
-        let Ok(websocket_permit) = websocket_limit.try_acquire_owned() else {
+        let sidebar = parsed.query_param("client") == Some("sidebar");
+        let Some(websocket_permit) = websocket_capacity.try_admit(sidebar) else {
             write_http_response(
                 &mut stream,
                 "503 Service Unavailable",
@@ -4906,23 +5182,40 @@ async fn handle_connection(
         let _websocket_permit = websocket_permit;
         debug_log("ws: client connected, sending hello + initial state");
         websocket.send(Message::text(HELLO_JSON)).await?;
+        // Subscribe before reading the cached state: startup stores its
+        // snapshot before broadcasting it, so a client that finds no cached
+        // state is guaranteed to receive that broadcast.
+        let mut connection_shutdown = shutdown.subscribe();
+        let mut state_rx = state_updates.subscribe();
         let initial_state = latest_state.read().unwrap().clone();
-        let initial_state = if initial_state.is_some() {
-            initial_state
-        } else {
-            run_state_source_blocking(
-                &state_source,
-                &state_operation_lock,
-                StateSource::snapshot_json,
-            )
-            .await?
+        let initial_state = match initial_state {
+            Some(state) => Some(state),
+            // Early clients share the single startup snapshot instead of each
+            // building their own while it is still in flight.
+            None if state_source.is_some() => loop {
+                tokio::select! {
+                    _ = connection_shutdown.recv() => {
+                        let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                        return Ok(());
+                    }
+                    update = state_rx.recv() => match update {
+                        Ok(update) if update == QUIT_JSON => {
+                            let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                            return Ok(());
+                        }
+                        Ok(update) if is_immediate_server_message(&update) => {}
+                        Ok(update) => break Some(update),
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    },
+                }
+            },
+            None => None,
         };
         if let Some(initial_state) = initial_state {
             websocket.send(Message::text(initial_state)).await?;
         }
 
-        let mut connection_shutdown = shutdown.subscribe();
-        let mut state_rx = state_updates.subscribe();
         let mut client_context = ClientConnectionContext::default();
         let mut pending_state: Option<String> = None;
         let mut state_flush =
@@ -5083,7 +5376,16 @@ async fn handle_connection(
         }
     }
 
-    if parsed.method == "GET" && parsed.path == "/" {
+    if parsed.method == "GET" && parsed.path == "/" && !startup_ready.load(Ordering::Acquire) {
+        // Launchers treat a live server as one whose hooks are installed and
+        // whose recorded sidebars are restored; answer, but not as live yet.
+        write_http_response(
+            &mut stream,
+            "503 Service Unavailable",
+            "opensessions server initializing",
+        )
+        .await?;
+    } else if parsed.method == "GET" && parsed.path == "/" {
         let body = server_identity
             .map(|identity| format!("opensessions server {identity}"))
             .unwrap_or_else(|| "opensessions server".to_string());
@@ -7199,6 +7501,697 @@ mod tests {
             switched_before_release,
             "interactive switching must bypass unrelated full-state work"
         );
+    }
+
+    /// A test server's identity files, removed (with the identity lock) on drop.
+    struct TestServerFiles {
+        pid_file: PathBuf,
+        token_file: PathBuf,
+    }
+
+    impl TestServerFiles {
+        fn paths(&self) -> (PathBuf, PathBuf) {
+            (self.pid_file.clone(), self.token_file.clone())
+        }
+    }
+
+    impl Drop for TestServerFiles {
+        fn drop(&mut self) {
+            for path in [
+                self.pid_file.with_extension("identity.lock"),
+                self.pid_file.clone(),
+                self.token_file.clone(),
+            ] {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    fn startup_test_paths(label: &str) -> TestServerFiles {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-{label}-{}-{id}", process::id()));
+        TestServerFiles {
+            pid_file: root.with_extension("pid"),
+            token_file: root.with_extension("token"),
+        }
+    }
+
+    async fn connect_test_websocket(
+        addr: SocketAddr,
+        token: &str,
+    ) -> tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>> {
+        let uri = format!("ws://{addr}").parse().expect("ws uri");
+        let (websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("authorization"),
+            )
+            .expect("add authorization header")
+            .connect()
+            .await
+            .expect("connect websocket");
+        websocket
+    }
+
+    async fn next_text<S>(websocket: &mut S) -> String
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_websockets::Error>> + Unpin,
+    {
+        let message = tokio::time::timeout(Duration::from_secs(5), websocket.next())
+            .await
+            .expect("websocket frame in time")
+            .expect("websocket open")
+            .expect("websocket frame");
+        message.as_text().expect("text frame").to_string()
+    }
+
+    #[tokio::test]
+    async fn liveness_answers_while_the_initial_snapshot_is_slow() {
+        let files = startup_test_paths("slow-initial-snapshot");
+        let (pid_file, token_file) = files.paths();
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(SlowSnapshotSource {
+                    snapshot_count: Arc::clone(&snapshot_count),
+                    delay: Duration::from_millis(2_000),
+                }),
+        )
+        .await
+        .expect("start server");
+        // Hook setup is instant here; only the snapshot is slow.
+        let liveness = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let response = http_exchange(
+                    server.addr(),
+                    "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                )
+                .await;
+                if !response.starts_with(b"HTTP/1.1 503") {
+                    return response;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let answered_after = started.elapsed();
+        server.shutdown().await.expect("stop server");
+
+        let liveness = liveness.expect("liveness must not wait for the initial snapshot");
+        assert!(
+            liveness.starts_with(b"HTTP/1.1 200 OK"),
+            "unexpected liveness response: {}",
+            String::from_utf8_lossy(&liveness)
+        );
+        assert!(
+            answered_after < Duration::from_millis(500),
+            "liveness answered after {answered_after:?}"
+        );
+    }
+
+    /// Hook setup blocks until released, like tmux installing hooks and
+    /// restoring sidebars on a loaded machine.
+    #[derive(Clone)]
+    struct GatedHookSource {
+        hooks_release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        hooks_installed: Arc<AtomicBool>,
+    }
+
+    impl StateSource for GatedHookSource {
+        fn snapshot_json(&self) -> String {
+            "{}".to_string()
+        }
+
+        fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {
+            let (released, wake) = self.hooks_release.as_ref();
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.hooks_installed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_reports_initializing_until_hooks_are_installed() {
+        let files = startup_test_paths("hook-gate");
+        let (pid_file, token_file) = files.paths();
+        let hooks_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hooks_installed = Arc::new(AtomicBool::new(false));
+        // Safety net so a server that installs hooks on the runtime thread
+        // fails this test instead of hanging it.
+        let fallback_release = Arc::clone(&hooks_release);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            let (released, wake) = fallback_release.as_ref();
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        });
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(GatedHookSource {
+                    hooks_release: Arc::clone(&hooks_release),
+                    hooks_installed: Arc::clone(&hooks_installed),
+                }),
+        )
+        .await
+        .expect("start server");
+        let liveness = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string();
+        let initializing = tokio::time::timeout(
+            Duration::from_millis(500),
+            http_exchange(server.addr(), liveness.clone()),
+        )
+        .await
+        .expect("liveness answers during hook setup");
+
+        let (released, wake) = hooks_release.as_ref();
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = http_exchange(server.addr(), liveness.clone()).await;
+                if response.starts_with(b"HTTP/1.1 200 OK") {
+                    return hooks_installed.load(Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        server.shutdown().await.expect("stop server");
+
+        // Launchers treat a live server as one whose hooks and restored
+        // sidebars are in place, so it must not claim liveness earlier.
+        assert!(
+            initializing.starts_with(b"HTTP/1.1 503 Service Unavailable"),
+            "unexpected response during hook setup: {}",
+            String::from_utf8_lossy(&initializing)
+        );
+        assert!(!initializing.ends_with(b"opensessions server"));
+        assert_eq!(ready, Ok(true), "liveness becomes ready only after hooks");
+    }
+
+    #[tokio::test]
+    async fn early_sidebar_connections_share_one_initial_snapshot() {
+        let files = startup_test_paths("early-sidebars");
+        let (pid_file, token_file) = files.paths();
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(SlowSnapshotSource {
+                    snapshot_count: Arc::clone(&snapshot_count),
+                    delay: Duration::from_millis(400),
+                }),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+        let sidebars = (0..8)
+            .map(|_| {
+                let token = token.clone();
+                tokio::spawn(async move {
+                    let mut websocket = connect_test_websocket(addr, &token).await;
+                    let hello = next_text(&mut websocket).await;
+                    let state = next_text(&mut websocket).await;
+                    (hello, state)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut received = Vec::new();
+        for sidebar in sidebars {
+            received.push(sidebar.await.expect("sidebar task"));
+        }
+        server.shutdown().await.expect("stop server");
+
+        for (hello, state) in received {
+            assert_eq!(hello, HELLO_JSON);
+            assert_eq!(state, "{}");
+        }
+        assert_eq!(snapshot_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// The initial snapshot is slow and marked `initial`; a metadata update
+    /// produces a newer, marked state.
+    #[derive(Clone)]
+    struct InitialThenNewerSource {
+        snapshot_started: Arc<AtomicBool>,
+    }
+
+    impl StateSource for InitialThenNewerSource {
+        fn snapshot_json(&self) -> String {
+            self.snapshot_started.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            r#"{"type":"state","marker":"initial"}"#.to_string()
+        }
+
+        fn handle_http_json(&self, _path: &str, _body: &Value) -> Option<String> {
+            Some(r#"{"type":"state","marker":"newer"}"#.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_initial_snapshot_never_overwrites_newer_state() {
+        let files = startup_test_paths("initial-overwrite");
+        let (pid_file, token_file) = files.paths();
+        let snapshot_started = Arc::new(AtomicBool::new(false));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(InitialThenNewerSource {
+                    snapshot_started: Arc::clone(&snapshot_started),
+                }),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+        let mut early = connect_test_websocket(addr, &token).await;
+        assert_eq!(next_text(&mut early).await, HELLO_JSON);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !snapshot_started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial snapshot starts");
+        let body = r#"{"session":"work","text":"busy"}"#;
+        let update = http_exchange(
+            addr,
+            format!(
+                "POST /set-status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(update.starts_with(b"HTTP/1.1 204 No Content"));
+        let first = next_text(&mut early).await;
+        let second = next_text(&mut early).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut late = connect_test_websocket(addr, &token).await;
+        assert_eq!(next_text(&mut late).await, HELLO_JSON);
+        let late_state = next_text(&mut late).await;
+        server.shutdown().await.expect("stop server");
+
+        assert!(first.contains("initial"), "first state: {first}");
+        assert!(second.contains("newer"), "second state: {second}");
+        assert!(
+            late_state.contains("newer"),
+            "late client state: {late_state}"
+        );
+    }
+
+    #[test]
+    fn connection_limits_are_derived_from_the_descriptor_limit() {
+        // macOS's default soft limit when raising it is not possible.
+        let constrained = ConnectionLimits::from_fd_limit(256, None);
+        assert_eq!(constrained.total, 160);
+        assert_eq!(constrained.websockets, 150);
+        assert_eq!(constrained.passive_websockets, 18);
+
+        // A raised limit allows far more sidebars than the old fixed 120,
+        // but the hard cap still bounds the server's descriptors.
+        let raised = ConnectionLimits::from_fd_limit(8_192, None);
+        assert_eq!(raised.total, 2_048);
+        assert_eq!(raised.websockets, 1_920);
+        assert_eq!(raised.passive_websockets, 240);
+        assert_eq!(ConnectionLimits::from_fd_limit(u64::MAX, None), raised);
+
+        // A configured cap may lower the limit but never exceed the
+        // descriptor budget or drop below a usable floor.
+        assert_eq!(
+            ConnectionLimits::from_fd_limit(256, Some(10_000)),
+            constrained
+        );
+        let configured = ConnectionLimits::from_fd_limit(8_192, Some(500));
+        assert_eq!(configured.total, 500);
+        assert_eq!(configured.websockets, 469);
+        assert_eq!(ConnectionLimits::from_fd_limit(8_192, Some(1)).total, 16);
+        assert_eq!(ConnectionLimits::from_fd_limit(32, None).total, 16);
+        for limits in [constrained, raised, configured] {
+            assert!(limits.websockets < limits.total);
+            assert!(limits.passive_websockets < limits.websockets);
+        }
+    }
+
+    #[test]
+    fn configured_connection_cap_is_read_from_the_environment() {
+        let env = |value: &'static str| {
+            move |key: &str| (key == "OPENSESSIONS_MAX_CONNECTIONS").then(|| value.to_string())
+        };
+        assert_eq!(max_connections_from_env(env("600")), Some(600));
+        assert_eq!(max_connections_from_env(env(" 600 ")), Some(600));
+        assert_eq!(max_connections_from_env(env("lots")), None);
+        assert_eq!(max_connections_from_env(env("0")), None);
+        assert_eq!(max_connections_from_env(|_| None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raising_the_descriptor_limit_never_lowers_it() {
+        let before = descriptor_limits().expect("read RLIMIT_NOFILE");
+        let raised = raise_fd_soft_limit().expect("raise RLIMIT_NOFILE");
+        let after = descriptor_limits().expect("read RLIMIT_NOFILE");
+        assert_eq!(raised, after.0);
+        assert!(after.0 >= before.0);
+        assert!(after.0 >= before.1.min(FD_SOFT_LIMIT_TARGET));
+        assert_eq!(after.1, before.1, "the hard limit is left alone");
+    }
+
+    async fn try_connect_websocket(
+        addr: SocketAddr,
+        token: &str,
+        path: &str,
+    ) -> Option<tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>>>
+    {
+        let uri = format!("ws://{addr}{path}").parse().expect("ws uri");
+        let (mut websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("authorization"),
+            )
+            .expect("add authorization header")
+            .connect()
+            .await
+            .ok()?;
+        assert_eq!(next_text(&mut websocket).await, HELLO_JSON);
+        let _ = next_text(&mut websocket).await;
+        Some(websocket)
+    }
+
+    async fn connect_websocket_when_released(
+        addr: SocketAddr,
+        token: &str,
+        path: &str,
+    ) -> Option<tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>>>
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(websocket) = try_connect_websocket(addr, token, path).await {
+                return Some(websocket);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_slots_are_reserved_for_sidebars_and_released_on_close() {
+        let files = startup_test_paths("websocket-capacity");
+        let (pid_file, token_file) = files.paths();
+        let limits = ConnectionLimits::from_fd_limit(u64::MAX, Some(32));
+        assert_eq!((limits.websockets, limits.passive_websockets), (24, 4));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_max_connections(32)
+                .with_state_source(|| "{}".to_string()),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+        let sidebar = SIDEBAR_WEBSOCKET_PATH;
+
+        let mut passive = Vec::new();
+        for _ in 0..4 {
+            passive.push(try_connect_websocket(addr, &token, "/").await);
+        }
+        let passive_over_share = try_connect_websocket(addr, &token, "/").await.is_some();
+        let mut sidebars = Vec::new();
+        for _ in 0..20 {
+            sidebars.push(try_connect_websocket(addr, &token, sidebar).await);
+        }
+        let sidebar_over_cap = try_connect_websocket(addr, &token, sidebar).await.is_some();
+
+        // Closing a client must free its slot promptly, for either kind.
+        let mut closed_passive = passive.pop().flatten().expect("passive client");
+        closed_passive.close().await.expect("close passive client");
+        drop(closed_passive);
+        let passive_after_close = connect_websocket_when_released(addr, &token, "/").await;
+        drop(sidebars.pop().flatten().expect("sidebar client"));
+        let sidebar_after_close = connect_websocket_when_released(addr, &token, sidebar).await;
+        // HTTP keeps its reserved connections while websockets are full.
+        let liveness =
+            http_exchange(addr, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".into()).await;
+        server.shutdown().await.expect("stop server");
+
+        assert!(
+            passive.iter().all(Option::is_some),
+            "passive share admitted"
+        );
+        assert!(
+            !passive_over_share,
+            "passive clients stay within their share"
+        );
+        assert!(
+            sidebars.iter().all(Option::is_some),
+            "sidebars use the reserve"
+        );
+        assert!(!sidebar_over_cap, "the websocket cap still holds");
+        assert!(
+            passive_after_close.is_some(),
+            "closed passive slot released"
+        );
+        assert!(
+            sidebar_after_close.is_some(),
+            "closed sidebar slot released"
+        );
+        assert!(liveness.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn default_websocket_capacity_admits_more_sidebars_than_the_old_fixed_cap() {
+        if raise_fd_soft_limit().is_none_or(|limit| limit < 1_024) {
+            eprintln!("skipping: descriptor limit too low for 150 in-process sidebars");
+            return;
+        }
+        let files = startup_test_paths("websocket-default-capacity");
+        let (pid_file, token_file) = files.paths();
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(|| "{}".to_string()),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let mut sidebars = Vec::new();
+        for _ in 0..150 {
+            match try_connect_websocket(server.addr(), &token, SIDEBAR_WEBSOCKET_PATH).await {
+                Some(websocket) => sidebars.push(websocket),
+                None => break,
+            }
+        }
+        let admitted = sidebars.len();
+        drop(sidebars);
+        server.shutdown().await.expect("stop server");
+        assert_eq!(admitted, 150, "a sidebar was refused after {admitted}");
+    }
+
+    /// A one-session mux whose sidebar pane listing, part of every full
+    /// snapshot, stalls while `slow` is set, like tmux under fork pressure.
+    struct StallingSnapshotMux {
+        slow: Arc<AtomicBool>,
+        stalled_calls: Arc<AtomicUsize>,
+    }
+
+    impl MuxProvider for StallingSnapshotMux {
+        fn name(&self) -> &str {
+            "stalling-snapshot"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            vec![opensessions_runtime::mux::MuxSessionInfo {
+                name: "work".to_string(),
+                created_at: 0,
+                dir: String::new(),
+                windows: 1,
+            }]
+        }
+        fn list_visible_sidebar_pane_ids(&self) -> Vec<String> {
+            if self.slow.load(Ordering::SeqCst) {
+                self.stalled_calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1_500));
+            }
+            Vec::new()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            Some("work".to_string())
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    async fn http_exchange(addr: SocketAddr, request: String) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("server should answer")
+            .expect("read response");
+        response
+    }
+
+    fn agent_event_request(token: &str, thread: &str, status: &str) -> String {
+        let body = format!(
+            r#"{{"agent":"amp","status":"{status}","tmuxSession":"work","threadId":"{thread}"}}"#
+        );
+        format!(
+            "POST /api/agent-event HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn agent_event_burst_is_answered_while_a_slow_snapshot_is_in_flight() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-event-burst-{}-{id}", process::id()));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let _files = TestServerFiles {
+            pid_file: pid_file.clone(),
+            token_file: token_file.clone(),
+        };
+        let agent_home = root.with_extension("home");
+        fs::create_dir_all(&agent_home).expect("agent home");
+        let slow = Arc::new(AtomicBool::new(false));
+        let stalled_calls = Arc::new(AtomicUsize::new(0));
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(StallingSnapshotMux {
+            slow: Arc::clone(&slow),
+            stalled_calls: Arc::clone(&stalled_calls),
+        })])
+        .with_agent_state_home(&agent_home)
+        .with_auto_hibernate(AutoHibernateSettings {
+            enabled: false,
+            idle_after_ms: 0,
+        });
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(source),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+
+        slow.store(true, Ordering::SeqCst);
+        let refresh = tokio::spawn(http_exchange(
+            addr,
+            format!(
+                "POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stalled_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slow snapshot should start");
+
+        // Ten Amp plugins reloading at once, each with the plugin's 750 ms budget.
+        let burst = (0..10)
+            .map(|index| {
+                let request = agent_event_request(&token, &format!("T-{index}"), "running");
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let response = http_exchange(addr, request).await;
+                    (started.elapsed(), response)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut slowest = Duration::ZERO;
+        for request in burst {
+            let (elapsed, response) = request.await.expect("burst request");
+            assert!(
+                response.starts_with(b"HTTP/1.1 204 No Content"),
+                "unexpected response: {}",
+                String::from_utf8_lossy(&response)
+            );
+            slowest = slowest.max(elapsed);
+        }
+        // One sender's later event must still win over its earlier one.
+        let sequential_started = Instant::now();
+        for status in ["running", "waiting"] {
+            let response = http_exchange(addr, agent_event_request(&token, "T-0", status)).await;
+            assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+        }
+        let sequential = sequential_started.elapsed();
+
+        let _ = refresh.await;
+        slow.store(false, Ordering::SeqCst);
+        let refreshed = http_exchange(
+            addr,
+            format!(
+                "POST /refresh HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(refreshed.starts_with(b"HTTP/1.1 200 OK"));
+        let uri = format!("ws://{addr}").parse().expect("ws uri");
+        let (mut websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("authorization"),
+            )
+            .expect("add authorization header")
+            .connect()
+            .await
+            .expect("connect websocket");
+        let _ = websocket.next().await.expect("hello").expect("hello frame");
+        let state = websocket
+            .next()
+            .await
+            .expect("initial state")
+            .expect("initial state frame");
+        let state: Value = serde_json::from_str(state.as_text().expect("text state")).unwrap();
+        let agents = state["sessions"][0]["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        server.shutdown().await.expect("stop server");
+        let _ = fs::remove_dir_all(&agent_home);
+
+        assert!(
+            slowest < Duration::from_millis(750),
+            "agent events waited {slowest:?} behind an unrelated snapshot"
+        );
+        assert!(
+            sequential < Duration::from_millis(750),
+            "sequential agent events waited {sequential:?}"
+        );
+        assert_eq!(agents.len(), 10, "every burst event is applied: {agents:?}");
+        let latest = agents
+            .iter()
+            .find(|agent| agent["threadId"] == "T-0")
+            .expect("thread T-0");
+        assert_eq!(latest["status"], "waiting");
     }
 
     #[tokio::test]

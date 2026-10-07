@@ -515,6 +515,7 @@ dependencies = [
  "base64",
  "futures-util",
  "http",
+ "libc",
  "opensessions-runtime",
  "opensessions-sidebar-core",
  "serde_json",

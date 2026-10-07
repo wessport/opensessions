@@ -66,7 +66,7 @@ Restarting the opensessions server (update, crash, SIGTERM, `q`) must not silent
 
 - the choice is stored in the tmux global user option `@opensessions_sidebar_visible` (`on`/`off`) on that tmux server, so it is naturally per-socket, survives opensessions restarts, and disappears with the tmux server; hook cleanup leaves it in place and `uninstall.sh` removes it
 - only explicit user transitions record it: toggle-on and the first sidebar connection on a fresh server record `on`; toggle-off records `off`
-- on startup, a server that finds no sidebar panes but a recorded `on` restores visibility exactly like toggle-on: `warming up…` and a sidebar in every window, before it starts accepting requests
+- on startup, a server that finds no sidebar panes but a recorded `on` restores visibility exactly like toggle-on: `warming up…` and a sidebar in every window, before its `GET /` liveness probe reports it live (it answers `503 … initializing` until then) and before it handles any state request; agent-event ingestion may already be accepted
 - a recorded `off` keeps the server hidden, so `/ensure-sidebar` and window/session hooks do not respawn sidebars
 - with no recorded choice (first start in a tmux server), the server starts hidden as before and the first toggle shows the sidebar
 - `toggle.sh` skips its toggle when its own `ensure_server` call just started a server that already restored sidebars; otherwise the restore would be undone immediately

@@ -18,8 +18,11 @@ If no healthy server is listening, `integrations/tmux-plugin/scripts/server-comm
 1. loads config from `~/.config/opensessions/config.json`
 2. registers the built-in tmux provider
 3. resolves the primary mux provider
-4. starts built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid
-5. starts the WebSocket and HTTP control server
+4. binds the WebSocket and HTTP control server, publishes its pid and token files, and starts accepting connections
+5. on the blocking pool, installs tmux hooks and restores recorded sidebars, then builds the one initial state snapshot
+6. starts built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid, and the other background loops, once that snapshot is published
+
+Accepting starts before the slow work in steps 5 and 6 (Git per session, system-wide `ps` and `lsof`), so the server never sits silently in the listen backlog. Until hooks are installed, the unauthenticated `GET /` liveness probe answers `503 opensessions server initializing`; launchers keep polling, so a server they consider live has its hooks and restored sidebars in place. Agent-event and Pi runtime ingestion is accepted immediately. Requests that read or change sidebar state wait behind startup and run after the initial snapshot, and sidebars that connect early receive that shared snapshot instead of each building their own. Background loops start only after it is published, so it can never overwrite newer state.
 
 ## State Assembly
 
@@ -104,6 +107,7 @@ The runtime keeps a small set of operational files:
 Some pieces are intentionally still narrow in scope:
 
 - the server and TUI are local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden
+- every window that has shown a sidebar keeps one websocket open, so connection capacity follows the descriptor limit: the server raises its soft `RLIMIT_NOFILE` toward 8192 (bounded by the hard limit; macOS defaults to 256) and caps concurrent connections at that limit less 96 descriptors of headroom, at most 2048. `OPENSESSIONS_MAX_CONNECTIONS` can lower the cap. About 1/16 of it stays reserved for HTTP hooks and probes; sidebars connect on `/?client=sidebar` and may use the rest, while other websocket clients are limited to 1/8 of the websocket slots. A slot is released as soon as its connection closes
 - parsed config field `keybinding` is not yet wired through the runtime
 - inline theme objects exist in the core API surface, but the running server currently uses theme names
 - tmux is the only supported mux today
