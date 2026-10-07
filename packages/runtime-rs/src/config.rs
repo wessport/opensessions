@@ -1,6 +1,7 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -136,26 +137,76 @@ pub fn load_config_from_home(home: &Path) -> OpensessionsConfig {
     config
 }
 
+/// Merges `updates` into the config file and writes it atomically.
+///
+/// A config file that exists but is not a JSON object is left untouched and
+/// reported as an error: overwriting it would silently discard the user's
+/// settings over a typo.
 pub fn save_config_to_home(home: &Path, updates: OpensessionsConfig) -> io::Result<()> {
     let path = config_path_from_home(home);
-    let existing = fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({ "plugins": [] }));
-
-    let mut merged = match existing {
-        Value::Object(map) => Value::Object(map),
-        _ => serde_json::json!({ "plugins": [] }),
+    let mut merged = match fs::read_to_string(&path) {
+        Ok(raw) if raw.trim().is_empty() => serde_json::json!({ "plugins": [] }),
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(Value::Object(map)) => Value::Object(map),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to overwrite {}: not a JSON object",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to overwrite unparseable {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            serde_json::json!({ "plugins": [] })
+        }
+        Err(error) => return Err(error),
     };
 
     merge_value(&mut merged, Value::Object(update_map(updates)));
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let encoded = serde_json::to_string_pretty(&merged).map_err(io::Error::other)?;
-    fs::write(path, format!("{encoded}\n"))
+    write_file_atomically(&path, &format!("{encoded}\n"))
+}
+
+/// Writes `contents` to a temporary file beside `path` and renames it into
+/// place, so a crash or a concurrent reader never sees a partial file.
+pub(crate) fn write_file_atomically(path: &Path, contents: &str) -> io::Result<()> {
+    static NEXT_TEMPORARY: AtomicUsize = AtomicUsize::new(0);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let temporary = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
@@ -213,6 +264,69 @@ fn merge_value(dst: &mut Value, src: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_home(name: &str) -> PathBuf {
+        static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-config-{name}-{}-{}",
+            std::process::id(),
+            NEXT_HOME.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&home);
+        home
+    }
+
+    #[test]
+    fn saving_never_overwrites_an_unparseable_config() {
+        let home = temp_home("unparseable");
+        let path = config_path_from_home(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let broken = "{ \"sidebarWidth\": 40, \"theme\": \"nord\", }\n";
+        fs::write(&path, broken).unwrap();
+
+        let result = save_config_to_home(
+            &home,
+            OpensessionsConfig {
+                sidebar_width: Some(52),
+                ..OpensessionsConfig::default()
+            },
+        );
+
+        let kept = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+        assert_eq!(
+            result.map_err(|error| error.kind()),
+            Err(io::ErrorKind::InvalidData)
+        );
+        assert_eq!(kept, broken);
+    }
+
+    #[test]
+    fn saving_merges_into_the_existing_config_without_leaving_temp_files() {
+        let home = temp_home("merge");
+        let path = config_path_from_home(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"theme":"nord","plugins":["x"]}"#).unwrap();
+
+        save_config_to_home(
+            &home,
+            OpensessionsConfig {
+                sidebar_width: Some(52),
+                ..OpensessionsConfig::default()
+            },
+        )
+        .expect("save config");
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        fs::remove_dir_all(&home).unwrap();
+        assert_eq!(saved["theme"], "nord");
+        assert_eq!(saved["sidebarWidth"], 52);
+        assert_eq!(entries, vec!["config.json".to_string()]);
+    }
 
     fn parse(raw: &str) -> OpensessionsConfig {
         serde_json::from_str(raw).expect("config parses")

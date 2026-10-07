@@ -53,9 +53,10 @@ When an opensessions server exits, every connected sidebar client in that tmux-s
 Expected shutdown behavior:
 
 - quit can be requested by a connected sidebar keypress, websocket command, `/quit`, or process shutdown
-- the server marks the sidebar lifecycle as `closing…`
+- the server marks the sidebar lifecycle as `closing…`, announced from the last built state so shutdown never waits on tmux, Git, or port discovery
 - the server broadcasts `quit` to websocket sidebar clients
 - the server waits briefly for clients to receive the quit frame, then removes hooks and pid file
+- that cleanup holds the identity lock from its ownership check to its last tmux command; a successor generation publishes its identity under the same lock before installing hooks or spawning sidebars, so an exiting server never unsets a successor's hooks or kills its sidebars, and skips cleanup entirely once a newer generation owns the identity
 - restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
 - shutdown is not a user choice to hide the sidebar: no shutdown path (`q`, `/quit`, SIGTERM, the tmux namespace disappearing) changes the recorded sidebar visibility
 
@@ -208,8 +209,11 @@ These are non-negotiable:
 - install both `pane-exited` and `after-kill-pane`; normal shell/process exit is not covered by `after-kill-pane` alone
 - treat `pane-exited` and `after-kill-pane` as topology-change signals only; they must never adopt tmux's redistributed sidebar width as user intent
 - use `after-resize-pane` only as an idempotent fixed-width repair trigger for the pane that caused the hook when it is titled `opensessions-sidebar`; it must not scan or resize unrelated panes
-- do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane
+- do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane; that refocus returns to tmux's last-active pane in the window (the pane the user was in before the spawn), not the first content pane
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
+- `remain-on-exit` is forced `on` only while a window has a sidebar (the prior value is saved in `@opensessions_remain_on_exit_previous`); hiding the sidebar, a sidebar pane exiting or being killed, and shutdown restore the saved value, so panes in sidebar-less windows exit normally instead of lingering as "Pane is dead"
+- the `pane-died` hook removes a dead content pane only when the user's saved `remain-on-exit` would not have kept it (never for `on`, clean exits only for `failed`); dead sidebar panes are always removed, and a window found without a sidebar gets its saved value back
+- target sessions by exact name (`=name`, or `=name:` for window/pane targets); a bare `-t name` falls back to prefix/pattern matches and can act on another session
 
 ## Per-tmux-server Technical Contract
 
@@ -245,6 +249,7 @@ Server backstops are adaptive rather than fixed-rate full snapshots:
 - synchronous state-provider work (tmux commands, Git, `ps`, and `lsof`) runs on Tokio's blocking pool rather than the HTTP/WebSocket event loop
 - port cache refresh is single-flight, so a burst of new sidebar connections cannot turn one empty cache into one `ps`/`lsof` pair per connection
 - the owned tmux socket is checked without spawning commands; when it stops accepting connections, the server exits and skips cleanup commands that cannot succeed against the missing namespace
+- a transiently failed `tmux list-sessions` (tmux could not be spawned or reached) is not an empty session list: it never prunes session metadata, session order, or hidden sessions, and never counts toward deciding the namespace is gone; only tmux reporting its server missing or exiting (`no server running`, `server exited unexpectedly`, a refused or missing socket) means no sessions
 - debug logging is opt-in through `OPENSESSIONS_DEBUG_LOG`
 
 E2E tmux clients also monitor their test parent and use tmux `exit-unattached`, so an interrupted test converges toward stopping its tmux namespace and server instead of leaving a polling environment behind.

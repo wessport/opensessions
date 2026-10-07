@@ -1353,12 +1353,29 @@ fn tmux_sidebar_pane_death_preserves_an_unrelated_retained_pane() {
         .trim()
         .to_string();
     lab.tmux_ok(["send-keys", "-t", exiting.as_str(), "exit", "Enter"]);
-    lab.wait_for_non_sidebar_pane_count("opensessions", 2);
+    // The user chose `remain-on-exit on` for this window, so the sidebar's
+    // pane-died cleanup must keep the newly exited pane as well.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lab.tmux(["display-message", "-p", "-t", &exiting, "#{pane_dead}"]) != "1"
+        && Instant::now() < deadline
+    {
+        sleep(Duration::from_millis(20));
+    }
+    sleep(Duration::from_millis(300));
 
     assert_eq!(
         lab.tmux(["display-message", "-p", "-t", &retained, "#{pane_dead}"]),
         "1",
         "an unrelated retained pane was deleted"
+    );
+    assert_eq!(
+        lab.non_sidebar_panes("opensessions").len(),
+        3,
+        "a pane exited under the user's remain-on-exit on was deleted"
+    );
+    assert_eq!(
+        lab.tmux(["display-message", "-p", "-t", &exiting, "#{pane_dead}"]),
+        "1"
     );
 }
 

@@ -66,6 +66,12 @@ pub trait MuxProvider: Send + Sync {
 
     fn name(&self) -> &str;
     fn list_sessions(&self) -> Vec<MuxSessionInfo>;
+    /// Like `list_sessions`, but `None` when listing failed rather than found
+    /// no sessions. Callers that prune or persist state, or decide the mux
+    /// namespace is gone, must not treat a failed listing as empty.
+    fn try_list_sessions(&self) -> Option<Vec<MuxSessionInfo>> {
+        Some(self.list_sessions())
+    }
 
     fn state_fingerprint(&self) -> Option<u64> {
         let sessions = self.list_sessions();
@@ -109,8 +115,11 @@ pub trait MuxProvider: Send + Sync {
         None
     }
     fn create_session(&self, name: Option<&str>, dir: Option<&str>);
-    fn rename_session(&self, _name: &str, _new_name: &str) -> bool {
-        false
+    /// Renames a session and returns the name the mux actually assigned,
+    /// which can differ from `new_name` (tmux replaces `.`/`:` and expands
+    /// formats). `None` means the rename did not happen.
+    fn rename_session(&self, _name: &str, _new_name: &str) -> Option<String> {
+        None
     }
     fn kill_session(&self, name: &str);
     fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str);
@@ -196,6 +205,9 @@ pub trait MuxProvider: Send + Sync {
 
     fn kill_sidebar_pane(&self, _pane_id: &str) {}
     fn prepare_sidebar_window(&self, _window_id: &str) {}
+    /// Undoes `prepare_sidebar_window` for windows whose sidebar is gone
+    /// (hidden or killed), so their panes exit normally again.
+    fn restore_windows_without_sidebar(&self) {}
     fn resize_sidebar_pane(&self, _pane_id: &str, _width: u16) {}
     fn resize_sidebar_panes(&self, pane_ids: &[String], width: u16) {
         for pane_id in pane_ids {

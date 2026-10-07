@@ -7,16 +7,15 @@ use crate::mux::{
     SidebarPosition,
 };
 use crate::tmux_scripting::{
-    SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION, hook_context_format, http_hook_command,
-    pane_died_hook_command, pane_exited_hook_command, resized_pane_width_repair_command,
-    sidebar_mouse_resize_marker_script, sidebar_mouse_resize_report_script,
+    REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION, SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION,
+    hook_context_format, http_hook_command, pane_died_hook_command, pane_exited_hook_command,
+    resized_pane_width_repair_command, sidebar_mouse_resize_marker_script,
+    sidebar_mouse_resize_report_script,
 };
 
 const SEP: &str = "\t";
 const STASH_SESSION: &str = "_os_stash";
 const OPENSESSIONS_HOOK_INDEX: u16 = 909;
-const REMAIN_ON_EXIT_PREVIOUS_OPTION: &str = "@opensessions_remain_on_exit_previous";
-const REMAIN_ON_EXIT_INHERITED: &str = "__inherited__";
 /// Tmux-server-scoped record of the user's last explicit sidebar show/hide
 /// choice. It intentionally survives opensessions server restarts and hook
 /// cleanup, and disappears with the tmux server itself.
@@ -144,7 +143,18 @@ impl TmuxClient {
     }
 
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
-        parse_sessions(&self.run(&["list-sessions", "-F", session_format()]).stdout)
+        self.try_list_sessions().unwrap_or_default()
+    }
+
+    /// `None` when `list-sessions` failed transiently (tmux could not be
+    /// spawned, the server was too busy to accept), as opposed to listing no
+    /// sessions. A tmux server that is gone or exiting has no sessions.
+    pub fn try_list_sessions(&self) -> Option<Vec<SessionInfo>> {
+        let output = self.run(&["list-sessions", "-F", session_format()]);
+        if output.ok() {
+            return Some(parse_sessions(&output.stdout));
+        }
+        tmux_server_is_gone(&output.stderr).then(Vec::new)
     }
 
     pub fn list_windows(&self) -> Vec<WindowInfo> {
@@ -190,12 +200,14 @@ impl TmuxClient {
 
     pub fn list_panes(&self, scope: PaneScope<'_>) -> Vec<PaneInfo> {
         let mut args = vec!["list-panes"];
+        let session_target;
         match scope {
             PaneScope::All => args.push("-a"),
-            PaneScope::Session(target) => {
+            PaneScope::Session(name) => {
+                session_target = exact_session_window_target(name);
                 args.push("-s");
                 args.push("-t");
-                args.push(target);
+                args.push(&session_target);
             }
             PaneScope::Window(target) => {
                 args.push("-t");
@@ -205,6 +217,11 @@ impl TmuxClient {
         args.push("-F");
         args.push(pane_format());
         parse_panes(&self.run(&args).stdout)
+    }
+
+    /// Switches to the session named exactly `session_name`.
+    pub fn switch_client_to_session(&self, session_name: &str, client_tty: Option<&str>) {
+        self.switch_client(&exact_session_target(session_name), client_tty);
     }
 
     pub fn switch_client(&self, target: &str, client_tty: Option<&str>) {
@@ -252,20 +269,49 @@ impl TmuxClient {
         self.run(&args).stdout
     }
 
-    pub fn kill_session(&self, target: &str) {
-        self.run(&["kill-session", "-t", target]);
+    /// Kills the session named exactly `session_name`. A plain `-t name`
+    /// would fall back to prefix and pattern matches and could kill another
+    /// session (`api` matching `api-v2`) once `name` is already gone.
+    pub fn kill_session(&self, session_name: &str) {
+        self.run(&["kill-session", "-t", &exact_session_target(session_name)]);
     }
 
-    pub fn rename_session(&self, target: &str, new_name: &str) -> bool {
-        self.run(&["rename-session", "-t", &format!("={target}"), new_name])
-            .ok()
+    /// Renames the session named exactly `target` and returns the resulting
+    /// name. tmux sanitizes names (`.`/`:` become `_`) and format-expands
+    /// them (`#{session_id}`), so the name is read back by stable session id.
+    pub fn rename_session(&self, target: &str, new_name: &str) -> Option<String> {
+        let session_id = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &exact_session_window_target(target),
+            "#{session_id}",
+        ]);
+        let session_id = session_id.stdout.trim();
+        if !session_id.starts_with('$') {
+            return None;
+        }
+        let renamed = self.run(&[
+            "rename-session",
+            "-t",
+            session_id,
+            new_name,
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            session_id,
+            "#{session_name}",
+        ]);
+        let actual = renamed.stdout.trim();
+        (renamed.ok() && !actual.is_empty()).then(|| actual.to_string())
     }
 
     pub fn unlink_window(&self, session_name: &str, window_id: &str) {
         self.run(&[
             "unlink-window",
             "-t",
-            &format!("{session_name}:{window_id}"),
+            &format!("={session_name}:{window_id}"),
         ]);
     }
 
@@ -412,35 +458,105 @@ impl TmuxClient {
     /// the `pane-died` hook removes their panes, so a sidebar-pane scan would
     /// skip windows and leave them with `remain-on-exit on`.
     pub fn restore_remain_on_exit_for_marked_windows(&self) {
+        for (window_id, previous) in self.remain_on_exit_marked_windows() {
+            self.restore_window_remain_on_exit(&window_id, &previous);
+        }
+    }
+
+    /// Restores `remain-on-exit` on marked windows that no longer have a
+    /// sidebar pane (hidden by toggle or killed by hand), and removes their
+    /// dead content panes that the restored value would not have kept.
+    /// Otherwise panes the user exits there linger as "Pane is dead".
+    pub fn restore_remain_on_exit_for_windows_without_sidebar(&self) {
+        let marked = self.remain_on_exit_marked_windows();
+        if marked.is_empty() {
+            return;
+        }
+        let listing = self.run(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_dead}\t#{pane_dead_status}",
+        ]);
+        if !listing.ok() {
+            return;
+        }
+        let panes = listing
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let parts = split(line);
+                (parts.len() >= 5)
+                    .then(|| (parts[0], parts[1], parts[2], parts[3] == "1", parts[4]))
+            })
+            .collect::<Vec<_>>();
+        let mut global = None;
+        for (window_id, previous) in marked {
+            let window_panes = panes
+                .iter()
+                .filter(|(window, ..)| *window == window_id)
+                .collect::<Vec<_>>();
+            if window_panes.is_empty()
+                || window_panes
+                    .iter()
+                    .any(|(_, _, title, ..)| *title == "opensessions-sidebar")
+            {
+                continue;
+            }
+            self.restore_window_remain_on_exit(&window_id, &previous);
+            let effective = if previous == REMAIN_ON_EXIT_INHERITED {
+                global
+                    .get_or_insert_with(|| {
+                        self.run(&["show-options", "-gwv", "remain-on-exit"]).stdout
+                    })
+                    .clone()
+            } else {
+                previous
+            };
+            for (_, pane_id, _, dead, status) in window_panes {
+                let kept = effective == "on" || (effective == "failed" && *status != "0");
+                if *dead && !kept {
+                    self.kill_pane(pane_id);
+                }
+            }
+        }
+    }
+
+    /// Windows carrying the saved-value marker, found by marker rather than
+    /// by sidebar panes: during shutdown sidebar clients exit before cleanup
+    /// and the `pane-died` hook removes their panes.
+    fn remain_on_exit_marked_windows(&self) -> Vec<(String, String)> {
         let format = format!("#{{window_id}}{SEP}#{{{REMAIN_ON_EXIT_PREVIOUS_OPTION}}}");
         let output = self.run(&["list-windows", "-a", "-F", &format]);
         let mut seen_windows = HashSet::new();
-        for line in output.stdout.lines() {
-            let Some((window_id, previous)) = line.split_once(SEP) else {
-                continue;
-            };
-            if previous.is_empty() || !seen_windows.insert(window_id) {
-                continue;
-            }
-            if previous == REMAIN_ON_EXIT_INHERITED {
-                self.run(&["set-window-option", "-t", window_id, "-u", "remain-on-exit"]);
-            } else {
-                self.run(&[
-                    "set-window-option",
-                    "-t",
-                    window_id,
-                    "remain-on-exit",
-                    previous,
-                ]);
-            }
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once(SEP))
+            .filter(|(window_id, previous)| !previous.is_empty() && seen_windows.insert(*window_id))
+            .map(|(window_id, previous)| (window_id.to_string(), previous.to_string()))
+            .collect()
+    }
+
+    fn restore_window_remain_on_exit(&self, window_id: &str, previous: &str) {
+        if previous == REMAIN_ON_EXIT_INHERITED {
+            self.run(&["set-window-option", "-t", window_id, "-u", "remain-on-exit"]);
+        } else {
             self.run(&[
                 "set-window-option",
                 "-t",
                 window_id,
-                "-u",
-                REMAIN_ON_EXIT_PREVIOUS_OPTION,
+                "remain-on-exit",
+                previous,
             ]);
         }
+        self.run(&[
+            "set-window-option",
+            "-t",
+            window_id,
+            "-u",
+            REMAIN_ON_EXIT_PREVIOUS_OPTION,
+        ]);
     }
 
     pub fn split_sidebar_pane(
@@ -546,12 +662,15 @@ impl TmuxClient {
         })
     }
 
-    pub fn get_session_dir(&self, target: &str) -> String {
-        self.display("#{pane_current_path}", Some(target))
+    pub fn get_session_dir(&self, session_name: &str) -> String {
+        self.display(
+            "#{pane_current_path}",
+            Some(&exact_session_window_target(session_name)),
+        )
     }
 
-    pub fn get_pane_count(&self, target: &str) -> u32 {
-        self.list_panes(PaneScope::Session(target)).len() as u32
+    pub fn get_pane_count(&self, session_name: &str) -> u32 {
+        self.list_panes(PaneScope::Session(session_name)).len() as u32
     }
 
     pub fn get_all_pane_counts(&self) -> HashMap<String, u32> {
@@ -661,8 +780,32 @@ impl TmuxClient {
 
 pub enum PaneScope<'a> {
     All,
+    /// Every pane of the session with exactly this name.
     Session(&'a str),
     Window(&'a str),
+}
+
+/// Whether a failed tmux command reported that its server does not exist or
+/// is exiting, rather than a transient failure to run or reach it.
+fn tmux_server_is_gone(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("server exited")
+        || stderr.contains("lost server")
+        || (stderr.contains("error connecting to")
+            && (stderr.contains("No such file or directory")
+                || stderr.contains("Connection refused")))
+}
+
+/// tmux resolves a bare `-t name` by exact match, then prefix, then pattern,
+/// so a missing `api` silently targets `api-v2`. `=` forces an exact match.
+fn exact_session_target(session_name: &str) -> String {
+    format!("={session_name}")
+}
+
+/// Exact session match for window- and pane-scoped targets: the trailing `:`
+/// selects that session's current window (and its active pane).
+fn exact_session_window_target(session_name: &str) -> String {
+    format!("={session_name}:")
 }
 
 #[derive(Clone)]
@@ -686,9 +829,13 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+        self.try_list_sessions().unwrap_or_default()
+    }
+
+    fn try_list_sessions(&self) -> Option<Vec<MuxSessionInfo>> {
         let active_dirs = self.client.get_active_session_dirs();
-        self.client
-            .list_sessions()
+        let sessions = self.client.try_list_sessions()?;
+        let sessions = sessions
             .into_iter()
             .filter(|session| session.name != STASH_SESSION)
             .map(|session| MuxSessionInfo {
@@ -700,7 +847,8 @@ impl MuxProvider for TmuxProvider {
                     .unwrap_or(session.dir),
                 windows: session.window_count,
             })
-            .collect()
+            .collect();
+        Some(sessions)
     }
 
     fn state_fingerprint(&self) -> Option<u64> {
@@ -708,7 +856,7 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
-        self.client.switch_client(name, client_tty);
+        self.client.switch_client_to_session(name, client_tty);
         self.client.select_sidebar_pane_for_session(name);
     }
 
@@ -722,7 +870,7 @@ impl MuxProvider for TmuxProvider {
         fallback_session: &str,
         _preferred_client_tty: Option<&str>,
     ) -> bool {
-        let fallback_target = format!("={fallback_session}:");
+        let fallback_target = exact_session_window_target(fallback_session);
         let mut switched = false;
         for client in self.client.list_clients() {
             if client.session_name == session_name {
@@ -781,7 +929,7 @@ impl MuxProvider for TmuxProvider {
         self.client.new_session(name, dir);
     }
 
-    fn rename_session(&self, name: &str, new_name: &str) -> bool {
+    fn rename_session(&self, name: &str, new_name: &str) -> Option<String> {
         self.client.rename_session(name, new_name)
     }
 
@@ -970,7 +1118,8 @@ impl MuxProvider for TmuxProvider {
         if !is_session_window {
             return;
         }
-        self.client.switch_client(session_name, client_tty);
+        self.client
+            .switch_client_to_session(session_name, client_tty);
         self.client.select_window(window_id);
     }
 
@@ -1073,6 +1222,11 @@ impl MuxProvider for TmuxProvider {
 
     fn prepare_sidebar_window(&self, window_id: &str) {
         self.client.ensure_window_remain_on_exit(window_id);
+    }
+
+    fn restore_windows_without_sidebar(&self) {
+        self.client
+            .restore_remain_on_exit_for_windows_without_sidebar();
     }
 
     fn focus_pane(&self, pane_id: &str) {
@@ -1189,7 +1343,7 @@ impl MuxProvider for TmuxProvider {
                     for client in self.client.list_clients() {
                         if client.session_name == *session_name {
                             self.client
-                                .switch_client(fallback_session, Some(&client.tty));
+                                .switch_client_to_session(fallback_session, Some(&client.tty));
                         }
                     }
                 }
@@ -1785,24 +1939,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_session_uses_an_exact_tmux_target() {
-        let runner = Arc::new(RecordingRunner::default());
-        let provider = TmuxProvider::new(runner.clone());
-
-        assert!(provider.rename_session("draft", "descriptive name"));
-
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[vec![
-                "rename-session".to_string(),
-                "-t".to_string(),
-                "=draft".to_string(),
-                "descriptive name".to_string(),
-            ]]
-        );
-    }
-
-    #[test]
     fn visible_sidebars_require_an_attached_client_and_active_window() {
         let runner = Arc::new(VisibilityRunner::default());
         let provider = TmuxProvider::new(runner.clone());
@@ -1914,7 +2050,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|call| { call == &["switch-client", "-c", "/dev/ttys001", "-t", "project",] })
+                .any(|call| { call == &["switch-client", "-c", "/dev/ttys001", "-t", "=project"] })
         );
         assert!(
             calls
@@ -1924,7 +2060,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|call| call == &["unlink-window", "-t", "project:@2"])
+                .any(|call| call == &["unlink-window", "-t", "=project:@2"])
         );
         assert!(
             calls
@@ -1935,7 +2071,7 @@ mod tests {
             matches!(
                 call.first().map(String::as_str),
                 Some("unlink-window" | "kill-window")
-            ) && !matches!(call.last().map(String::as_str), Some("project:@2" | "@4"))
+            ) && !matches!(call.last().map(String::as_str), Some("=project:@2" | "@4"))
         }));
     }
 
@@ -2125,6 +2261,43 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         (runner.clone(), TmuxProvider::new(runner))
+    }
+
+    #[test]
+    fn a_failed_session_listing_is_not_an_empty_one() {
+        let failing = |stderr: &str| {
+            TmuxProvider::new(Arc::new(PanePidRunner {
+                output: CommandOutput {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                },
+                calls: Mutex::new(Vec::new()),
+            }))
+        };
+        assert_eq!(
+            pane_pid_provider(0, "").1.try_list_sessions(),
+            Some(Vec::new())
+        );
+        for transient in [
+            "No such file or directory (os error 2)",
+            "error connecting to /tmp/tmux-501/default (Resource temporarily unavailable)",
+            "",
+        ] {
+            assert_eq!(failing(transient).try_list_sessions(), None, "{transient}");
+        }
+        for gone in [
+            "no server running on /tmp/tmux-501/default",
+            "error connecting to /tmp/tmux-501/default (No such file or directory)",
+            "server exited unexpectedly",
+        ] {
+            assert_eq!(
+                failing(gone).try_list_sessions(),
+                Some(Vec::new()),
+                "{gone}"
+            );
+        }
+        assert!(failing("").list_sessions().is_empty());
     }
 
     #[test]

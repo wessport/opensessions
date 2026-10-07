@@ -25,7 +25,7 @@ use opensessions_runtime::config::{
     AutoHibernateSettings, OpensessionsConfig, SidebarPosition as ConfigSidebarPosition,
     load_config_from_home, save_config_to_home,
 };
-use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
+use opensessions_runtime::git_info::{GIT_INFO_SECTION_SEPARATOR, GitInfo, parse_git_info_output};
 use opensessions_runtime::hibernate::{
     AgentProcessTarget, HIBERNATE_POLL_INTERVAL_MS, HIBERNATE_TERM_GRACE, ProcessControl,
     ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes,
@@ -39,7 +39,7 @@ use opensessions_runtime::project_dir_session::{
 };
 use opensessions_runtime::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
-    SessionFilterMode, WindowData,
+    ServerState, SessionFilterMode, WindowData,
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
@@ -374,10 +374,11 @@ impl GitCommandRunner for SystemGitCommandRunner {
             return String::new();
         };
 
+        let separator = GIT_INFO_SECTION_SEPARATOR;
         format!(
-            "{}\n---\n{}\n---NUMSTAT---\n{}",
+            "{}{separator}{}{separator}{}",
             String::from_utf8_lossy(&rev_parse.stdout).trim(),
-            String::from_utf8_lossy(&status.stdout).trim(),
+            String::from_utf8_lossy(&status.stdout),
             String::from_utf8_lossy(&numstat.stdout).trim()
         )
     }
@@ -433,6 +434,9 @@ pub struct ReadOnlyMuxStateSource {
     agent_state_home: Option<PathBuf>,
     /// Agent panes found for writer pids recorded in agent state files.
     agent_pane_routes: Mutex<AgentPaneRouteCache>,
+    /// Last full state built, so shutdown can announce `closing…` without
+    /// running tmux, Git, or port discovery.
+    last_state: Mutex<Option<ServerState>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -536,6 +540,7 @@ impl ReadOnlyMuxStateSource {
             process_control: Arc::new(SystemProcessControl),
             agent_state_home: std::env::var_os("HOME").map(PathBuf::from),
             agent_pane_routes: Mutex::new(AgentPaneRouteCache::default()),
+            last_state: Mutex::new(None),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -1303,12 +1308,15 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn mux_namespace_available(&self) -> bool {
+        // A failed listing (fork pressure, a slow server) says nothing about
+        // the namespace; only a successful empty listing means it is gone.
         self.tmux_socket_path.as_ref().is_none_or(|socket_path| {
             tmux_socket_is_live(socket_path)
-                && self
-                    .providers
-                    .iter()
-                    .any(|provider| !provider.list_sessions().is_empty())
+                && self.providers.iter().any(|provider| {
+                    provider
+                        .try_list_sessions()
+                        .is_none_or(|sessions| !sessions.is_empty())
+                })
         })
     }
 
@@ -1363,16 +1371,14 @@ impl StateSource for ReadOnlyMuxStateSource {
         self.sync_agent_pane_presence();
         self.agent_tracker.lock().unwrap().prune_terminal();
 
-        let valid_session_names = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .map(|session| session.name)
-            .collect::<Vec<_>>();
-        self.metadata_store
-            .lock()
-            .unwrap()
-            .prune_sessions(valid_session_names);
+        // Never prune on a failed listing: that would drop every session's
+        // metadata for one transient tmux error.
+        if let Some(valid_session_names) = self.try_sorted_session_names() {
+            self.metadata_store
+                .lock()
+                .unwrap()
+                .prune_sessions(valid_session_names);
+        }
 
         let providers = self
             .providers
@@ -1398,11 +1404,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                 .collect()
         });
         let git_by_session = self.git_info_by_session(visible_session_names.as_deref(), false);
+        // Copy tracker state out under one short lock; tmux commands run
+        // later must never hold it (agent events and watchers need it).
+        let tracker = self.agent_tracker.lock().unwrap();
+        let unseen_sessions = Some(tracker.get_unseen());
         let (agent_state_by_session, agents_by_session, event_timestamps_by_session) =
             visible_session_names
                 .as_ref()
                 .map(|names| {
-                    let tracker = self.agent_tracker.lock().unwrap();
                     let mut states = HashMap::new();
                     let mut agents = HashMap::new();
                     let mut timestamps = HashMap::new();
@@ -1422,9 +1431,29 @@ impl StateSource for ReadOnlyMuxStateSource {
                     (Some(states), Some(agents), Some(timestamps))
                 })
                 .unwrap_or((None, None, None));
+        drop(tracker);
         let ports_by_session = self.discover_live_ports(visible_session_names.as_deref(), false);
+        // Capture settings with their revision under the revision lock, then
+        // release every lock before `build_read_only_state` runs tmux
+        // commands; a slow or panicking tmux call must not stall or poison
+        // the server's shared state.
         let settings_revision = self.settings_revision.lock().unwrap();
+        let revision = *settings_revision;
         let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
+        let theme = self.theme.lock().unwrap().clone();
+        let transparent_background = *self.transparent_background.lock().unwrap();
+        let session_filter = *self.session_filter.lock().unwrap();
+        let agent_panel_scope = *self.agent_panel_scope.lock().unwrap();
+        let collapsed_worktree_groups = self
+            .collapsed_worktree_groups
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let detail_panel_height = u32::from(*self.detail_panel_height.lock().unwrap());
+        drop(settings_revision);
+        let focused_session = self.focused_session.lock().unwrap().clone();
         debug_log(format!(
             "snapshot_json mode={} init={} width={}",
             sidebar_state.mode, sidebar_state.initializing, sidebar_state.width,
@@ -1437,40 +1466,45 @@ impl StateSource for ReadOnlyMuxStateSource {
             agent_state_by_session,
             agents_by_session,
             event_timestamps_by_session,
-            unseen_sessions: Some(self.agent_tracker.lock().unwrap().get_unseen()),
+            unseen_sessions,
             ports_by_session,
             portless_state: None,
-            focused_session: self.focused_session.lock().unwrap().clone(),
+            focused_session,
             current_session_override: None,
             visible_sidebar_pane_ids,
-            theme: self.theme.lock().unwrap().clone(),
-            transparent_background: *self.transparent_background.lock().unwrap(),
-            session_filter: *self.session_filter.lock().unwrap(),
-            agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
-            collapsed_worktree_groups: self
-                .collapsed_worktree_groups
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect(),
+            theme,
+            transparent_background,
+            session_filter,
+            agent_panel_scope,
+            collapsed_worktree_groups,
             sidebar_width: sidebar_state.width,
-            detail_panel_height: u32::from(*self.detail_panel_height.lock().unwrap()),
-            settings_revision: *settings_revision,
+            detail_panel_height,
+            settings_revision: revision,
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
         });
 
-        serde_json::to_string(&ServerMessage::State(state)).expect("state must serialize")
+        let payload = serde_json::to_string(&ServerMessage::State(state.clone()))
+            .expect("state must serialize");
+        *self.last_state.lock().unwrap() = Some(state);
+        payload
     }
 
+    /// Announces `closing…` from the last built state. Shutdown runs on the
+    /// runtime thread and must not wait for tmux, Git, or port discovery.
     fn begin_shutdown(&self) -> Option<String> {
-        {
+        let sidebar_state = {
             let mut coordinator = self.sidebar_coordinator.lock().unwrap();
             coordinator.begin_closing();
-        }
-        Some(self.snapshot_json())
+            coordinator.state()
+        };
+        let mut state = self.last_state.lock().unwrap().clone()?;
+        state.initializing = sidebar_state.initializing;
+        state.init_label =
+            (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label);
+        state.sidebar_width = sidebar_state.width;
+        serde_json::to_string(&ServerMessage::State(state)).ok()
     }
 
     fn handle_client_command(&self, command: &Value) -> Option<String> {
@@ -1494,13 +1528,18 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if new_name.is_empty() || new_name == name {
                     return None;
                 }
-                if !provider.rename_session(name, new_name) {
+                // The mux may sanitize the requested name; every reference
+                // must follow the name the session actually has now.
+                let Some(new_name) = provider
+                    .rename_session(name, new_name)
+                    .filter(|actual| actual != name)
+                else {
                     return Some(self.snapshot_json());
-                }
-                self.rename_session_references(name, new_name);
+                };
+                self.rename_session_references(name, &new_name);
                 serde_json::to_string(&ServerMessage::ReIdentify {
                     old_name: name.to_string(),
-                    new_name: new_name.to_string(),
+                    new_name,
                 })
                 .ok()
             }
@@ -1907,6 +1946,13 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .collect::<HashMap<_, _>>();
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
+                }
+                // A sidebar pane that exited or was killed leaves its window
+                // with forced `remain-on-exit`; serialize with spawning so a
+                // sidebar being created is never mistaken for a missing one.
+                let _presence_guard = self.sidebar_presence.lock().unwrap();
+                for provider in &self.providers {
+                    provider.restore_windows_without_sidebar();
                 }
                 None
             }
@@ -2416,6 +2462,12 @@ impl ReadOnlyMuxStateSource {
 
     fn toggle_sidebar(&self) {
         let _presence_guard = self.sidebar_presence.lock().unwrap();
+        // A toggle queued behind the state-operation lock can run after
+        // shutdown began; it must neither spawn sidebars nor record a choice.
+        if self.sidebar_coordinator.lock().unwrap().state().lifecycle == SidebarLifecycle::Closing {
+            debug_log("toggle_sidebar: ignored while the server is closing");
+            return;
+        }
         let providers = self
             .providers
             .iter()
@@ -2431,6 +2483,8 @@ impl ReadOnlyMuxStateSource {
                 for pane in panes {
                     provider.hide_sidebar(&pane.pane_id);
                 }
+                // Hidden windows must exit panes normally again.
+                provider.restore_windows_without_sidebar();
             }
             self.sidebar_coordinator.lock().unwrap().hide();
             self.record_sidebar_visibility(false);
@@ -2631,31 +2685,44 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
-        let names = self.sorted_session_names();
-        let mut session_order = self.session_order.lock().unwrap();
-        session_order.sync(names.clone());
-        if let Some(current_session) = self
+        let names = self.try_sorted_session_names();
+        let current_session = self
             .providers
             .iter()
-            .find_map(|provider| provider.get_current_session())
-        {
+            .find_map(|provider| provider.get_current_session());
+        let mut session_order = self.session_order.lock().unwrap();
+        // A failed listing must not prune the order or hidden list; fall
+        // back to the last known sessions until tmux answers again.
+        let names = match names {
+            Some(names) => {
+                session_order.sync(names.clone());
+                names
+            }
+            None => session_order.known_names(),
+        };
+        if let Some(current_session) = current_session {
             session_order.show(&current_session);
         }
         Some(session_order.apply(names))
     }
 
     fn sorted_session_names(&self) -> Vec<String> {
-        let mut sessions = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .collect::<Vec<_>>();
+        self.try_sorted_session_names().unwrap_or_default()
+    }
+
+    /// Session names in creation order, or `None` if any provider failed to
+    /// list its sessions.
+    fn try_sorted_session_names(&self) -> Option<Vec<String>> {
+        let mut sessions = Vec::new();
+        for provider in &self.providers {
+            sessions.extend(provider.try_list_sessions()?);
+        }
         sessions.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        sessions.into_iter().map(|session| session.name).collect()
+        Some(sessions.into_iter().map(|session| session.name).collect())
     }
 }
 
@@ -2977,11 +3044,18 @@ async fn run_agent_watcher_loop(
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = tokio::time::sleep(Duration::from_millis(delay)) => {
-                let pruned = source
-                    .agent_tracker
-                    .lock()
-                    .unwrap()
-                    .prune_stuck(STUCK_RUNNING_TIMEOUT_MS);
+                // The tracker lock can be held by blocking-pool work; waiting
+                // for it here would stall every task on the runtime thread.
+                let prune_source = source.clone();
+                let pruned = tokio::task::spawn_blocking(move || {
+                    prune_source
+                        .agent_tracker
+                        .lock()
+                        .unwrap()
+                        .prune_stuck(STUCK_RUNNING_TIMEOUT_MS)
+                })
+                .await
+                .unwrap_or(false);
                 if pruned {
                     debug_log("agent_watcher_loop: stale agent state changed, broadcasting");
                     let snapshot_source = source.clone();
@@ -3713,6 +3787,9 @@ struct HttpContext {
 
 fn parse_context(body: &str) -> Option<HttpContext> {
     let trimmed = trim_context_quotes(body);
+    if let Some(context) = parse_pipe_context(trimmed) {
+        return Some(context);
+    }
     let pipe_parts = trimmed.split('|').collect::<Vec<_>>();
     if pipe_parts.len() == 5 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
         return Some(HttpContext {
@@ -3755,6 +3832,47 @@ fn parse_context(body: &str) -> Option<HttpContext> {
         pane_id: None,
         pane_active: None,
     })
+}
+
+/// Parses `client_tty|session|window_id[|pane_id[|pane_active]]`.
+///
+/// tmux allows `|` in session names, so the separator count cannot pick the
+/// format. Every other field is structured: the tty is a path before the
+/// first `|`, and the trailing fields are tmux ids (`@N`, `%N`) and a 0/1
+/// flag, so they are taken from the end and the session is what remains.
+fn parse_pipe_context(trimmed: &str) -> Option<HttpContext> {
+    let (client_tty, rest) = trimmed.split_once('|')?;
+    let client_tty = (!client_tty.is_empty()).then(|| client_tty.to_string());
+    let is_window = |value: &str| value.len() > 1 && value.starts_with('@');
+    let is_pane = |value: &str| value.len() > 1 && value.starts_with('%');
+    let context = |session: &str, window_id: &str, pane_id: Option<&str>, active: Option<&str>| {
+        (!session.is_empty()).then(|| HttpContext {
+            client_tty: client_tty.clone(),
+            session: session.to_string(),
+            window_id: window_id.to_string(),
+            pane_id: pane_id.map(str::to_string),
+            pane_active: active.map(|active| active == "1"),
+        })
+    };
+    if let [active, pane_id, window_id, session] = rest.rsplitn(4, '|').collect::<Vec<_>>()[..]
+        && matches!(active, "0" | "1")
+        && is_pane(pane_id)
+        && is_window(window_id)
+    {
+        return context(session, window_id, Some(pane_id), Some(active));
+    }
+    if let [pane_id, window_id, session] = rest.rsplitn(3, '|').collect::<Vec<_>>()[..]
+        && is_pane(pane_id)
+        && is_window(window_id)
+    {
+        return context(session, window_id, Some(pane_id), None);
+    }
+    if let [window_id, session] = rest.rsplitn(2, '|').collect::<Vec<_>>()[..]
+        && is_window(window_id)
+    {
+        return context(session, window_id, None, None);
+    }
+    None
 }
 
 fn parse_context_session(body: &str) -> Option<String> {
@@ -3925,11 +4043,33 @@ fn publish_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io:
     publish_identity_locked(pid_file, token_file, token)
 }
 
-fn cleanup_owned_identity(pid_file: &Path, token_file: &Path, token: &str) -> std::io::Result<()> {
+/// Removes this generation's mux hooks, sidebar clients, and identity files.
+///
+/// The identity lock is held from the ownership check through the last
+/// cleanup command: a successor generation publishes its identity under the
+/// same lock before it installs hooks or spawns sidebars, so it can neither
+/// slip in between the check and cleanup nor have its own hooks unset.
+fn cleanup_owned_generation(
+    pid_file: &Path,
+    token_file: &Path,
+    token: &str,
+    state_source: Option<&dyn StateSource>,
+) -> std::io::Result<()> {
     let _identity_lock = lock_identity(pid_file)?;
     if !owns_identity_generation(pid_file, token_file, token) {
+        debug_log("shutdown: a newer generation owns the identity; skipping mux cleanup");
         return Ok(());
     }
+    if let Some(source) = state_source
+        && source.mux_namespace_available()
+    {
+        source.cleanup_mux_hooks();
+        source.cleanup_sidebar_clients();
+    }
+    remove_identity_files(pid_file, token_file)
+}
+
+fn remove_identity_files(pid_file: &Path, token_file: &Path) -> std::io::Result<()> {
     match fs::remove_file(pid_file) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4074,14 +4214,17 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         identity_task.abort();
         let _ = identity_task.await;
         state_cache_task.abort();
-        if owns_identity_generation(&config.pid_file, &token_file, &token)
-            && let Some(source) = cleanup_state_source.as_ref()
-            && source.mux_namespace_available()
-        {
-            source.cleanup_mux_hooks();
-            source.cleanup_sidebar_clients();
-        }
-        let cleanup_result = cleanup_owned_identity(&config.pid_file, &token_file, &token);
+        // Dozens of tmux commands: keep them off the runtime thread.
+        let cleanup_result = tokio::task::spawn_blocking(move || {
+            cleanup_owned_generation(
+                &config.pid_file,
+                &token_file,
+                &token,
+                cleanup_state_source.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)));
         match (result, cleanup_result) {
             (Err(err), _) => Err(err),
             (Ok(()), Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
@@ -4128,7 +4271,27 @@ async fn run_accept_loop(
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) if accept_error_action(&error) == AcceptErrorAction::Retry => {
+                        // Out of descriptors or an aborted handshake: the
+                        // listener is fine, so back off instead of exiting.
+                        debug_log(format!("accept failed transiently: {error}; retrying"));
+                        tokio::time::sleep(ACCEPT_RETRY_BACKOFF).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        debug_log(format!("accept failed fatally: {error}; shutting down"));
+                        request_shutdown(
+                            &state_source,
+                            &state_updates,
+                            &shutdown,
+                            &shutdown_announcement,
+                        );
+                        tokio::time::sleep(Duration::from_millis(SERVER_SHUTDOWN_DRAIN_MS)).await;
+                        return Err(error.into());
+                    }
+                };
                 let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
                     continue;
                 };
@@ -4162,6 +4325,62 @@ async fn run_accept_loop(
             }
 
         }
+    }
+}
+
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    Retry,
+    Fatal,
+}
+
+/// `accept` errno values that describe one connection or temporary resource
+/// exhaustion rather than a broken listener (see accept(2)).
+#[cfg(target_os = "linux")]
+const TRANSIENT_ACCEPT_ERRNOS: &[i32] = &[
+    1,   // EPERM: firewall rules forbid the connection
+    12,  // ENOMEM
+    23,  // ENFILE
+    24,  // EMFILE
+    71,  // EPROTO
+    100, // ENETDOWN
+    101, // ENETUNREACH
+    105, // ENOBUFS
+    113, // EHOSTUNREACH
+];
+#[cfg(not(target_os = "linux"))]
+const TRANSIENT_ACCEPT_ERRNOS: &[i32] = &[
+    12,  // ENOMEM
+    23,  // ENFILE
+    24,  // EMFILE
+    50,  // ENETDOWN
+    51,  // ENETUNREACH
+    55,  // ENOBUFS
+    65,  // EHOSTUNREACH
+    100, // EPROTO
+];
+
+fn accept_error_action(error: &std::io::Error) -> AcceptErrorAction {
+    use std::io::ErrorKind;
+    let transient_kind = matches!(
+        error.kind(),
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::OutOfMemory
+    );
+    let transient_errno = error
+        .raw_os_error()
+        .is_some_and(|errno| TRANSIENT_ACCEPT_ERRNOS.contains(&errno));
+    if transient_kind || transient_errno {
+        AcceptErrorAction::Retry
+    } else {
+        AcceptErrorAction::Fatal
     }
 }
 
@@ -6150,12 +6369,13 @@ mod tests {
             String::new()
         }
         fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
-        fn rename_session(&self, name: &str, new_name: &str) -> bool {
+        fn rename_session(&self, name: &str, new_name: &str) -> Option<String> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((name.to_string(), new_name.to_string()));
-            true
+            // Like tmux, replace characters that are invalid in names.
+            Some(new_name.replace(['.', ':'], "_"))
         }
         fn kill_session(&self, _name: &str) {}
         fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
@@ -6324,6 +6544,32 @@ mod tests {
                 .get("descriptive-name")
                 .map(String::as_str),
             Some("%1")
+        );
+    }
+
+    #[test]
+    fn rename_follows_the_name_the_mux_actually_assigned() {
+        let provider = Arc::new(RenameTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        *source.focused_session.lock().unwrap() = Some("draft".to_string());
+
+        let response = source.handle_client_command(&serde_json::json!({
+            "type": "rename-session",
+            "name": "draft",
+            "newName": "v1.2:x",
+        }));
+
+        assert_eq!(
+            response,
+            serde_json::to_string(&ServerMessage::ReIdentify {
+                old_name: "draft".to_string(),
+                new_name: "v1_2_x".to_string(),
+            })
+            .ok()
+        );
+        assert_eq!(
+            source.focused_session.lock().unwrap().as_deref(),
+            Some("v1_2_x")
         );
     }
 
@@ -6702,7 +6948,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let cleanup = std::thread::spawn(move || {
             started_tx.send(()).expect("signal cleanup start");
-            cleanup_owned_identity(&cleanup_pid, &cleanup_token, &cleanup_old_token)
+            cleanup_owned_generation(&cleanup_pid, &cleanup_token, &cleanup_old_token, None)
         });
         started_rx.recv().expect("cleanup started");
         std::thread::sleep(Duration::from_millis(25));
@@ -6939,6 +7185,8 @@ mod tests {
         preference: Mutex<Option<bool>>,
         panes: Mutex<Vec<opensessions_runtime::mux::SidebarPane>>,
         spawned_windows: Mutex<Vec<String>>,
+        /// Sidebar pane count seen by each `restore_windows_without_sidebar`.
+        restores: Mutex<Vec<usize>>,
     }
 
     impl SidebarVisibilityTestProvider {
@@ -6947,6 +7195,7 @@ mod tests {
                 preference: Mutex::new(preference),
                 panes: Mutex::new(Vec::new()),
                 spawned_windows: Mutex::new(Vec::new()),
+                restores: Mutex::new(Vec::new()),
             })
         }
 
@@ -7041,6 +7290,10 @@ mod tests {
         }
         fn kill_sidebar_pane(&self, pane_id: &str) {
             self.hide_sidebar(pane_id);
+        }
+        fn restore_windows_without_sidebar(&self) {
+            let sidebars = self.panes.lock().unwrap().len();
+            self.restores.lock().unwrap().push(sidebars);
         }
     }
 
@@ -7139,5 +7392,421 @@ mod tests {
 
         assert!(provider.panes.lock().unwrap().is_empty());
         assert_eq!(provider.sidebar_visibility_preference(), Some(true));
+    }
+
+    #[test]
+    fn hiding_the_sidebar_restores_windows_without_a_sidebar() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+        assert!(provider.restores.lock().unwrap().is_empty());
+
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+
+        assert_eq!(*provider.restores.lock().unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn an_exited_sidebar_pane_restores_its_window() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+        provider.panes.lock().unwrap().pop();
+
+        source.handle_http_hook("/pane-exited", "");
+
+        assert_eq!(*provider.restores.lock().unwrap(), vec![1]);
+    }
+
+    /// Lists `alpha` and `beta` until told to fail like a `tmux list-sessions`
+    /// that could not run.
+    #[derive(Default)]
+    struct FlakySessionsTestProvider {
+        failing: AtomicBool,
+    }
+
+    impl MuxProvider for FlakySessionsTestProvider {
+        fn name(&self) -> &str {
+            "flaky-sessions-test"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            self.try_list_sessions().unwrap_or_default()
+        }
+        fn try_list_sessions(&self) -> Option<Vec<opensessions_runtime::mux::MuxSessionInfo>> {
+            if self.failing.load(Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                ["alpha", "beta"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| opensessions_runtime::mux::MuxSessionInfo {
+                        name: name.to_string(),
+                        created_at: index as u64,
+                        dir: String::new(),
+                        windows: 1,
+                    })
+                    .collect(),
+            )
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn a_failed_session_listing_keeps_metadata_order_and_hidden_sessions() {
+        let order_path = std::env::temp_dir().join(format!(
+            "opensessions-flaky-order-{}-{}.json",
+            process::id(),
+            current_time_ms()
+        ));
+        let provider = Arc::new(FlakySessionsTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()])
+            .with_session_order_path(order_path.clone());
+        source.snapshot_json();
+        source
+            .metadata_store
+            .lock()
+            .unwrap()
+            .set_status("alpha", Some(("building".to_string(), None)));
+        source.handle_client_command(&serde_json::json!({
+            "type": "hide-session",
+            "name": "beta",
+        }));
+
+        provider.failing.store(true, Ordering::SeqCst);
+        source.snapshot_json();
+        provider.failing.store(false, Ordering::SeqCst);
+
+        assert!(source.metadata_store.lock().unwrap().get("alpha").is_some());
+        assert_eq!(
+            source.visible_session_names(),
+            Some(vec!["alpha".to_string()])
+        );
+        let persisted = fs::read_to_string(&order_path).unwrap_or_default();
+        let _ = fs::remove_file(&order_path);
+        assert!(persisted.contains("beta"), "{persisted}");
+    }
+
+    #[test]
+    fn a_failed_session_listing_does_not_mean_the_namespace_is_gone() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "os-flaky-{}-{}.sock",
+            process::id(),
+            current_time_ms() % 100_000
+        ));
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let provider = Arc::new(FlakySessionsTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()])
+            .with_tmux_socket_path(socket_path.clone());
+
+        provider.failing.store(true, Ordering::SeqCst);
+        let available = source.mux_namespace_available();
+        let _ = fs::remove_file(&socket_path);
+
+        assert!(available);
+    }
+
+    /// Parks inside `build_read_only_state`'s tmux work until released.
+    struct BlockingSnapshotProvider {
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl MuxProvider for BlockingSnapshotProvider {
+        fn name(&self) -> &str {
+            "blocking-snapshot-test"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            Vec::new()
+        }
+        fn is_batch_capable(&self) -> bool {
+            true
+        }
+        fn get_all_pane_counts(&self) -> HashMap<String, u32> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            HashMap::new()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            0
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn snapshot_tmux_work_holds_no_shared_state_locks() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockingSnapshotProvider {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let source = Arc::new(ReadOnlyMuxStateSource::new(vec![provider]));
+        let snapshot_source = Arc::clone(&source);
+        let snapshot = std::thread::spawn(move || snapshot_source.snapshot_json());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("snapshot reached tmux work");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let lock_source = Arc::clone(&source);
+        let contender = std::thread::spawn(move || {
+            lock_source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .prune_stuck(STUCK_RUNNING_TIMEOUT_MS);
+            drop(lock_source.settings_revision.lock().unwrap());
+            drop(lock_source.sidebar_coordinator.lock().unwrap());
+            drop(lock_source.theme.lock().unwrap());
+            drop(lock_source.focused_session.lock().unwrap());
+            drop(lock_source.collapsed_worktree_groups.lock().unwrap());
+            let _ = done_tx.send(());
+        });
+        let locks_available = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let _ = release_tx.send(());
+        snapshot.join().expect("snapshot finished");
+        contender.join().expect("contender finished");
+
+        assert!(
+            locks_available,
+            "shared state stayed locked while the snapshot ran tmux commands"
+        );
+    }
+
+    #[test]
+    fn shutdown_announces_closing_without_running_mux_commands() {
+        let provider = Arc::new(FlakySessionsTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.snapshot_json();
+        provider.failing.store(true, Ordering::SeqCst);
+
+        let payload = source.begin_shutdown().expect("closing state");
+
+        let state: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["initLabel"], "closing…");
+        // The announcement reuses the last state; a fresh snapshot would
+        // have seen the now-failing listing and dropped both sessions.
+        assert_eq!(state["sessions"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn a_toggle_queued_behind_shutdown_changes_nothing() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.begin_shutdown();
+
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+
+        assert!(provider.spawned_windows().is_empty());
+        assert_eq!(provider.sidebar_visibility_preference(), None);
+    }
+
+    /// Parks in `cleanup_mux_hooks` until released.
+    struct BlockingCleanupSource {
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl StateSource for BlockingCleanupSource {
+        fn snapshot_json(&self) -> String {
+            "{}".to_string()
+        }
+
+        fn cleanup_mux_hooks(&self) {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successor_cannot_publish_until_shutdown_cleanup_finishes() {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-successor-{}-{id}", process::id()));
+        let pid_file = root.with_extension("pid");
+        let token_file = root.with_extension("token");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, pid_file.clone())
+                .with_token_file(token_file.clone())
+                .with_state_source(BlockingCleanupSource {
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(Some(release_rx)),
+                }),
+        )
+        .await
+        .expect("start server");
+        // A successor generation starting while cleanup runs publishes its
+        // identity first. Everything below runs off the runtime thread, so
+        // it also observes a cleanup that blocks that thread.
+        let successor_token = "c".repeat(64);
+        let successor_pid = pid_file.clone();
+        let successor_token_file = token_file.clone();
+        let successor_token_value = successor_token.clone();
+        let successor = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown cleanup started");
+            let (published_tx, published_rx) = std::sync::mpsc::channel();
+            let publisher = std::thread::spawn(move || {
+                publish_identity(
+                    &successor_pid,
+                    &successor_token_file,
+                    &successor_token_value,
+                )
+                .expect("publish successor");
+                let _ = published_tx.send(());
+            });
+            let published_during_cleanup = published_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_ok();
+            let _ = release_tx.send(());
+            publisher.join().expect("successor published");
+            published_during_cleanup
+        });
+        server.shutdown().await.expect("shutdown");
+        let published_during_cleanup = successor.join().expect("successor thread");
+
+        let successor_kept = fs::read_to_string(&token_file).ok() == Some(successor_token);
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&token_file);
+        let _ = fs::remove_file(root.with_extension("identity.lock"));
+        assert!(
+            !published_during_cleanup,
+            "a successor published while the old generation was still cleaning up"
+        );
+        assert!(
+            successor_kept,
+            "old generation removed the successor identity"
+        );
+    }
+
+    #[test]
+    fn accept_retries_resource_exhaustion_and_aborted_connections() {
+        use std::io::{Error, ErrorKind};
+        for retry in [
+            Error::from_raw_os_error(24), // EMFILE
+            Error::from_raw_os_error(23), // ENFILE
+            Error::from(ErrorKind::ConnectionAborted),
+            Error::from(ErrorKind::Interrupted),
+        ] {
+            assert_eq!(
+                accept_error_action(&retry),
+                AcceptErrorAction::Retry,
+                "{retry}"
+            );
+        }
+        for fatal in [
+            Error::from_raw_os_error(9),  // EBADF
+            Error::from_raw_os_error(22), // EINVAL
+        ] {
+            assert_eq!(
+                accept_error_action(&fatal),
+                AcceptErrorAction::Fatal,
+                "{fatal}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_info_survives_branch_names_containing_dashes() {
+        let repo = std::env::temp_dir().join(format!(
+            "opensessions-git-dashes-{}-{}",
+            process::id(),
+            NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            process::Command::new("git")
+                .current_dir(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        if !git(&["init", "-q", "-b", "fix---races"]).status.success() {
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        }
+        fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+
+        let info =
+            parse_git_info_output(&SystemGitCommandRunner.git_info_output(&repo.to_string_lossy()));
+        let _ = fs::remove_dir_all(&repo);
+
+        assert_eq!(info.branch, "fix---races");
+        assert_eq!(info.changed_files, 1);
+        assert_eq!((info.insertions, info.deletions), (1, 0));
+    }
+
+    #[test]
+    fn hook_context_accepts_session_names_containing_pipes() {
+        for (body, session, pane_id, active) in [
+            ("/dev/ttys001|a|b|@3|%7|1", "a|b", Some("%7"), Some(true)),
+            ("|x|0|@3|%7|0", "x|0", Some("%7"), Some(false)),
+            ("/dev/ttys001|a|@b|@3|%7", "a|@b", Some("%7"), None),
+            ("|pipe|end|@3", "pipe|end", None, None),
+            ("/dev/ttys001|main|@3|%1|1", "main", Some("%1"), Some(true)),
+        ] {
+            let context = parse_context(body).expect(body);
+            assert_eq!(context.session, session, "{body}");
+            assert_eq!(context.window_id, "@3", "{body}");
+            assert_eq!(context.pane_id.as_deref(), pane_id, "{body}");
+            assert_eq!(context.pane_active, active, "{body}");
+        }
+
+        let provider = SidebarVisibilityTestProvider::with_preference(Some(true));
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.setup_mux_hooks("127.0.0.1", 0, "");
+        provider.panes.lock().unwrap().clear();
+        source.handle_http_hook("/ensure-sidebar", "/dev/ttys001|a|b|@7|%1|1");
+        assert_eq!(
+            provider.spawned_windows().last().map(String::as_str),
+            Some("@7")
+        );
     }
 }
