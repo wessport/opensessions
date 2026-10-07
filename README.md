@@ -69,11 +69,11 @@ No rebuild step:
 
 No local rebuild is needed for normal installs. Reload tmux after TPM updates the plugin; opensessions will download the matching release bundle if `bin/` is missing or incomplete.
 
-The plugin automatically restarts the server on update so it picks up the new binary. Toggle the sidebar back on with `prefix o → s` if it was open.
+When the plugin path or version changes, the plugin stops the old server so the next opensessions shortcut starts the new binary. The new server restores the shown/hidden sidebar choice you last made.
 
 ## Uninstall
 
-Run the uninstall script **before** removing the plugin files — it cleans up tmux hooks, keybindings, sidebar panes, and environment variables that would otherwise persist and cause glitching:
+Run the uninstall script **before** removing the plugin files — it stops the server and cleans up tmux hooks, keybindings, sidebar panes, and environment variables that would otherwise persist and cause glitching. It removes only opensessions' own hook slots, so your own tmux hooks are kept:
 
 ```bash
 sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/uninstall.sh
@@ -83,7 +83,7 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 
 ## Today
 
-- Live agent state across sessions for Amp, Claude Code, Codex, and OpenCode.
+- Live agent state across sessions for Amp, Claude Code, Codex, OpenCode, Pi, and Droid.
 - Per-thread unseen markers for `done`, `error`, and `interrupted` states.
 - Session context in the UI: branch in the list, working directory in the detail panel, thread names, and detected localhost ports.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
@@ -168,11 +168,11 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 ## A Few Concrete Bits
 
 - Session ordering is persisted in `~/.config/opensessions/session-order.json`.
-- Amp watcher reads `~/.local/share/amp/threads/*.json` and clears unseen state from Amp's `session.json` when a thread becomes seen there.
+- Amp watcher reads `~/.local/share/amp/threads/*.json` and Amp's thread logs in `~/.cache/amp/logs/threads/`; the optional [Amp plugin](./integrations/amp/README.md) reports live events.
 - Claude Code watcher reads JSONL transcripts in `~/.claude/projects/`.
 - Codex watcher reads transcript JSONL files in `~/.codex/sessions/` or `$CODEX_HOME/sessions/` and resolves sessions from `turn_context.cwd`.
 - OpenCode watcher polls the SQLite database in `~/.local/share/opencode/opencode.db`.
-- Hidden sidebars are stashed in a tmux session named `_os_stash`, so they can come back without restarting the sidebar process.
+- Hiding sidebars kills their panes; showing them again spawns fresh sidebar clients. The shown/hidden choice is remembered per tmux server.
 - Clicking a detected port opens `http://localhost:<port>`.
 
 ## Repo Layout

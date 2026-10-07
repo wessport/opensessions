@@ -5,16 +5,16 @@ of by polling Amp's cloud API.
 
 ## Why
 
-The cloud API approach (built-in `AmpAgentWatcher`) works, but:
+The server's built-in Amp watcher reads Amp's local files
+(`~/.local/share/amp/threads/*.json` and `~/.cache/amp/logs/threads/`), so it
+only sees a status change once Amp has written it and the next scan runs.
+This plugin reports lifecycle events as they happen. A tracked row that is
+newer than a thread's log snapshot keeps winning until the log catches up, so
+plugin events are not overwritten by stale watcher data. Without the plugin,
+the watcher alone still tracks Amp threads.
 
-- It polls `/api/threads` every 10s for discovery.
-- Local threads (`usesDtw: false`) require detail fetches on every version bump.
-- Amp's DTW WebSocket protocol is "in flux" per the Amp team and may change.
-
-When this plugin is installed, opensessions uses its events as the source of
-truth and automatically suppresses cloud API calls for any thread the plugin
-has reported on. If the plugin goes silent for 5 minutes, the watcher falls
-back to polling.
+To show thread titles, the plugin fetches `GET <amp url>/api/threads/<id>`
+once per thread using the API key in `~/.local/share/amp/secrets.json`.
 
 ## Install
 
@@ -28,11 +28,36 @@ cp integrations/amp/opensessions.ts ~/.config/amp/plugins/opensessions.ts
 Restart Amp. A recent Amp build that exposes `ctx.thread.id` on `session.start`
 is required.
 
-## Environment
+## Server discovery
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OPENSESSIONS_URL` | `http://127.0.0.1:7391` | opensessions server base URL |
+Endpoints are resolved again for every event, so the plugin follows
+opensessions restarts and tmux environment changes. Candidates, in order:
+
+1. `OPENSESSIONS_URL`, if set (a trailing `/` is ignored).
+2. `http://127.0.0.1:$OPENSESSIONS_PORT`, if set.
+3. The port derived from `OPENSESSIONS_SERVER_KEY`, if set.
+4. The port derived from the tmux socket in `$TMUX` (the same per-socket key
+   the tmux scripts and server use; ports fall in 22000–41999).
+5. Every live server found through `/tmp/opensessions.<key>.pid`.
+6. `http://127.0.0.1:7391`, only when nothing above produced a candidate.
+
+Each event goes to the first candidate that accepts it (the last successful
+endpoint is tried first); it is not broadcast to every server. Requests carry
+the bearer token from `OPENSESSIONS_TOKEN_FILE` when set, otherwise from
+`/tmp/opensessions.<key>.token` for key-derived candidates, or
+`/tmp/opensessions.token`. Candidates without a readable token are skipped.
+
+Failed events are retried with backoff for up to 30 seconds. A newer event for
+the same thread replaces any queued older one, and events are sent one at a
+time, so an older status can never overwrite a newer one.
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENSESSIONS_URL` | Explicit server base URL, tried first |
+| `OPENSESSIONS_PORT` | Explicit server port on `127.0.0.1` |
+| `OPENSESSIONS_SERVER_KEY` | Explicit server key; see the key rule in the [configuration reference](../../docs/reference/configuration.md#server-key-and-port) |
+| `OPENSESSIONS_TOKEN_FILE` | Bearer token file used for every candidate |
+| `OPENSESSIONS_AMP_PLUGIN_LOG` | Plugin log path (default `/tmp/opensessions-plugin.log`) |
 
 ## Event mapping
 
