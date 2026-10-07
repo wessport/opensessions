@@ -763,13 +763,16 @@ fn content_has_type(content: Option<&Value>, target_type: &str) -> bool {
 }
 
 fn find_uuid_suffix(name: &str) -> Option<&str> {
-    let bytes = name.as_bytes();
-    let len = bytes.len();
+    let len = name.len();
     if len < 36 {
         return None;
     }
+    // A UUID is ASCII, so only windows that start and end on char
+    // boundaries can match; skipping the rest keeps non-ASCII names safe.
     for start in (0..=len - 36).rev() {
-        let candidate = &name[start..start + 36];
+        let Some(candidate) = name.get(start..start + 36) else {
+            continue;
+        };
         if is_uuid(candidate) {
             return Some(candidate);
         }
@@ -904,6 +907,17 @@ not json
             Some("Write a migration")
         );
         assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn codex_thread_id_from_non_ascii_path_does_not_panic() {
+        let uuid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert_eq!(
+            codex_thread_id_from_path(&format!("/s/rollout-é-{uuid}.jsonl")),
+            uuid
+        );
+        let name = "rollout-日本語のセッション名前ファイル";
+        assert_eq!(codex_thread_id_from_path(&format!("/s/{name}.jsonl")), name);
     }
 
     #[test]
