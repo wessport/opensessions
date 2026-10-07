@@ -1399,11 +1399,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                 .collect()
         });
         let git_by_session = self.git_info_by_session(visible_session_names.as_deref(), false);
+        // Copy tracker state out under one short lock; tmux commands run
+        // later must never hold it (agent events and watchers need it).
+        let tracker = self.agent_tracker.lock().unwrap();
+        let unseen_sessions = Some(tracker.get_unseen());
         let (agent_state_by_session, agents_by_session, event_timestamps_by_session) =
             visible_session_names
                 .as_ref()
                 .map(|names| {
-                    let tracker = self.agent_tracker.lock().unwrap();
                     let mut states = HashMap::new();
                     let mut agents = HashMap::new();
                     let mut timestamps = HashMap::new();
@@ -1423,9 +1426,29 @@ impl StateSource for ReadOnlyMuxStateSource {
                     (Some(states), Some(agents), Some(timestamps))
                 })
                 .unwrap_or((None, None, None));
+        drop(tracker);
         let ports_by_session = self.discover_live_ports(visible_session_names.as_deref(), false);
+        // Capture settings with their revision under the revision lock, then
+        // release every lock before `build_read_only_state` runs tmux
+        // commands; a slow or panicking tmux call must not stall or poison
+        // the server's shared state.
         let settings_revision = self.settings_revision.lock().unwrap();
+        let revision = *settings_revision;
         let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
+        let theme = self.theme.lock().unwrap().clone();
+        let transparent_background = *self.transparent_background.lock().unwrap();
+        let session_filter = *self.session_filter.lock().unwrap();
+        let agent_panel_scope = *self.agent_panel_scope.lock().unwrap();
+        let collapsed_worktree_groups = self
+            .collapsed_worktree_groups
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let detail_panel_height = u32::from(*self.detail_panel_height.lock().unwrap());
+        drop(settings_revision);
+        let focused_session = self.focused_session.lock().unwrap().clone();
         debug_log(format!(
             "snapshot_json mode={} init={} width={}",
             sidebar_state.mode, sidebar_state.initializing, sidebar_state.width,
@@ -1438,26 +1461,20 @@ impl StateSource for ReadOnlyMuxStateSource {
             agent_state_by_session,
             agents_by_session,
             event_timestamps_by_session,
-            unseen_sessions: Some(self.agent_tracker.lock().unwrap().get_unseen()),
+            unseen_sessions,
             ports_by_session,
             portless_state: None,
-            focused_session: self.focused_session.lock().unwrap().clone(),
+            focused_session,
             current_session_override: None,
             visible_sidebar_pane_ids,
-            theme: self.theme.lock().unwrap().clone(),
-            transparent_background: *self.transparent_background.lock().unwrap(),
-            session_filter: *self.session_filter.lock().unwrap(),
-            agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
-            collapsed_worktree_groups: self
-                .collapsed_worktree_groups
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect(),
+            theme,
+            transparent_background,
+            session_filter,
+            agent_panel_scope,
+            collapsed_worktree_groups,
             sidebar_width: sidebar_state.width,
-            detail_panel_height: u32::from(*self.detail_panel_height.lock().unwrap()),
-            settings_revision: *settings_revision,
+            detail_panel_height,
+            settings_revision: revision,
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
@@ -3005,11 +3022,18 @@ async fn run_agent_watcher_loop(
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = tokio::time::sleep(Duration::from_millis(delay)) => {
-                let pruned = source
-                    .agent_tracker
-                    .lock()
-                    .unwrap()
-                    .prune_stuck(STUCK_RUNNING_TIMEOUT_MS);
+                // The tracker lock can be held by blocking-pool work; waiting
+                // for it here would stall every task on the runtime thread.
+                let prune_source = source.clone();
+                let pruned = tokio::task::spawn_blocking(move || {
+                    prune_source
+                        .agent_tracker
+                        .lock()
+                        .unwrap()
+                        .prune_stuck(STUCK_RUNNING_TIMEOUT_MS)
+                })
+                .await
+                .unwrap_or(false);
                 if pruned {
                     debug_log("agent_watcher_loop: stale agent state changed, broadcasting");
                     let snapshot_source = source.clone();
@@ -7329,5 +7353,91 @@ mod tests {
         let _ = fs::remove_file(&socket_path);
 
         assert!(available);
+    }
+
+    /// Parks inside `build_read_only_state`'s tmux work until released.
+    struct BlockingSnapshotProvider {
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl MuxProvider for BlockingSnapshotProvider {
+        fn name(&self) -> &str {
+            "blocking-snapshot-test"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            Vec::new()
+        }
+        fn is_batch_capable(&self) -> bool {
+            true
+        }
+        fn get_all_pane_counts(&self) -> HashMap<String, u32> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            HashMap::new()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            0
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn snapshot_tmux_work_holds_no_shared_state_locks() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockingSnapshotProvider {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let source = Arc::new(ReadOnlyMuxStateSource::new(vec![provider]));
+        let snapshot_source = Arc::clone(&source);
+        let snapshot = std::thread::spawn(move || snapshot_source.snapshot_json());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("snapshot reached tmux work");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let lock_source = Arc::clone(&source);
+        let contender = std::thread::spawn(move || {
+            lock_source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .prune_stuck(STUCK_RUNNING_TIMEOUT_MS);
+            drop(lock_source.settings_revision.lock().unwrap());
+            drop(lock_source.sidebar_coordinator.lock().unwrap());
+            drop(lock_source.theme.lock().unwrap());
+            drop(lock_source.focused_session.lock().unwrap());
+            drop(lock_source.collapsed_worktree_groups.lock().unwrap());
+            let _ = done_tx.send(());
+        });
+        let locks_available = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let _ = release_tx.send(());
+        snapshot.join().expect("snapshot finished");
+        contender.join().expect("contender finished");
+
+        assert!(
+            locks_available,
+            "shared state stayed locked while the snapshot ran tmux commands"
+        );
     }
 }
