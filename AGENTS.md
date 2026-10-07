@@ -106,6 +106,7 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 - A GitHub post-push “create pull request” URL may target the canonical upstream even when the branch was pushed to a fork. Before sharing or creating a pull request, verify the base repository and branch and the head repository and branch. For a fork-local pull request, verify the fork's base branch exists and use an explicit same-repository comparison such as `https://github.com/<fork-owner>/<repo>/compare/<base>...<head>?expand=1`.
 - After creating or updating a pull request, inspect its actual metadata and comparison. Verify repositories, branches, commit count, changed files, and mergeability before reporting success. Never claim a pull request was created when only a branch was pushed or a comparison URL was provided.
 - When the user requests only a commit and push, report the pushed branch and commit without adding a pull-request link.
+- Never merge a pull request unless the user explicitly authorizes that specific merge. Permission to create, update, review, or recommend merging a pull request is not permission to merge it, and neither is green CI, mergeability, or reviewer approval.
 - Force-push only with explicit approval, using `--force-with-lease` pinned to the remote commit inspected immediately beforehand.
 
 ## Common Commands
@@ -120,7 +121,7 @@ cargo run -p opensessions-sidebar              # Start sidebar directly
 bun test scripts/postinstall.test.ts           # Postinstall helper tests
 ```
 
-Use `rtk` prefixes when running shell commands, per the user-level instructions.
+Do not use `rtk` in this project. Run shell commands directly; `rtk` is not installed or part of this repository's workflow.
 
 ## Adding A New Built-In Mux Provider
 
