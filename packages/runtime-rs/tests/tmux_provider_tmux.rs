@@ -181,3 +181,172 @@ fn rename_reports_the_name_tmux_actually_assigned() {
     assert_eq!(provider.rename_session("api", "stolen"), None);
     assert_eq!(lab.session_names(), vec!["api-v2", "plain name"]);
 }
+
+/// One window with a fake sidebar pane plus content panes whose shells exit
+/// with the given status after one Enter keypress, under real hooks.
+struct SidebarWindow {
+    window: String,
+    sidebar: String,
+    content: Vec<String>,
+}
+
+fn sidebar_window(lab: &PrivateTmux, provider: &TmuxProvider, exit_codes: &[i32]) -> SidebarWindow {
+    let window = lab.stdout(&["display-message", "-p", "-t", "=work:", "#{window_id}"]);
+    let keeper = lab.stdout(&["display-message", "-p", "-t", "=work:", "#{pane_id}"]);
+    let mut content = Vec::new();
+    for code in exit_codes {
+        let command = format!("sh -c 'read line; exit {code}'");
+        content.push(lab.stdout(&[
+            "split-window",
+            "-d",
+            "-t",
+            &keeper,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            &command,
+        ]));
+    }
+    let sidebar = lab.stdout(&[
+        "split-window",
+        "-hbf",
+        "-d",
+        "-l",
+        "20",
+        "-t",
+        &keeper,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "sleep 600",
+    ]);
+    lab.tmux(&["select-pane", "-t", &sidebar, "-T", "opensessions-sidebar"]);
+    // Hooks point at a closed port; their HTTP calls fail fast and silently.
+    provider.setup_hooks("127.0.0.1", 9, "/nonexistent/opensessions.token");
+    provider.prepare_sidebar_window(&window);
+    SidebarWindow {
+        window,
+        sidebar,
+        content,
+    }
+}
+
+fn window_option(lab: &PrivateTmux, window: &str, option: &str) -> String {
+    lab.stdout(&["show-window-options", "-t", window, "-v", option])
+}
+
+/// `None` when the pane no longer exists, otherwise whether it is dead.
+fn pane_dead(lab: &PrivateTmux, pane: &str) -> Option<bool> {
+    lab.stdout(&["list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"])
+        .lines()
+        .find_map(|line| {
+            let (id, dead) = line.split_once(' ')?;
+            (id == pane).then(|| dead == "1")
+        })
+}
+
+fn exit_pane(lab: &PrivateTmux, pane: &str) {
+    lab.tmux(&["send-keys", "-t", pane, "Enter"]);
+}
+
+#[test]
+fn hiding_the_sidebar_restores_remain_on_exit_for_its_window() {
+    let Some(lab) = PrivateTmux::start("work") else {
+        return;
+    };
+    let provider = lab.provider();
+    let setup = sidebar_window(&lab, &provider, &[0]);
+    assert_eq!(window_option(&lab, &setup.window, "remain-on-exit"), "on");
+
+    lab.tmux(&["kill-pane", "-t", &setup.sidebar]);
+    provider.restore_windows_without_sidebar();
+
+    assert_eq!(window_option(&lab, &setup.window, "remain-on-exit"), "");
+    assert_eq!(
+        window_option(&lab, &setup.window, "@opensessions_remain_on_exit_previous"),
+        ""
+    );
+    exit_pane(&lab, &setup.content[0]);
+    assert!(
+        wait_until(Duration::from_secs(3), || pane_dead(
+            &lab,
+            &setup.content[0]
+        )
+        .is_none()),
+        "exited pane lingered: {:?}",
+        pane_dead(&lab, &setup.content[0])
+    );
+}
+
+#[test]
+fn dead_panes_do_not_linger_after_a_sidebar_is_killed_by_hand() {
+    let Some(lab) = PrivateTmux::start("work") else {
+        return;
+    };
+    let provider = lab.provider();
+    let setup = sidebar_window(&lab, &provider, &[0]);
+
+    // No server is around to react; the pane-died hook alone must cope.
+    lab.tmux(&["kill-pane", "-t", &setup.sidebar]);
+    exit_pane(&lab, &setup.content[0]);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || pane_dead(
+            &lab,
+            &setup.content[0]
+        )
+        .is_none()),
+        "exited pane lingered: {:?}",
+        pane_dead(&lab, &setup.content[0])
+    );
+    assert!(wait_until(Duration::from_secs(3), || {
+        window_option(&lab, &setup.window, "remain-on-exit").is_empty()
+    }));
+}
+
+#[test]
+fn sidebar_windows_keep_dead_panes_when_the_user_wants_them() {
+    let Some(lab) = PrivateTmux::start("work") else {
+        return;
+    };
+    lab.tmux(&["set-option", "-gw", "remain-on-exit", "on"]);
+    let provider = lab.provider();
+    let setup = sidebar_window(&lab, &provider, &[0, 0]);
+
+    exit_pane(&lab, &setup.content[0]);
+    assert!(wait_until(Duration::from_secs(3), || {
+        pane_dead(&lab, &setup.content[0]) == Some(true)
+    }));
+    // The pane-died hook has run once the second pane is dead too; the
+    // first must still be there.
+    exit_pane(&lab, &setup.content[1]);
+    assert!(wait_until(Duration::from_secs(3), || {
+        pane_dead(&lab, &setup.content[1]) == Some(true)
+    }));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(pane_dead(&lab, &setup.content[0]), Some(true));
+    assert_eq!(pane_dead(&lab, &setup.content[1]), Some(true));
+}
+
+#[test]
+fn sidebar_windows_honour_remain_on_exit_failed() {
+    let Some(lab) = PrivateTmux::start("work") else {
+        return;
+    };
+    lab.tmux(&["set-option", "-gw", "remain-on-exit", "failed"]);
+    let provider = lab.provider();
+    let setup = sidebar_window(&lab, &provider, &[3, 0]);
+
+    exit_pane(&lab, &setup.content[0]);
+    exit_pane(&lab, &setup.content[1]);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || pane_dead(
+            &lab,
+            &setup.content[1]
+        )
+        .is_none()),
+        "cleanly exited pane lingered"
+    );
+    assert_eq!(pane_dead(&lab, &setup.content[0]), Some(true));
+}

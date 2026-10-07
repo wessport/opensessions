@@ -210,6 +210,9 @@ These are non-negotiable:
 - use `after-resize-pane` only as an idempotent fixed-width repair trigger for the pane that caused the hook when it is titled `opensessions-sidebar`; it must not scan or resize unrelated panes
 - do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
+- `remain-on-exit` is forced `on` only while a window has a sidebar (the prior value is saved in `@opensessions_remain_on_exit_previous`); hiding the sidebar, a sidebar pane exiting or being killed, and shutdown restore the saved value, so panes in sidebar-less windows exit normally instead of lingering as "Pane is dead"
+- the `pane-died` hook removes a dead content pane only when the user's saved `remain-on-exit` would not have kept it (never for `on`, clean exits only for `failed`); dead sidebar panes are always removed, and a window found without a sidebar gets its saved value back
+- target sessions by exact name (`=name`, or `=name:` for window/pane targets); a bare `-t name` falls back to prefix/pattern matches and can act on another session
 
 ## Per-tmux-server Technical Contract
 

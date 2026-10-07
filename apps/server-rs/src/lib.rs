@@ -1913,6 +1913,13 @@ impl StateSource for ReadOnlyMuxStateSource {
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
                 }
+                // A sidebar pane that exited or was killed leaves its window
+                // with forced `remain-on-exit`; serialize with spawning so a
+                // sidebar being created is never mistaken for a missing one.
+                let _presence_guard = self.sidebar_presence.lock().unwrap();
+                for provider in &self.providers {
+                    provider.restore_windows_without_sidebar();
+                }
                 None
             }
             "/pane-layout-changed" | "/client-resized" => {
@@ -2436,6 +2443,8 @@ impl ReadOnlyMuxStateSource {
                 for pane in panes {
                     provider.hide_sidebar(&pane.pane_id);
                 }
+                // Hidden windows must exit panes normally again.
+                provider.restore_windows_without_sidebar();
             }
             self.sidebar_coordinator.lock().unwrap().hide();
             self.record_sidebar_visibility(false);
@@ -6971,6 +6980,8 @@ mod tests {
         preference: Mutex<Option<bool>>,
         panes: Mutex<Vec<opensessions_runtime::mux::SidebarPane>>,
         spawned_windows: Mutex<Vec<String>>,
+        /// Sidebar pane count seen by each `restore_windows_without_sidebar`.
+        restores: Mutex<Vec<usize>>,
     }
 
     impl SidebarVisibilityTestProvider {
@@ -6979,6 +6990,7 @@ mod tests {
                 preference: Mutex::new(preference),
                 panes: Mutex::new(Vec::new()),
                 spawned_windows: Mutex::new(Vec::new()),
+                restores: Mutex::new(Vec::new()),
             })
         }
 
@@ -7073,6 +7085,10 @@ mod tests {
         }
         fn kill_sidebar_pane(&self, pane_id: &str) {
             self.hide_sidebar(pane_id);
+        }
+        fn restore_windows_without_sidebar(&self) {
+            let sidebars = self.panes.lock().unwrap().len();
+            self.restores.lock().unwrap().push(sidebars);
         }
     }
 
@@ -7171,5 +7187,29 @@ mod tests {
 
         assert!(provider.panes.lock().unwrap().is_empty());
         assert_eq!(provider.sidebar_visibility_preference(), Some(true));
+    }
+
+    #[test]
+    fn hiding_the_sidebar_restores_windows_without_a_sidebar() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+        assert!(provider.restores.lock().unwrap().is_empty());
+
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+
+        assert_eq!(*provider.restores.lock().unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn an_exited_sidebar_pane_restores_its_window() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+        provider.panes.lock().unwrap().pop();
+
+        source.handle_http_hook("/pane-exited", "");
+
+        assert_eq!(*provider.restores.lock().unwrap(), vec![1]);
     }
 }
