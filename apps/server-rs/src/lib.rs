@@ -2461,6 +2461,12 @@ impl ReadOnlyMuxStateSource {
 
     fn toggle_sidebar(&self) {
         let _presence_guard = self.sidebar_presence.lock().unwrap();
+        // A toggle queued behind the state-operation lock can run after
+        // shutdown began; it must neither spawn sidebars nor record a choice.
+        if self.sidebar_coordinator.lock().unwrap().state().lifecycle == SidebarLifecycle::Closing {
+            debug_log("toggle_sidebar: ignored while the server is closing");
+            return;
+        }
         let providers = self
             .providers
             .iter()
@@ -7470,5 +7476,17 @@ mod tests {
         // The announcement reuses the last state; a fresh snapshot would
         // have seen the now-failing listing and dropped both sessions.
         assert_eq!(state["sessions"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn a_toggle_queued_behind_shutdown_changes_nothing() {
+        let provider = SidebarVisibilityTestProvider::with_preference(None);
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.begin_shutdown();
+
+        source.handle_http_hook("/toggle", ENSURE_CONTEXT);
+
+        assert!(provider.spawned_windows().is_empty());
+        assert_eq!(provider.sidebar_visibility_preference(), None);
     }
 }
