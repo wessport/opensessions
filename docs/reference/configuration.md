@@ -164,7 +164,7 @@ All other tmux options fall back to the defaults shown in the table above.
 | `OPENSESSIONS_TOKEN_FILE` | server, sidebar, helper shell scripts, Amp/Pi integrations | Bearer token file override; default `/tmp/opensessions.<key>.token` |
 | `OPENSESSIONS_URL` | Amp/Pi integrations | Explicit server base URL, tried before derived endpoints |
 | `OPENSESSIONS_RELEASE_BASE` | TPM bootstrap, `scripts/postinstall.js` | Release download base for prebuilt binaries (required for fork installs) |
-| `OPENSESSIONS_DEBUG_LOG` | server | Append debug lines to this file; unset disables debug logging |
+| `OPENSESSIONS_DEBUG_LOG` | server, sidebar | Append debug lines to this file; unset disables debug logging. Sidebars rotate the file to `<path>.1` past 5 MiB |
 | `OPENSESSIONS_LAZYDIFF` | sidebar | Explicit lazydiff binary path override. By default the sidebar prefers the bundled sibling binary in `bin/`, then `lazydiff` on `PATH` |
 | `OPENSESSIONS_SKIP_BINARY_DOWNLOAD` | TPM bootstrap | Set to `1` to skip prebuilt binary downloads and use a local `target/` build |
 | `OPENSESSIONS_WIDTH` | ignored | Deprecated stale bootstrap variable; width is controlled by persisted `sidebarWidth` |

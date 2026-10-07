@@ -391,7 +391,7 @@ Before shipping any sidebar behavior change, verify all of these.
 - control-mode clients cannot steal foreground/current-session authority
 - hooks and sidebar clients point to the derived server for the current tmux socket
 - tmux windows remain in `window-size latest`
-- no resize or enforcement loop appears in `/tmp/opensessions-debug.log`
+- no resize or enforcement loop appears in the debug log (`OPENSESSIONS_DEBUG_LOG`)
 
 ## Files To Read Before Changing This Area
 
