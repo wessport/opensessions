@@ -16,7 +16,7 @@
  *   agent.start   → running
  *   agent.end     → done | error | interrupted  (from event.status)
  *   tool.call     → tool-running
- *   tool.result   → error on failure, interrupted on cancel (no-op on success)
+ *   tool.result   → error on failure, interrupted on cancel, running on success
  *
  * Session identity:
  *   1. `tmux display-message -p '#S'` — works when Amp is launched inside a
@@ -151,7 +151,7 @@ function resolveServerUrls(): string[] {
     if (tokenFile) tokenFileByUrl.set(url, tokenFile);
   };
 
-  add(process.env.OPENSESSIONS_URL);
+  add(process.env.OPENSESSIONS_URL?.trim().replace(/\/+$/, ""));
 
   const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
   if (Number.isFinite(explicit) && explicit > 0) add(`http://127.0.0.1:${explicit}`);
@@ -174,9 +174,10 @@ function resolveServerUrls(): string[] {
     }
   }
 
-  // Broadcast agent telemetry to every opensessions server currently known on
-  // this machine. Each server maps projectDir/tmuxSession against its own tmux
-  // sessions and no-ops events for folders it does not own.
+  // Also consider every live opensessions server discovered through its
+  // /tmp pid file. This is a fallback candidate list, not a broadcast:
+  // postOnce delivers each event to the first candidate that accepts it,
+  // trying the last successful endpoint first.
   try {
     for (const entry of readdirSync("/tmp")) {
       const match = /^opensessions\.([A-Za-z0-9_-]+)\.pid$/.exec(entry);
@@ -248,11 +249,30 @@ async function resolveTmuxPane($: PluginAPI["$"]): Promise<string | null> {
 
 type PendingPayload = EventPayload & { firstAttemptTs: number; retryDelayMs: number };
 
+// Delivery invariants:
+// - Every network send (first attempt or retry) runs through `exclusive`, so
+//   sends never overlap and an older event cannot land after a newer one.
+// - Each event gets a sequence number; the newest event for a thread wins.
+//   A newer event drops any queued older event for that thread, and an older
+//   event that is still waiting to send is skipped once a newer one exists.
 const pendingByThread = new Map<string, PendingPayload>();
+const latestSeqByKey = new Map<string, number>();
+let eventSeq = 0;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let sendChain: Promise<unknown> = Promise.resolve();
+
+function exclusive<T>(task: () => Promise<T>): Promise<T> {
+  const run = sendChain.then(task, task);
+  sendChain = run.catch(() => {});
+  return run;
+}
 
 function pendingKey(payload: EventPayload): string {
   return payload.threadId ?? `${payload.projectDir}:${payload.tmuxSession ?? ""}`;
+}
+
+function isLatest(key: string, seq: number): boolean {
+  return latestSeqByKey.get(key) === seq;
 }
 
 function scheduleRetry(): void {
@@ -266,25 +286,31 @@ function scheduleRetry(): void {
   }, nextDelay);
 }
 
-async function flushPending(): Promise<void> {
-  const now = Date.now();
-  for (const [key, payload] of Array.from(pendingByThread.entries())) {
-    if (now - payload.firstAttemptTs > RETRY_FOR_MS) {
-      pendingByThread.delete(key);
-      plog(`retry drop status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ageMs=${now - payload.firstAttemptTs}`);
-      continue;
+function flushPending(): Promise<void> {
+  return exclusive(async () => {
+    for (const [key, payload] of Array.from(pendingByThread.entries())) {
+      // A newer event may have replaced or dropped this entry while an
+      // earlier retry in this pass was awaiting the network.
+      if (pendingByThread.get(key) !== payload) continue;
+      const now = Date.now();
+      if (now - payload.firstAttemptTs > RETRY_FOR_MS) {
+        pendingByThread.delete(key);
+        plog(`retry drop status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ageMs=${now - payload.firstAttemptTs}`);
+        continue;
+      }
+      const { firstAttemptTs: _firstAttemptTs, retryDelayMs, ...eventPayload } = payload;
+      const delivered = await postOnce(eventPayload);
+      if (pendingByThread.get(key) !== payload) continue;
+      if (delivered) {
+        pendingByThread.delete(key);
+      } else {
+        pendingByThread.set(key, {
+          ...payload,
+          retryDelayMs: Math.min(retryDelayMs * 2, RETRY_MAX_MS),
+        });
+      }
     }
-    const { firstAttemptTs, retryDelayMs, ...eventPayload } = payload;
-    if (await postOnce(eventPayload)) {
-      pendingByThread.delete(key);
-    } else {
-      pendingByThread.set(key, {
-        ...payload,
-        retryDelayMs: Math.min(retryDelayMs * 2, RETRY_MAX_MS),
-      });
-    }
-  }
-  scheduleRetry();
+  }).finally(scheduleRetry);
 }
 
 async function postOnce(payload: EventPayload): Promise<boolean> {
@@ -320,17 +346,24 @@ async function postOnce(payload: EventPayload): Promise<boolean> {
 }
 
 async function post(payload: EventPayload): Promise<void> {
-  if (await postOnce(payload)) return;
-
   const key = pendingKey(payload);
-  const existing = pendingByThread.get(key);
-  pendingByThread.set(key, {
-    ...payload,
-    firstAttemptTs: existing?.firstAttemptTs ?? Date.now(),
-    retryDelayMs: RETRY_INITIAL_MS,
+  const seq = ++eventSeq;
+  latestSeqByKey.set(key, seq);
+  // This event supersedes any older event still queued for the same thread.
+  pendingByThread.delete(key);
+
+  await exclusive(async () => {
+    if (!isLatest(key, seq)) return;
+    if (await postOnce(payload)) return;
+    if (!isLatest(key, seq)) return;
+    pendingByThread.set(key, {
+      ...payload,
+      firstAttemptTs: Date.now(),
+      retryDelayMs: RETRY_INITIAL_MS,
+    });
+    plog(`retry queued status=${payload.status} thread=${payload.threadId?.slice(0, 8)} key=${key} pending=${pendingByThread.size}`);
+    scheduleRetry();
   });
-  plog(`retry queued status=${payload.status} thread=${payload.threadId?.slice(0, 8)} key=${key} pending=${pendingByThread.size}`);
-  scheduleRetry();
 }
 
 export default function (amp: PluginAPI) {
