@@ -1493,7 +1493,7 @@ fn render_modal_overlay(
     width: usize,
     height: usize,
 ) {
-    match &app.modal {
+    let drawn = match &app.modal {
         Modal::RenameSession {
             original_name,
             draft,
@@ -1541,7 +1541,56 @@ fn render_modal_overlay(
             marked,
             *confirming,
         ),
-        Modal::None => {}
+        Modal::None => true,
+    };
+    if !drawn {
+        render_compact_modal_prompt(app, palette, lines, width, height);
+    }
+}
+
+/// One-line stand-in for a modal whose box does not fit. An open modal owns
+/// every key, so it must never be invisible: otherwise a narrow or short
+/// sidebar silently swallows input.
+fn render_compact_modal_prompt(
+    app: &App,
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let (text, color, keep_end) = match &app.modal {
+        Modal::QuitConfirm => ("Quit opensessions? y/n".to_string(), palette.red, false),
+        Modal::KillConfirm { target } => {
+            let (title, label) = app.kill_confirm_copy(target);
+            (format!("{title} {label} y/n"), palette.red, false)
+        }
+        Modal::RenameSession { draft, .. } => (format!("Rename: {draft}_"), palette.blue, true),
+        Modal::ThemePicker { .. } => (
+            format!("Theme: {}", app.theme.as_deref().unwrap_or("default")),
+            palette.blue,
+            false,
+        ),
+        Modal::WidthSlider { draft_width } => {
+            (format!("Width {draft_width} ←/→"), palette.blue, false)
+        }
+        Modal::WindowManager {
+            confirming: true, ..
+        } => ("Kill windows? Enter/Esc".to_string(), palette.red, false),
+        Modal::WindowManager { .. } => ("Windows · Esc".to_string(), palette.blue, false),
+        Modal::None => return,
+    };
+    let text = if keep_end {
+        truncate_left(&text, width)
+    } else {
+        truncate_right(&text, width)
+    };
+    let mut line = StyledLine::blank();
+    line.push(text, color);
+    if let Some(target) = lines.get_mut(height / 2) {
+        *target = line;
     }
 }
 
@@ -1556,12 +1605,12 @@ fn render_window_manager_overlay(
     selected: usize,
     marked: &HashSet<String>,
     confirming: bool,
-) {
+) -> bool {
     let box_width = width.min(38);
     let visible_items = windows.len().clamp(1, 10);
     let box_height = if confirming { 7 } else { visible_items + 6 };
     if height < box_height + 2 || box_width < MIN_SIDEBAR_WIDTH as usize {
-        return;
+        return false;
     }
     let start_y = (height - box_height) / 2;
     let start_x = (width - box_width) / 2;
@@ -1653,6 +1702,7 @@ fn render_window_manager_overlay(
             *target = row;
         }
     }
+    true
 }
 
 fn render_theme_picker_overlay(
@@ -1663,13 +1713,13 @@ fn render_theme_picker_overlay(
     query: &str,
     selected: usize,
     transparent_background: bool,
-) {
+) -> bool {
     let box_width: usize = 28;
     let visible_items: usize = 12;
     // title + search + blank + items + blank + footer
     let box_height = 4 + visible_items + 1;
     if height < box_height + 2 || width < box_width + 2 {
-        return;
+        return false;
     }
 
     let filtered: Vec<&str> = THEME_NAMES
@@ -1851,6 +1901,7 @@ fn render_theme_picker_overlay(
     if row < lines.len() {
         lines[row] = bottom;
     }
+    true
 }
 
 fn render_rename_session_overlay(
@@ -1860,14 +1911,14 @@ fn render_rename_session_overlay(
     height: usize,
     original_name: &str,
     draft: &str,
-) {
+) -> bool {
     let desired_box_width = 34usize
         .max(original_name.width() + 6)
         .max(draft.width() + 6);
     let max_box_width = width.saturating_sub(2);
     let box_height = 7usize;
     if height < box_height + 2 || max_box_width < 16 {
-        return;
+        return false;
     }
     let box_width = desired_box_width.min(max_box_width);
     let inner_width = box_width - 2;
@@ -1910,6 +1961,7 @@ fn render_rename_session_overlay(
             *target = row;
         }
     }
+    true
 }
 
 fn render_kill_confirm_overlay(
@@ -1919,12 +1971,12 @@ fn render_kill_confirm_overlay(
     height: usize,
     title: &str,
     label: &str,
-) {
+) -> bool {
     let desired_box_width: usize = 30.max(title.width() + 6).max(label.width() + 6);
     let max_box_width = width.saturating_sub(2);
     let box_height: usize = 5;
     if height < box_height + 2 || max_box_width < 12 {
-        return;
+        return false;
     }
     let box_width = desired_box_width.min(max_box_width);
 
@@ -1973,6 +2025,7 @@ fn render_kill_confirm_overlay(
             lines[y] = row;
         }
     }
+    true
 }
 
 fn render_width_slider_overlay(
@@ -1981,11 +2034,11 @@ fn render_width_slider_overlay(
     width: usize,
     height: usize,
     draft_width: u16,
-) {
+) -> bool {
     let box_width: usize = width.min(36);
     let box_height: usize = 7;
     if height < box_height + 2 || box_width < MIN_SIDEBAR_WIDTH as usize {
-        return;
+        return false;
     }
 
     let start_y = (height.saturating_sub(box_height)) / 2;
@@ -2071,6 +2124,7 @@ fn render_width_slider_overlay(
             lines[y] = row;
         }
     }
+    true
 }
 
 fn compute_agent_window(
@@ -2376,6 +2430,9 @@ fn dir_name(session: &SessionData) -> Option<Cow<'_, str>> {
 fn truncate_left(value: &str, max_cols: usize) -> String {
     if value.width() <= max_cols {
         return value.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
     }
 
     let mut chars = value.chars().collect::<Vec<_>>();
@@ -3370,6 +3427,86 @@ mod tests {
             "long kill target should be visibly truncated inside narrow modal\n{}",
             lines.join("\n")
         );
+    }
+
+    #[test]
+    fn truncate_left_never_exceeds_the_allowed_width() {
+        for max_cols in 0..4 {
+            let truncated = truncate_left("/repos/project", max_cols);
+            assert!(
+                truncated.width() <= max_cols,
+                "{truncated:?} is wider than {max_cols}"
+            );
+        }
+        assert_eq!(truncate_left("/repos/project", 0), "");
+    }
+
+    #[test]
+    fn quit_confirm_stays_visible_when_the_sidebar_is_too_small_for_the_box() {
+        let mut app = app_from_sessions(vec![session("project", "/tmp/project", "main")]);
+        app.modal = Modal::QuitConfirm;
+
+        let lines = render_text(&app, 30, 6);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Quit opensessions?") && line.contains("y/n")),
+            "a modal that captures keys must stay visible\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_modal_stays_visible_when_its_box_does_not_fit() {
+        let make_app = || app_from_sessions(vec![session("project", "/tmp/project", "main")]);
+        let base = make_app();
+        let modals = [
+            Modal::QuitConfirm,
+            Modal::KillConfirm {
+                target: KillTarget::Session("project".to_string()),
+            },
+            Modal::RenameSession {
+                original_name: "project".to_string(),
+                draft: "renamed".to_string(),
+            },
+            Modal::ThemePicker {
+                query: String::new(),
+                selected: 0,
+                original_theme: None,
+                original_transparent_background: false,
+            },
+            Modal::WidthSlider { draft_width: 36 },
+            Modal::WindowManager {
+                session: "project".to_string(),
+                windows: Vec::new(),
+                selected: 0,
+                marked: HashSet::new(),
+                confirming: false,
+            },
+        ];
+        for (width, height) in [(12, 5), (36, 12), (11, 30)] {
+            let without_modal = render_text(&base, width, height);
+            for modal in &modals {
+                let mut app = make_app();
+                app.modal = modal.clone();
+
+                let lines = render_text(&app, width, height);
+
+                assert_ne!(
+                    lines, without_modal,
+                    "{modal:?} captures keys but is invisible at {width}x{height}"
+                );
+                for (row, line) in lines.iter().enumerate() {
+                    if without_modal.get(row) != Some(line) {
+                        assert!(
+                            line.width() <= width,
+                            "{modal:?} overflowed {width} columns: {line:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

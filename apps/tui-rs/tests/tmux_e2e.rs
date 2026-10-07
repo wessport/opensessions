@@ -1268,13 +1268,38 @@ fn tmux_sidebar_q_in_main_pane_does_not_quit_opensessions() {
     let mut lab = started_lab("opensessions-e2e-q-main-pane");
     let main = lab.main_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    let sidebars = lab.sidebar_panes();
+    assert_eq!(sidebars.len(), SIDEBAR_SESSIONS.len());
+    for sidebar in &sidebars {
+        lab.wait_for_capture_pane(&sidebar.pane, |text| text.contains("sessions"));
+    }
     lab.tmux_ok(["select-pane", "-t", main.as_str()]);
+
+    // `q` alone only opens a confirmation, so a leak is visible as the
+    // prompt in any sidebar, and `q` then `y` would stop the server.
     lab.tmux_ok(["send-keys", "-t", main.as_str(), "q"]);
     sleep(Duration::from_millis(700));
+    let assert_no_quit_prompt = |lab: &Lab, after: &str| {
+        for sidebar in &sidebars {
+            let capture = lab.capture_pane(&sidebar.pane);
+            assert!(
+                !capture.contains("Quit opensessions?"),
+                "{after} in the main pane opened the quit prompt in sidebar {} ({}):\n{capture}",
+                sidebar.pane,
+                sidebar.session,
+            );
+        }
+    };
+    assert_no_quit_prompt(&lab, "q");
 
+    lab.tmux_ok(["send-keys", "-t", main.as_str(), "y"]);
+    lab.wait_for_capture_pane(&main, |text| text.contains("qy"));
+    sleep(Duration::from_millis(700));
+
+    assert_no_quit_prompt(&lab, "q then y");
     assert!(
         lab.server_is_running(),
-        "server exited after q in main pane"
+        "server exited after q then y in the main pane"
     );
     assert_eq!(lab.sidebar_panes().len(), SIDEBAR_SESSIONS.len());
 }

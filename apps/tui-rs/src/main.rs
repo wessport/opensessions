@@ -9,10 +9,13 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_sidebar::app::{App, LaunchTarget, Modal};
-use opensessions_sidebar::cli::{Args, resolve_endpoint_from_env};
+use opensessions_sidebar::cli::{Args, resolve_endpoint};
 use opensessions_sidebar::client::{
-    connect_ws_path_with_token, decode_server_message, encode_client_command, fire_quit_http,
-    validate_hello,
+    connect_ws_path_with_token, decode_server_message, encode_client_command,
+    send_quit_with_http_fallback, validate_hello,
+};
+use opensessions_sidebar::debug_log::{
+    DEBUG_LOG_MAX_BYTES, append_bounded, debug_log_path_from_env,
 };
 use opensessions_sidebar::generated::protocol::{ClientCommand, ServerMessage};
 use opensessions_sidebar::input::{UiKey, UiMouse, apply_ui_key, apply_ui_mouse};
@@ -27,8 +30,6 @@ use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
-const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
-const DEFAULT_SERVER_PORT: u16 = 7_391;
 const SIDEBAR_WIDTH_DEBOUNCE_MS: u64 = 80;
 
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -39,50 +40,38 @@ struct PendingSidebarWidthCommand {
     due_at: std::time::Instant,
 }
 
-/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
-/// so live focus/agent-state issues can be diagnosed without extra env setup;
-/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
+/// Append a single debug line when `OPENSESSIONS_DEBUG_LOG` names a path,
+/// matching the server's opt-in logging. The file is size-capped so one
+/// sidebar per tmux window cannot grow it without bound.
 fn debug_log(line: impl AsRef<str>) {
-    use std::io::Write;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .ok()
-        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
-    if path.is_empty() {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| debug_log_path_from_env(|key| std::env::var(key).ok()))
+    else {
         return;
-    }
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(
-            file,
+    append_bounded(
+        path,
+        &format!(
             "[{now}] [sidebar pid={}] {}",
             std::process::id(),
             line.as_ref()
-        );
-    }
+        ),
+        DEBUG_LOG_MAX_BYTES,
+    );
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let env = resolve_endpoint_from_env(|key| std::env::var(key).ok());
-    let server_host = if args.server_host == DEFAULT_SERVER_HOST {
-        env.server_host
-    } else {
-        args.server_host
-    };
-    let server_port = if args.server_port == DEFAULT_SERVER_PORT {
-        env.server_port
-    } else {
-        args.server_port
-    };
+    let env = resolve_endpoint(&args, |key| std::env::var(key).ok());
+    let server_host = env.server_host.clone();
+    let server_port = env.server_port;
     let auth_token = std::fs::read_to_string(&env.token_file)
         .with_context(|| format!("read opensessions token {}", env.token_file))?;
 
@@ -118,6 +107,11 @@ async fn main() -> Result<()> {
             .await?;
     }
 
+    let quit_endpoint = QuitEndpoint {
+        host: server_host.clone(),
+        port: server_port,
+        token: auth_token.trim().to_string(),
+    };
     let mut terminal = TerminalGuard::enter()?;
     let mut events = EventStream::new();
     let mut app: Option<App> = None;
@@ -230,23 +224,12 @@ async fn main() -> Result<()> {
                     handle_key(app, key);
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
-                        let is_quit = send_or_queue_client_command(
+                        send_or_queue_client_command(
                             command,
                             &mut ws,
                             &mut pending_sidebar_width,
+                            &quit_endpoint,
                         ).await?;
-                        if is_quit {
-                            // HTTP fallback on a separate TCP connection.
-                            // Whichever path reaches the server first triggers
-                            // quitAll → close WS → renderer teardown. We
-                            // fire-and-forget on the current_thread runtime.
-                            let host = server_host.clone();
-                            let port = server_port;
-                            let quit_token = auth_token.clone();
-                            tokio::spawn(async move {
-                                fire_quit_http(&host, port, quit_token.trim()).await;
-                            });
-                        }
                     }
                     for launch in app.drain_launches() {
                         handle_launch(launch, app, &mut last_lazydiff_launch);
@@ -274,7 +257,7 @@ async fn main() -> Result<()> {
                     apply_ui_mouse(app, ui_mouse);
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
-                        send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
+                        send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width, &quit_endpoint).await?;
                     }
                     for launch in app.drain_launches() {
                         handle_launch(launch, app, &mut last_lazydiff_launch);
@@ -348,7 +331,7 @@ async fn main() -> Result<()> {
                     }
                     if let Some(app) = &mut app {
                         for command in app.drain_commands() {
-                            send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
+                            send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width, &quit_endpoint).await?;
                         }
                         terminal.draw(app)?;
                         if let Ok((width, _)) = terminal::size() {
@@ -389,11 +372,19 @@ fn animation_needed(app: &App) -> bool {
         })
 }
 
+/// Where the HTTP `/quit` fallback is sent.
+struct QuitEndpoint {
+    host: String,
+    port: u16,
+    token: String,
+}
+
 async fn send_or_queue_client_command(
     command: ClientCommand,
     ws: &mut ClientWebSocket,
     pending_sidebar_width: &mut Option<PendingSidebarWidthCommand>,
-) -> Result<bool> {
+    quit_endpoint: &QuitEndpoint,
+) -> Result<()> {
     match command {
         ClientCommand::SetSidebarWidth { width, request_id } => {
             *pending_sidebar_width = Some(PendingSidebarWidthCommand {
@@ -402,14 +393,27 @@ async fn send_or_queue_client_command(
                 due_at: std::time::Instant::now()
                     + std::time::Duration::from_millis(SIDEBAR_WIDTH_DEBOUNCE_MS),
             });
-            Ok(false)
+            Ok(())
+        }
+        ClientCommand::Quit => {
+            // Whichever path reaches the server first triggers quitAll →
+            // close WS → renderer teardown. The HTTP fallback fires even when
+            // the websocket is already failing.
+            let flushed = flush_pending_sidebar_width(ws, pending_sidebar_width).await;
+            send_quit_with_http_fallback(
+                ws,
+                &quit_endpoint.host,
+                quit_endpoint.port,
+                &quit_endpoint.token,
+            )
+            .await?;
+            flushed
         }
         command => {
             flush_pending_sidebar_width(ws, pending_sidebar_width).await?;
-            let is_quit = matches!(command, ClientCommand::Quit);
             ws.send(Message::text(encode_client_command(&command)?))
                 .await?;
-            Ok(is_quit)
+            Ok(())
         }
     }
 }
