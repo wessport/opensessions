@@ -61,6 +61,10 @@ pub struct TerminationOutcome {
     /// At least one process in the target survived the grace period and was
     /// sent SIGKILL.
     pub escalated: bool,
+    /// Every captured process exited or was SIGKILLed, so the agent is no
+    /// longer running. False when SIGTERM was not delivered or a survivor
+    /// was spared because the target was no longer wanted.
+    pub stopped: bool,
 }
 
 pub trait ProcessControl: Send + Sync {
@@ -218,6 +222,18 @@ pub fn terminate_agent_processes(
     targets: &[AgentProcessTarget],
     grace: Duration,
 ) -> Vec<TerminationOutcome> {
+    terminate_agent_processes_if(control, targets, grace, &|_| true)
+}
+
+/// Like [`terminate_agent_processes`], but after the grace period only
+/// escalates targets for which `still_wanted(index)` holds, so an agent that
+/// became active while SIGTERM was pending is not SIGKILLed.
+pub fn terminate_agent_processes_if(
+    control: &dyn ProcessControl,
+    targets: &[AgentProcessTarget],
+    grace: Duration,
+    still_wanted: &dyn Fn(usize) -> bool,
+) -> Vec<TerminationOutcome> {
     // The targets come from an earlier process-table snapshot; re-read it so
     // a pid recycled since then is never signalled.
     let running = process_args_by_pid(control);
@@ -231,6 +247,7 @@ pub fn terminate_agent_processes(
                 .is_some_and(|process| running.get(&process.pid) == Some(&process.args))
                 && control.signal(target.pid, Signal::Term),
             escalated: false,
+            stopped: false,
         })
         .collect::<Vec<_>>();
     if !outcomes.iter().any(|outcome| outcome.terminated) {
@@ -239,19 +256,33 @@ pub fn terminate_agent_processes(
 
     control.sleep(grace);
     let survivors = process_args_by_pid(control);
-    for (target, outcome) in targets.iter().zip(outcomes.iter_mut()) {
+    for (index, (target, outcome)) in targets.iter().zip(outcomes.iter_mut()).enumerate() {
         if !outcome.terminated {
             continue;
         }
-        for process in &target.processes {
-            // Matching the command line guards against signalling a recycled
-            // pid that now belongs to an unrelated process.
-            if survivors.get(&process.pid) == Some(&process.args)
-                && control.signal(process.pid, Signal::Kill)
-            {
+        // Matching the command line guards against signalling a recycled
+        // pid that now belongs to an unrelated process.
+        let alive = target
+            .processes
+            .iter()
+            .filter(|process| survivors.get(&process.pid) == Some(&process.args))
+            .collect::<Vec<_>>();
+        if alive.is_empty() {
+            outcome.stopped = true;
+            continue;
+        }
+        if !still_wanted(index) {
+            continue;
+        }
+        let mut all_killed = true;
+        for process in alive {
+            if control.signal(process.pid, Signal::Kill) {
                 outcome.escalated = true;
+            } else {
+                all_killed = false;
             }
         }
+        outcome.stopped = all_killed;
     }
     outcomes
 }
@@ -421,6 +452,7 @@ mod tests {
                 pid: 200,
                 terminated: true,
                 escalated: true,
+                stopped: true,
             }]
         );
         assert_eq!(
@@ -444,6 +476,22 @@ mod tests {
 
         assert!(outcomes[0].terminated);
         assert!(!outcomes[0].escalated);
+        assert!(outcomes[0].stopped);
+        assert_eq!(*control.signals.lock().unwrap(), vec![(200, Signal::Term)]);
+    }
+
+    #[test]
+    fn spares_a_surviving_target_that_is_no_longer_wanted() {
+        let table = amp_pane_table();
+        let target = find_agent_process(100, "amp", &table).unwrap();
+        let control = FakeControl::new(table);
+
+        let outcomes =
+            terminate_agent_processes_if(&control, &[target], HIBERNATE_TERM_GRACE, &|_| false);
+
+        assert!(outcomes[0].terminated);
+        assert!(!outcomes[0].escalated);
+        assert!(!outcomes[0].stopped, "the agent is still running");
         assert_eq!(*control.signals.lock().unwrap(), vec![(200, Signal::Term)]);
     }
 

@@ -28,7 +28,7 @@ use opensessions_runtime::config::{
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::hibernate::{
     AgentProcessTarget, HIBERNATE_POLL_INTERVAL_MS, HIBERNATE_TERM_GRACE, ProcessControl,
-    ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes,
+    ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes_if,
 };
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
@@ -47,7 +47,7 @@ use opensessions_runtime::shared::resolve_server_key;
 use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarLifecycle};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
-use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
+use opensessions_runtime::tracker::{AgentTracker, HibernationCandidate, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
@@ -1152,18 +1152,37 @@ impl ReadOnlyMuxStateSource {
             return false;
         }
 
-        let outcomes = terminate_agent_processes(
+        // An event or a focus change during the SIGTERM grace period can make
+        // a candidate active again; such agents are neither SIGKILLed nor
+        // marked hibernated.
+        let still_hibernatable = std::cell::OnceCell::new();
+        let still_wanted = |index: usize| {
+            let still = still_hibernatable.get_or_init(|| {
+                let viewed = self.viewed_sessions_and_panes();
+                let tracker = self.agent_tracker.lock().unwrap();
+                self.unviewed_hibernation_candidates(&tracker, &viewed)
+            });
+            planned
+                .iter()
+                .filter(|(_, planned_index)| *planned_index == index)
+                .all(|(candidate, _)| still.contains(candidate))
+        };
+        let outcomes = terminate_agent_processes_if(
             self.process_control.as_ref(),
             &targets,
             HIBERNATE_TERM_GRACE,
+            &still_wanted,
         );
+        let viewed = self.viewed_sessions_and_panes();
         let hibernated_at = (self.now_ms)();
         let mut tracker = self.agent_tracker.lock().unwrap();
+        let still = self.unviewed_hibernation_candidates(&tracker, &viewed);
         let mut changed = false;
         for (candidate, index) in planned {
             let outcome = outcomes[index];
+            let still_quiet = still.contains(&candidate);
             debug_log(format!(
-                "auto-hibernate: session={} pane={} agent={} thread={:?} pid={} terminated={} escalated={}",
+                "auto-hibernate: session={} pane={} agent={} thread={:?} pid={} terminated={} escalated={} stopped={} still_quiet={still_quiet}",
                 candidate.session,
                 candidate.pane_id,
                 candidate.agent,
@@ -1171,12 +1190,31 @@ impl ReadOnlyMuxStateSource {
                 outcome.pid,
                 outcome.terminated,
                 outcome.escalated,
+                outcome.stopped,
             ));
-            if outcome.terminated {
+            if outcome.stopped && still_quiet {
                 changed = tracker.mark_hibernated(&candidate, hibernated_at) || changed;
             }
         }
         changed
+    }
+
+    /// Hibernation candidates as of now, minus every session and pane in
+    /// `viewed` (from [`Self::viewed_sessions_and_panes`]).
+    fn unviewed_hibernation_candidates(
+        &self,
+        tracker: &AgentTracker,
+        (protected_sessions, protected_panes): &(HashSet<String>, HashSet<String>),
+    ) -> Vec<HibernationCandidate> {
+        tracker
+            .find_hibernation_candidates(
+                (self.now_ms)(),
+                self.auto_hibernate.idle_after_ms,
+                protected_sessions,
+            )
+            .into_iter()
+            .filter(|candidate| !protected_panes.contains(&candidate.pane_id))
+            .collect()
     }
 
     /// Sessions and panes the user may be looking at: the focused session,
@@ -5519,6 +5557,8 @@ mod tests {
     struct TermIgnoringProcesses {
         signals: Mutex<Vec<(u32, opensessions_runtime::hibernate::Signal)>>,
         table_reads: AtomicUsize,
+        /// Runs during the SIGTERM grace period.
+        during_grace: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ProcessControl for TermIgnoringProcesses {
@@ -5546,7 +5586,11 @@ mod tests {
             true
         }
 
-        fn sleep(&self, _duration: Duration) {}
+        fn sleep(&self, _duration: Duration) {
+            if let Some(during_grace) = self.during_grace.lock().unwrap().as_ref() {
+                during_grace();
+            }
+        }
     }
 
     const HIBERNATE_TEST_NOW: u64 = 1_000 + 6 * 60 * 60 * 1000 + 1;
@@ -5653,6 +5697,39 @@ mod tests {
                 AgentStatus::Done
             );
         }
+    }
+
+    #[test]
+    fn auto_hibernate_spares_an_agent_that_becomes_active_during_the_grace_period() {
+        use opensessions_runtime::hibernate::Signal;
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings::default());
+        let source = Arc::new(source);
+        let resumed = Arc::downgrade(&source);
+        *processes.during_grace.lock().unwrap() = Some(Box::new(move || {
+            resumed
+                .upgrade()
+                .expect("source")
+                .apply_agent_event(&serde_json::json!({
+                    "agent": "amp",
+                    "tmuxSession": "background",
+                    "threadId": "T-bg",
+                    "status": "running",
+                    "paneId": "%1",
+                    "ts": HIBERNATE_TEST_NOW,
+                }))
+                .expect("apply running event");
+        }));
+
+        assert!(!source.hibernate_idle_agent_panes());
+
+        assert_eq!(
+            *processes.signals.lock().unwrap(),
+            vec![(101, Signal::Term)],
+            "the agent that resumed during the grace period is not killed"
+        );
+        let resumed = agent_status(&source, "background", "T-bg");
+        assert_eq!(resumed.status, AgentStatus::Running);
+        assert_eq!(resumed.pane_id.as_deref(), Some("%1"));
     }
 
     #[test]
