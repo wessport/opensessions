@@ -53,7 +53,7 @@ When an opensessions server exits, every connected sidebar client in that tmux-s
 Expected shutdown behavior:
 
 - quit can be requested by a connected sidebar keypress, websocket command, `/quit`, or process shutdown
-- the server marks the sidebar lifecycle as `closing…`
+- the server marks the sidebar lifecycle as `closing…`, announced from the last built state so shutdown never waits on tmux, Git, or port discovery
 - the server broadcasts `quit` to websocket sidebar clients
 - the server waits briefly for clients to receive the quit frame, then removes hooks and pid file
 - restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
