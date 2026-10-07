@@ -612,7 +612,15 @@ impl AgentTracker {
 
         let active_pane_ids = pane_agents
             .iter()
-            .map(|pane| pane.pane_id.as_str())
+            .map(|pane| pane.pane_id.clone())
+            .collect::<HashSet<_>>();
+        let titled_agent_panes = pane_agents
+            .iter()
+            .filter_map(|pane| {
+                pane.thread_name
+                    .as_ref()
+                    .map(|name| format!("{}\0{name}", pane.agent))
+            })
             .collect::<HashSet<_>>();
         let agents_with_thread_ids = pane_agents
             .iter()
@@ -783,6 +791,25 @@ impl AgentTracker {
                             changed = true;
                         }
                     }
+                    continue;
+                }
+                // An untitled pane must not take a row that a titled pane
+                // names or that is already bound to another live agent pane;
+                // otherwise the row would flip between panes every pass.
+                if pane.thread_name.is_none()
+                    && self
+                        .instances
+                        .get(session)
+                        .and_then(|instances| instances.get(&watcher_entries[0]))
+                        .is_some_and(|event| {
+                            event.thread_name.as_ref().is_some_and(|name| {
+                                titled_agent_panes.contains(&format!("{}\0{name}", event.agent))
+                            }) || (event.liveness == Some(AgentLiveness::Alive)
+                                && event.pane_id.as_deref().is_some_and(|bound| {
+                                    bound != pane.pane_id && active_pane_ids.contains(bound)
+                                }))
+                        })
+                {
                     continue;
                 }
                 if self.stamp_alive(session, &watcher_entries[0], &pane.pane_id) {
@@ -1391,6 +1418,35 @@ mod tests {
             .expect("tracked agent");
         assert_eq!(agent.pane_id.as_deref(), Some("%9"));
         assert_eq!(agent.liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn untitled_agent_pane_does_not_steal_a_title_matched_row() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(event("amp", "work", Some("T-1"), Some("Fix focus")));
+        let pane = |pane_id: &str, thread_name: Option<&str>| PanePresenceInput {
+            agent: "amp".to_string(),
+            pane_id: pane_id.to_string(),
+            active: false,
+            thread_id: None,
+            thread_name: thread_name.map(str::to_string),
+        };
+
+        for panes in [
+            vec![pane("%1", Some("Fix focus")), pane("%2", None)],
+            vec![pane("%2", None), pane("%1", Some("Fix focus"))],
+        ] {
+            tracker.apply_pane_presence("work", panes.clone());
+            assert_eq!(
+                tracker.get_agents("work")[0].pane_id.as_deref(),
+                Some("%1"),
+                "the row stays on the pane whose title names its thread"
+            );
+            assert!(
+                !tracker.apply_pane_presence("work", panes),
+                "an unchanged layout reports no change"
+            );
+        }
     }
 
     #[test]
