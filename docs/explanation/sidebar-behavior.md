@@ -248,6 +248,7 @@ Server backstops are adaptive rather than fixed-rate full snapshots:
 - synchronous state-provider work (tmux commands, Git, `ps`, and `lsof`) runs on Tokio's blocking pool rather than the HTTP/WebSocket event loop
 - port cache refresh is single-flight, so a burst of new sidebar connections cannot turn one empty cache into one `ps`/`lsof` pair per connection
 - the owned tmux socket is checked without spawning commands; when it stops accepting connections, the server exits and skips cleanup commands that cannot succeed against the missing namespace
+- a transiently failed `tmux list-sessions` (tmux could not be spawned or reached) is not an empty session list: it never prunes session metadata, session order, or hidden sessions, and never counts toward deciding the namespace is gone; only tmux reporting its server missing or exiting (`no server running`, `server exited unexpectedly`, a refused or missing socket) means no sessions
 - debug logging is opt-in through `OPENSESSIONS_DEBUG_LOG`
 
 E2E tmux clients also monitor their test parent and use tmux `exit-unattached`, so an interrupted test converges toward stopping its tmux namespace and server instead of leaving a polling environment behind.
