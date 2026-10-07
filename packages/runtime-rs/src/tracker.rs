@@ -158,6 +158,17 @@ impl AgentTracker {
             .unwrap_or_default()
     }
 
+    /// The newest activity timestamp of any row for `agent`/`thread_id`,
+    /// in any session.
+    pub fn newest_thread_activity(&self, agent: &str, thread_id: &str) -> Option<u64> {
+        let key = instance_key(agent, Some(thread_id));
+        self.instances
+            .values()
+            .filter_map(|instances| instances.get(&key))
+            .map(|event| event.ts)
+            .max()
+    }
+
     pub fn rename_session(&mut self, session: &str, new_name: &str) {
         if let Some(mut instances) = self.instances.remove(session) {
             for event in instances.values_mut() {

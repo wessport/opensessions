@@ -2257,13 +2257,20 @@ impl ReadOnlyMuxStateSource {
         // Amp snapshots are stamped with the log's mtime; a row with newer
         // activity came from a live event (such as the Amp plugin) that the
         // log has not caught up with, so the older snapshot must not win.
+        // That row may live in another session (a plugin event resolved by
+        // project dir), where the snapshot would otherwise add a duplicate.
         if snapshot.agent == "amp"
-            && let Some(existing) = existing.as_ref()
-            && existing.ts > snapshot.ts
+            && let Some(thread_id) = snapshot.thread_id.as_deref()
+            && let Some(row_ts) = self
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .newest_thread_activity(snapshot.agent, thread_id)
+            && row_ts > snapshot.ts
         {
             debug_log(format!(
-                "watcher-snapshot older than tracked row session={} agent={} thread_id={:?} snapshot_ts={} row_ts={}",
-                session, snapshot.agent, snapshot.thread_id, snapshot.ts, existing.ts,
+                "watcher-snapshot older than tracked row session={} agent={} thread_id={:?} snapshot_ts={} row_ts={row_ts}",
+                session, snapshot.agent, snapshot.thread_id, snapshot.ts,
             ));
             return false;
         }
@@ -6536,6 +6543,33 @@ mod tests {
         poll.run(&source, current_time_ms());
         poll.run(&source, current_time_ms());
         assert_eq!(reads(), 2, "processes outside agent panes are remembered");
+    }
+
+    #[test]
+    fn older_log_activity_does_not_duplicate_a_thread_tracked_in_another_session() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "working", 60_000);
+        let (source, _) = restarted_source(&home);
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "amp",
+                "tmuxSession": "focused",
+                "threadId": "T-bg",
+                "status": "done",
+                "ts": current_time_ms(),
+            }))
+            .expect("apply plugin event");
+
+        AgentWatcherPoll::default().run(&source, current_time_ms());
+
+        assert!(
+            background_threads(&source).is_empty(),
+            "the pid-routed older snapshot must not add a second T-bg row"
+        );
+        assert_eq!(
+            agent_status(&source, "focused", "T-bg").status,
+            AgentStatus::Done
+        );
     }
 
     #[test]
