@@ -14,6 +14,9 @@ use opensessions_sidebar::client::{
     connect_ws_path_with_token, decode_server_message, encode_client_command, fire_quit_http,
     validate_hello,
 };
+use opensessions_sidebar::debug_log::{
+    DEBUG_LOG_MAX_BYTES, append_bounded, debug_log_path_from_env,
+};
 use opensessions_sidebar::generated::protocol::{ClientCommand, ServerMessage};
 use opensessions_sidebar::input::{UiKey, UiMouse, apply_ui_key, apply_ui_mouse};
 use opensessions_sidebar::renderer::render_app;
@@ -39,34 +42,30 @@ struct PendingSidebarWidthCommand {
     due_at: std::time::Instant,
 }
 
-/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
-/// so live focus/agent-state issues can be diagnosed without extra env setup;
-/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
+/// Append a single debug line when `OPENSESSIONS_DEBUG_LOG` names a path,
+/// matching the server's opt-in logging. The file is size-capped so one
+/// sidebar per tmux window cannot grow it without bound.
 fn debug_log(line: impl AsRef<str>) {
-    use std::io::Write;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .ok()
-        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
-    if path.is_empty() {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| debug_log_path_from_env(|key| std::env::var(key).ok()))
+    else {
         return;
-    }
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(
-            file,
+    append_bounded(
+        path,
+        &format!(
             "[{now}] [sidebar pid={}] {}",
             std::process::id(),
             line.as_ref()
-        );
-    }
+        ),
+        DEBUG_LOG_MAX_BYTES,
+    );
 }
 
 #[tokio::main(flavor = "current_thread")]
