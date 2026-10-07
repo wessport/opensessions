@@ -1391,13 +1391,32 @@ fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     if title == "pi" || title.starts_with("pi ") || title.starts_with('π') || command == "pi" {
         return Some("pi".to_string());
     }
-    let haystack = format!("{title} {command}");
-    for (agent, aliases) in AGENT_ALIASES {
-        if aliases.iter().any(|alias| haystack.contains(alias)) {
-            return Some((*agent).to_string());
+    // Amp titles its pane "<thread> - amp - <dir>"; the thread name may
+    // mention other agents, so the structured form wins.
+    if title.contains(AMP_TITLE_SEPARATOR) {
+        return Some("amp".to_string());
+    }
+    // Whole words only: "sample.rs" or "timestamp" must not read as Amp.
+    // The running command is more reliable than free-form title text.
+    for text in [&command, &title] {
+        let words = agent_words(text);
+        for (agent, aliases) in AGENT_ALIASES {
+            if aliases.iter().any(|alias| words.contains(alias)) {
+                return Some((*agent).to_string());
+            }
         }
     }
     None
+}
+
+const AMP_TITLE_SEPARATOR: &str = " - amp - ";
+
+/// Words of a pane title or command; hyphens and underscores stay inside a
+/// word so names like `amp-local` and `claude-code` are matched whole.
+fn agent_words(text: &str) -> Vec<&str> {
+    text.split(|ch: char| !(ch.is_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 // Keep this broad and process/title based for zero-config agent
@@ -1433,6 +1452,84 @@ fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod agent_pane_tests {
+    use super::*;
+
+    /// Serves one fixed `list-panes` table: `(pane id, command, title)`.
+    struct PaneTableRunner(Vec<(&'static str, &'static str, &'static str)>);
+
+    impl CommandRunner for PaneTableRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            let stdout = if args.first().map(String::as_str) == Some("list-panes") {
+                self.0
+                    .iter()
+                    .map(|(id, command, title)| {
+                        format!(
+                            "{id}\twork\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\t{command}\t{title}\t80\t24\t0\t79"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+
+    fn provider(panes: Vec<(&'static str, &'static str, &'static str)>) -> TmuxProvider {
+        TmuxProvider::new(Arc::new(PaneTableRunner(panes)))
+    }
+
+    #[test]
+    fn agent_panes_are_detected_by_whole_words_not_substrings() {
+        let provider = provider(vec![
+            ("%1", "nvim", "sample.rs"),
+            ("%2", "zsh", "timestamp"),
+            ("%3", "zsh", "campaign - notes"),
+            ("%4", "node", "Fix focus - amp - repo"),
+            ("%5", "amp", "zsh"),
+            ("%6", "node", "✳ Claude Code"),
+            ("%7", "claude", "host.local"),
+            ("%8", "codex", "repo"),
+            ("%9", "amp-local", "repo"),
+            ("%10", "node", "Debug cursor - amp - repo"),
+            ("%11", "zsh", "my-codex-notes"),
+        ]);
+
+        let agents = provider
+            .list_agent_panes("work")
+            .into_iter()
+            .map(|pane| (pane.pane_id, pane.agent, pane.thread_name))
+            .collect::<Vec<_>>();
+
+        let pane = |id: &str, agent: &str, thread: Option<&str>| {
+            (
+                id.to_string(),
+                agent.to_string(),
+                thread.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            agents,
+            vec![
+                pane("%4", "amp", Some("Fix focus")),
+                pane("%5", "amp", None),
+                pane("%6", "claude-code", None),
+                pane("%7", "claude-code", None),
+                pane("%8", "codex", None),
+                pane("%9", "amp", None),
+                pane("%10", "amp", Some("Debug cursor")),
+            ]
+        );
+    }
 }
 
 fn shell_quote(value: &str) -> String {
