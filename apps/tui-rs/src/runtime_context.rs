@@ -86,22 +86,31 @@ where
         "-t",
         &window_id,
         "-F",
-        "#{pane_id}\t#{pane_active}",
+        "#{pane_id}\t#{pane_active}\t#{pane_last}",
     ])?;
     let panes = panes
         .lines()
-        .filter_map(|line| line.trim().split_once('\t'))
+        .filter_map(|line| {
+            let mut fields = line.trim().split('\t');
+            Some((fields.next()?, fields.next()?, fields.next().unwrap_or("0")))
+        })
         .collect::<Vec<_>>();
     if !panes
         .iter()
-        .any(|(candidate, active)| *candidate == pane_id && *active == "1")
+        .any(|(candidate, active, _)| *candidate == pane_id && *active == "1")
     {
         return None;
     }
-    let main_pane = panes
+    // Spawning the sidebar made it active, so tmux's last-active pane is the
+    // one the user was in; fall back to the first other pane.
+    let others = panes
         .iter()
-        .map(|(candidate, _)| *candidate)
-        .find(|candidate| !candidate.is_empty() && *candidate != pane_id)?;
+        .filter(|(candidate, _, _)| !candidate.is_empty() && *candidate != pane_id);
+    let main_pane = others
+        .clone()
+        .find(|(_, _, last)| *last == "1")
+        .or_else(|| others.clone().next())
+        .map(|(candidate, _, _)| *candidate)?;
 
     Some(RefocusPlan {
         select_pane: main_pane.to_string(),
@@ -117,9 +126,15 @@ mod tests {
         let plan = refocus_plan("%1", Some("@2"), |args| {
             assert_eq!(
                 args,
-                ["list-panes", "-t", "@2", "-F", "#{pane_id}\t#{pane_active}"]
+                [
+                    "list-panes",
+                    "-t",
+                    "@2",
+                    "-F",
+                    "#{pane_id}\t#{pane_active}\t#{pane_last}"
+                ]
             );
-            Some("%1\t1\n%2\t0".to_string())
+            Some("%1\t1\t0\n%2\t0\t0".to_string())
         });
 
         assert_eq!(
@@ -135,11 +150,31 @@ mod tests {
         let plan = refocus_plan("%1", Some("@2"), |args| {
             assert_eq!(
                 args,
-                ["list-panes", "-t", "@2", "-F", "#{pane_id}\t#{pane_active}"]
+                [
+                    "list-panes",
+                    "-t",
+                    "@2",
+                    "-F",
+                    "#{pane_id}\t#{pane_active}\t#{pane_last}"
+                ]
             );
-            Some("%1\t0\n%2\t1".to_string())
+            Some("%1\t0\t0\n%2\t1\t1".to_string())
         });
 
         assert_eq!(plan, None);
+    }
+
+    #[test]
+    fn refocus_plan_returns_to_the_pane_the_user_was_in() {
+        let plan = refocus_plan("%9", Some("@2"), |_| {
+            Some("%9\t1\t0\n%1\t0\t0\n%2\t0\t1".to_string())
+        });
+
+        assert_eq!(
+            plan,
+            Some(RefocusPlan {
+                select_pane: "%2".to_string(),
+            })
+        );
     }
 }
