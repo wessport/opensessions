@@ -249,6 +249,7 @@ Server backstops are adaptive rather than fixed-rate full snapshots:
 - agent filesystem scans back off while no agent is active
 - Git and port discovery run independently on a slower adaptive schedule, so routine tmux polling cannot launch Git, `ps`, or `lsof`
 - synchronous state-provider work (tmux commands, Git, `ps`, and `lsof`) runs on Tokio's blocking pool rather than the HTTP/WebSocket event loop
+- every such subprocess is bounded (tmux, `ps`, and `kill` 5s; Git and `lsof` 10s); one that outlives its bound is killed, reaped, and reported as a failed command, so a wedged tmux cannot hold the state operation lock or keep the blocking pool, and therefore shutdown, waiting forever. A timed-out `list-sessions` is a transient failure, not an empty list
 - port cache refresh is single-flight, so a burst of new sidebar connections cannot turn one empty cache into one `ps`/`lsof` pair per connection
 - the owned tmux socket is checked without spawning commands; when it stops accepting connections, the server exits and skips cleanup commands that cannot succeed against the missing namespace
 - a transiently failed `tmux list-sessions` (tmux could not be spawned or reached) is not an empty session list: it never prunes session metadata, session order, or hidden sessions, and never counts toward deciding the namespace is gone; only tmux reporting its server missing or exiting (`no server running`, `server exited unexpectedly`, a refused or missing socket) means no sessions

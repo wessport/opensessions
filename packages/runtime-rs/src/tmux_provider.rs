@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, MuxWindowInfo, SidebarPane,
     SidebarPosition, ViewedPane,
 };
+use crate::subprocess::{TMUX_COMMAND_TIMEOUT, output_with_timeout};
 use crate::tmux_scripting::{
     REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION, SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION,
     hook_context_format, http_hook_command, pane_died_hook_command, pane_exited_hook_command,
@@ -38,15 +40,24 @@ pub trait CommandRunner: Send + Sync {
     fn run(&self, args: &[String]) -> CommandOutput;
 }
 
+/// Runs the mux binary as a subprocess. Each command is bounded by a timeout
+/// (default [`TMUX_COMMAND_TIMEOUT`]); a command that outlives it is killed
+/// and reported as a failure so a wedged tmux cannot hold callers' locks.
 #[derive(Debug, Clone)]
 pub struct StdCommandRunner {
     binary: String,
+    timeout: Duration,
 }
 
 impl StdCommandRunner {
     pub fn new(binary: impl Into<String>) -> Self {
+        Self::with_timeout(binary, TMUX_COMMAND_TIMEOUT)
+    }
+
+    pub fn with_timeout(binary: impl Into<String>, timeout: Duration) -> Self {
         Self {
             binary: binary.into(),
+            timeout,
         }
     }
 }
@@ -59,7 +70,7 @@ impl Default for StdCommandRunner {
 
 impl CommandRunner for StdCommandRunner {
     fn run(&self, args: &[String]) -> CommandOutput {
-        match Command::new(&self.binary).args(args).output() {
+        match output_with_timeout(Command::new(&self.binary).args(args), self.timeout) {
             Ok(output) => CommandOutput {
                 exit_code: output.status.code().unwrap_or(1),
                 stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -2498,6 +2509,66 @@ mod tests {
             );
         }
         assert!(failing("").list_sessions().is_empty());
+    }
+
+    /// A stand-in tmux binary running `script`, removed on drop.
+    struct FakeTmux(std::path::PathBuf);
+
+    impl FakeTmux {
+        fn new(name: &str, script: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let path = std::env::temp_dir().join(format!(
+                "opensessions-fake-tmux-{name}-{}",
+                std::process::id()
+            ));
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self(path)
+        }
+
+        fn client(&self, timeout: Duration) -> TmuxClient {
+            TmuxClient::new(Arc::new(StdCommandRunner::with_timeout(
+                self.0.to_string_lossy(),
+                timeout,
+            )))
+        }
+    }
+
+    impl Drop for FakeTmux {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_hung_tmux_command_fails_within_its_timeout() {
+        let hung = FakeTmux::new("hung", "exec sleep 10");
+        let started = std::time::Instant::now();
+
+        let sessions = hung.client(Duration::from_millis(300)).try_list_sessions();
+
+        assert_eq!(
+            sessions, None,
+            "a timed-out listing is a failure, not empty"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_prompt_tmux_command_is_unaffected_by_the_timeout() {
+        let prompt = FakeTmux::new("prompt", "printf '$1\\twork\\t0\\t1\\t2\\t/tmp\\n'");
+
+        let sessions = prompt
+            .client(Duration::from_secs(5))
+            .try_list_sessions()
+            .expect("listing succeeds");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "work");
     }
 
     #[test]

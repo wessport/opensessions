@@ -46,6 +46,7 @@ use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::shared::resolve_server_key;
 use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarLifecycle};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
+use opensessions_runtime::subprocess::{PROCESS_PROBE_TIMEOUT, output_with_timeout};
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, HibernationCandidate, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
@@ -450,6 +451,11 @@ pub trait GitCommandRunner: Send + Sync + 'static {
     fn git_info_output(&self, dir: &str) -> String;
 }
 
+/// `lsof` can take a second or more on hosts with many open files.
+const LSOF_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// `git status` in a large worktree can be slow; still bound it.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Default)]
 struct SystemPortCommandRunner;
 
@@ -458,10 +464,10 @@ struct SystemGitCommandRunner;
 
 impl PortCommandRunner for SystemPortCommandRunner {
     fn process_rows(&self) -> Vec<(u32, u32)> {
-        let Ok(output) = process::Command::new("ps")
-            .args(["-eo", "pid=,ppid="])
-            .output()
-        else {
+        let Ok(output) = output_with_timeout(
+            process::Command::new("ps").args(["-eo", "pid=,ppid="]),
+            PROCESS_PROBE_TIMEOUT,
+        ) else {
             return Vec::new();
         };
         String::from_utf8_lossy(&output.stdout)
@@ -471,10 +477,10 @@ impl PortCommandRunner for SystemPortCommandRunner {
     }
 
     fn lsof_fields(&self) -> String {
-        let Ok(output) = process::Command::new("lsof")
-            .args(["-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pn"])
-            .output()
-        else {
+        let Ok(output) = output_with_timeout(
+            process::Command::new("lsof").args(["-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pn"]),
+            LSOF_COMMAND_TIMEOUT,
+        ) else {
             return String::new();
         };
         if !output.status.success() {
@@ -490,30 +496,36 @@ impl GitCommandRunner for SystemGitCommandRunner {
             return String::new();
         }
 
-        let Ok(rev_parse) = process::Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "--abbrev-ref", "HEAD", "--git-dir"])
-            .output()
-        else {
+        let Ok(rev_parse) = output_with_timeout(
+            process::Command::new("git").current_dir(dir).args([
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+                "--git-dir",
+            ]),
+            GIT_COMMAND_TIMEOUT,
+        ) else {
             return String::new();
         };
         if !rev_parse.status.success() {
             return String::new();
         }
 
-        let Ok(status) = process::Command::new("git")
-            .current_dir(dir)
-            .args(["status", "--porcelain"])
-            .output()
-        else {
+        let Ok(status) = output_with_timeout(
+            process::Command::new("git")
+                .current_dir(dir)
+                .args(["status", "--porcelain"]),
+            GIT_COMMAND_TIMEOUT,
+        ) else {
             return String::new();
         };
 
-        let Ok(numstat) = process::Command::new("git")
-            .current_dir(dir)
-            .args(["diff", "--numstat", "HEAD", "--"])
-            .output()
-        else {
+        let Ok(numstat) = output_with_timeout(
+            process::Command::new("git")
+                .current_dir(dir)
+                .args(["diff", "--numstat", "HEAD", "--"]),
+            GIT_COMMAND_TIMEOUT,
+        ) else {
             return String::new();
         };
 
@@ -3929,40 +3941,7 @@ fn run_process_with_timeout(
     mut command: process::Command,
     timeout: Duration,
 ) -> Option<process::Output> {
-    let mut child = command
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let mut stderr = child.stderr.take()?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let started = Instant::now();
-
-    loop {
-        if let Some(status) = child.try_wait().ok()? {
-            return Some(process::Output {
-                status,
-                stdout: stdout_reader.join().ok()?.ok()?,
-                stderr: stderr_reader.join().ok()?.ok()?,
-            });
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    output_with_timeout(&mut command, timeout).ok()
 }
 
 fn collect_jsonl_files(dir: &Path) -> Vec<PathBuf> {
