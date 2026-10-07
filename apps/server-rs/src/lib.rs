@@ -3787,6 +3787,9 @@ struct HttpContext {
 
 fn parse_context(body: &str) -> Option<HttpContext> {
     let trimmed = trim_context_quotes(body);
+    if let Some(context) = parse_pipe_context(trimmed) {
+        return Some(context);
+    }
     let pipe_parts = trimmed.split('|').collect::<Vec<_>>();
     if pipe_parts.len() == 5 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
         return Some(HttpContext {
@@ -3829,6 +3832,47 @@ fn parse_context(body: &str) -> Option<HttpContext> {
         pane_id: None,
         pane_active: None,
     })
+}
+
+/// Parses `client_tty|session|window_id[|pane_id[|pane_active]]`.
+///
+/// tmux allows `|` in session names, so the separator count cannot pick the
+/// format. Every other field is structured: the tty is a path before the
+/// first `|`, and the trailing fields are tmux ids (`@N`, `%N`) and a 0/1
+/// flag, so they are taken from the end and the session is what remains.
+fn parse_pipe_context(trimmed: &str) -> Option<HttpContext> {
+    let (client_tty, rest) = trimmed.split_once('|')?;
+    let client_tty = (!client_tty.is_empty()).then(|| client_tty.to_string());
+    let is_window = |value: &str| value.len() > 1 && value.starts_with('@');
+    let is_pane = |value: &str| value.len() > 1 && value.starts_with('%');
+    let context = |session: &str, window_id: &str, pane_id: Option<&str>, active: Option<&str>| {
+        (!session.is_empty()).then(|| HttpContext {
+            client_tty: client_tty.clone(),
+            session: session.to_string(),
+            window_id: window_id.to_string(),
+            pane_id: pane_id.map(str::to_string),
+            pane_active: active.map(|active| active == "1"),
+        })
+    };
+    if let [active, pane_id, window_id, session] = rest.rsplitn(4, '|').collect::<Vec<_>>()[..]
+        && matches!(active, "0" | "1")
+        && is_pane(pane_id)
+        && is_window(window_id)
+    {
+        return context(session, window_id, Some(pane_id), Some(active));
+    }
+    if let [pane_id, window_id, session] = rest.rsplitn(3, '|').collect::<Vec<_>>()[..]
+        && is_pane(pane_id)
+        && is_window(window_id)
+    {
+        return context(session, window_id, Some(pane_id), None);
+    }
+    if let [window_id, session] = rest.rsplitn(2, '|').collect::<Vec<_>>()[..]
+        && is_window(window_id)
+    {
+        return context(session, window_id, None, None);
+    }
+    None
 }
 
 fn parse_context_session(body: &str) -> Option<String> {
@@ -7737,5 +7781,32 @@ mod tests {
         assert_eq!(info.branch, "fix---races");
         assert_eq!(info.changed_files, 1);
         assert_eq!((info.insertions, info.deletions), (1, 0));
+    }
+
+    #[test]
+    fn hook_context_accepts_session_names_containing_pipes() {
+        for (body, session, pane_id, active) in [
+            ("/dev/ttys001|a|b|@3|%7|1", "a|b", Some("%7"), Some(true)),
+            ("|x|0|@3|%7|0", "x|0", Some("%7"), Some(false)),
+            ("/dev/ttys001|a|@b|@3|%7", "a|@b", Some("%7"), None),
+            ("|pipe|end|@3", "pipe|end", None, None),
+            ("/dev/ttys001|main|@3|%1|1", "main", Some("%1"), Some(true)),
+        ] {
+            let context = parse_context(body).expect(body);
+            assert_eq!(context.session, session, "{body}");
+            assert_eq!(context.window_id, "@3", "{body}");
+            assert_eq!(context.pane_id.as_deref(), pane_id, "{body}");
+            assert_eq!(context.pane_active, active, "{body}");
+        }
+
+        let provider = SidebarVisibilityTestProvider::with_preference(Some(true));
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+        source.setup_mux_hooks("127.0.0.1", 0, "");
+        provider.panes.lock().unwrap().clear();
+        source.handle_http_hook("/ensure-sidebar", "/dev/ttys001|a|b|@7|%1|1");
+        assert_eq!(
+            provider.spawned_windows().last().map(String::as_str),
+            Some("@7")
+        );
     }
 }
