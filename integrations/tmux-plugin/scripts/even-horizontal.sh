@@ -34,6 +34,30 @@ pane_session() {
   tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null || true
 }
 
+# tmux 3.4 takes a rejoined full-height sidebar's width unevenly from its
+# neighbors (for example 83/85 instead of 84/84), so set the content widths
+# explicitly. Each resize moves the boundary to the pane's right, so panes are
+# sized left to right and the last one keeps the remainder.
+even_content_panes() {
+  window_id="$1"
+  sidebar_pane_id="$2"
+  content="$(tmux list-panes -t "$window_id" -F "#{pane_left} #{pane_id} #{pane_width}" 2>/dev/null |
+    sort -n | awk -v sidebar="$sidebar_pane_id" '$2 != sidebar { print $2, $3 }')"
+  count="$(printf '%s\n' "$content" | grep -c .)"
+  [ "$count" -ge 2 ] || return 0
+  total="$(printf '%s\n' "$content" | awk '{ sum += $2 } END { print sum }')"
+  base=$((total / count))
+  extra=$((total % count))
+  index=0
+  printf '%s\n' "$content" | while read -r pane_id _width; do
+    index=$((index + 1))
+    [ "$index" -lt "$count" ] || break
+    width="$base"
+    [ "$index" -gt "$extra" ] || width=$((base + 1))
+    tmux resize-pane -t "$pane_id" -x "$width" >/dev/null 2>&1 || true
+  done
+}
+
 # Put a stashed sidebar back into the window. If the full-height join at its
 # edge fails, retry a plain join next to the edge pane; as a last resort kill
 # the stashed pane and ask the server for a fresh sidebar so it is never
@@ -108,6 +132,7 @@ fi
 # From here on the sidebar must always be restored, even if the layout fails.
 tmux select-layout -t "$WINDOW_ID" even-horizontal >/dev/null 2>&1 || true
 if unstash_sidebar_pane; then
+  even_content_panes "$WINDOW_ID" "$SIDEBAR_PANE_ID"
   restore_focus "$CURRENT_PANE_ID" "$SIDEBAR_PANE_ID" "$SIDEBAR_ACTIVE"
 else
   restore_focus "$CURRENT_PANE_ID" "" "0"
