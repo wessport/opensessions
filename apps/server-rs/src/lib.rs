@@ -4226,7 +4226,27 @@ async fn run_accept_loop(
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) if accept_error_action(&error) == AcceptErrorAction::Retry => {
+                        // Out of descriptors or an aborted handshake: the
+                        // listener is fine, so back off instead of exiting.
+                        debug_log(format!("accept failed transiently: {error}; retrying"));
+                        tokio::time::sleep(ACCEPT_RETRY_BACKOFF).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        debug_log(format!("accept failed fatally: {error}; shutting down"));
+                        request_shutdown(
+                            &state_source,
+                            &state_updates,
+                            &shutdown,
+                            &shutdown_announcement,
+                        );
+                        tokio::time::sleep(Duration::from_millis(SERVER_SHUTDOWN_DRAIN_MS)).await;
+                        return Err(error.into());
+                    }
+                };
                 let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
                     continue;
                 };
@@ -4260,6 +4280,62 @@ async fn run_accept_loop(
             }
 
         }
+    }
+}
+
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    Retry,
+    Fatal,
+}
+
+/// `accept` errno values that describe one connection or temporary resource
+/// exhaustion rather than a broken listener (see accept(2)).
+#[cfg(target_os = "linux")]
+const TRANSIENT_ACCEPT_ERRNOS: &[i32] = &[
+    1,   // EPERM: firewall rules forbid the connection
+    12,  // ENOMEM
+    23,  // ENFILE
+    24,  // EMFILE
+    71,  // EPROTO
+    100, // ENETDOWN
+    101, // ENETUNREACH
+    105, // ENOBUFS
+    113, // EHOSTUNREACH
+];
+#[cfg(not(target_os = "linux"))]
+const TRANSIENT_ACCEPT_ERRNOS: &[i32] = &[
+    12,  // ENOMEM
+    23,  // ENFILE
+    24,  // EMFILE
+    50,  // ENETDOWN
+    51,  // ENETUNREACH
+    55,  // ENOBUFS
+    65,  // EHOSTUNREACH
+    100, // EPROTO
+];
+
+fn accept_error_action(error: &std::io::Error) -> AcceptErrorAction {
+    use std::io::ErrorKind;
+    let transient_kind = matches!(
+        error.kind(),
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::OutOfMemory
+    );
+    let transient_errno = error
+        .raw_os_error()
+        .is_some_and(|errno| TRANSIENT_ACCEPT_ERRNOS.contains(&errno));
+    if transient_kind || transient_errno {
+        AcceptErrorAction::Retry
+    } else {
+        AcceptErrorAction::Fatal
     }
 }
 
@@ -7599,5 +7675,32 @@ mod tests {
             successor_kept,
             "old generation removed the successor identity"
         );
+    }
+
+    #[test]
+    fn accept_retries_resource_exhaustion_and_aborted_connections() {
+        use std::io::{Error, ErrorKind};
+        for retry in [
+            Error::from_raw_os_error(24), // EMFILE
+            Error::from_raw_os_error(23), // ENFILE
+            Error::from(ErrorKind::ConnectionAborted),
+            Error::from(ErrorKind::Interrupted),
+        ] {
+            assert_eq!(
+                accept_error_action(&retry),
+                AcceptErrorAction::Retry,
+                "{retry}"
+            );
+        }
+        for fatal in [
+            Error::from_raw_os_error(9),  // EBADF
+            Error::from_raw_os_error(22), // EINVAL
+        ] {
+            assert_eq!(
+                accept_error_action(&fatal),
+                AcceptErrorAction::Fatal,
+                "{fatal}"
+            );
+        }
     }
 }
