@@ -254,6 +254,8 @@ impl AgentTracker {
         for key in removed_keys {
             self.unseen_instances
                 .remove(&self.unseen_key(session, &key));
+            self.seeded_instances
+                .remove(&self.unseen_key(session, &key));
         }
         if should_remove_session {
             self.instances.remove(session);
@@ -288,6 +290,8 @@ impl AgentTracker {
 
             if removed {
                 self.unseen_instances
+                    .remove(&self.unseen_key(&other_session, &key));
+                self.seeded_instances
                     .remove(&self.unseen_key(&other_session, &key));
                 if empty {
                     self.instances.remove(&other_session);
@@ -340,6 +344,7 @@ impl AgentTracker {
 
         for key in unseen_to_remove {
             self.unseen_instances.remove(&key);
+            self.seeded_instances.remove(&key);
         }
         changed
     }
@@ -364,6 +369,7 @@ impl AgentTracker {
                     .collect::<Vec<_>>();
                 for key in keys {
                     session_instances.remove(&key);
+                    self.seeded_instances.remove(&format!("{session}\0{key}"));
                 }
                 empty = session_instances.is_empty();
             }
@@ -421,7 +427,9 @@ impl AgentTracker {
     }
 
     /// Records that the candidate's agent process was stopped. The row stays
-    /// visible (restorable) with no pane and exited liveness.
+    /// visible (restorable) with no pane and exited liveness. A hibernated
+    /// seed keeps its seed mark so newer activity on its own thread can
+    /// still release it; other threads' events never supersede it.
     pub fn mark_hibernated(&mut self, candidate: &HibernationCandidate, ts: u64) -> bool {
         let Some(session_instances) = self.instances.get_mut(&candidate.session) else {
             return false;
@@ -1010,7 +1018,9 @@ impl AgentTracker {
     }
 
     /// A live event is authoritative over seeds for the same agent in its
-    /// session, except seeds bound to a different, known pane.
+    /// session, except seeds bound to a different, known pane and hibernated
+    /// seeds, which stay visible until their own thread resumes (or newer
+    /// activity on that thread releases them).
     fn supersede_seeds(&mut self, event: &AgentEvent, key: &str) {
         self.seeded_instances
             .remove(&self.unseen_key(&event.session, key));
@@ -1022,6 +1032,7 @@ impl AgentTracker {
             .filter(|(seed_key, seed)| {
                 *seed_key != key
                     && seed.agent == event.agent
+                    && seed.status != AgentStatus::Hibernated
                     && self.is_seeded(&event.session, seed_key)
                     && !matches!(
                         (event.pane_id.as_deref(), seed.pane_id.as_deref()),
@@ -2088,6 +2099,28 @@ mod tests {
         let agents = tracker.get_agents("work");
         assert_eq!(agents[0].pane_id.as_deref(), Some("%1"));
         assert_eq!(agents[0].liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn hibernated_seeds_stay_visible_when_another_thread_reports() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_seed_event(seed("T-old", 1_000, Some("%1")));
+        let candidate = tracker
+            .find_hibernation_candidates(1_000 + IDLE_AFTER_MS + 1, IDLE_AFTER_MS, &HashSet::new())
+            .pop()
+            .expect("seeded candidate");
+        assert!(tracker.mark_hibernated(&candidate, now_ms()));
+
+        let mut other = event("amp", "work", Some("T-new"), None);
+        other.ts = now_ms();
+        tracker.apply_event(other);
+
+        let old = tracker
+            .get_agents("work")
+            .into_iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("T-old"))
+            .expect("hibernated row stays until resumed");
+        assert_eq!(old.status, AgentStatus::Hibernated);
     }
 
     #[test]
