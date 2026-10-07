@@ -83,14 +83,11 @@ pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
     fn process_table(&self) -> Vec<ProcessEntry> {
-        output_with_timeout(
-            Command::new("ps").args(["-axo", "pid=,ppid=,args="]),
-            PROCESS_PROBE_TIMEOUT,
-        )
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| parse_process_table(&String::from_utf8_lossy(&output.stdout)))
-        .unwrap_or_default()
+        output_with_timeout(&mut process_table_command(), PROCESS_PROBE_TIMEOUT)
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| parse_process_table(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_default()
     }
 
     fn signal(&self, pid: u32, signal: Signal) -> bool {
@@ -103,6 +100,17 @@ impl ProcessControl for SystemProcessControl {
         )
         .is_ok_and(|output| output.status.success())
     }
+}
+
+/// Every process with its full command line, on both BSD/macOS `ps` and
+/// procps-ng. `-A` selects all processes, with or without a terminal, in both.
+/// `-ww` disables width truncation: macOS never truncates when stdout is not
+/// a terminal, but procps-ng still truncates `args` to `$COLUMNS` when that
+/// is set, which would hide the agent name in long command lines.
+fn process_table_command() -> Command {
+    let mut command = Command::new("ps");
+    command.args(["-A", "-ww", "-o", "pid=,ppid=,args="]);
+    command
 }
 
 pub fn parse_process_table(raw: &str) -> Vec<ProcessEntry> {
@@ -325,6 +333,43 @@ mod tests {
             entry(202, 200, "node /work/node_modules/.bin/vite"),
             entry(300, 1, "/Users/me/.amp/bin/amp"),
         ]
+    }
+
+    #[test]
+    fn long_command_lines_parse_intact() {
+        let args = format!("/opt/bin/amp threads continue {}", "x ".repeat(2048));
+        let table = parse_process_table(&format!("  4242   100 {args}\n"));
+
+        assert_eq!(table, vec![entry(4242, 100, args.trim())]);
+    }
+
+    #[test]
+    fn process_table_lists_full_command_lines_regardless_of_columns() {
+        // procps-ng truncates `args` to $COLUMNS even when stdout is not a
+        // terminal; a narrow inherited COLUMNS must not hide agent names.
+        let marker = format!("opensessions-long-arg-{}", "A".repeat(600));
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30; :", &marker])
+            .spawn()
+            .unwrap();
+
+        let output = output_with_timeout(
+            process_table_command().env("COLUMNS", "80"),
+            PROCESS_PROBE_TIMEOUT,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let table = parse_process_table(&String::from_utf8_lossy(&output.unwrap().stdout));
+        let row = table
+            .iter()
+            .find(|row| row.pid == child.id())
+            .expect("a tty-less child is listed");
+        assert!(
+            row.args.ends_with(&marker),
+            "truncated: {} chars",
+            row.args.len()
+        );
     }
 
     #[test]
