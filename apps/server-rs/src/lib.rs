@@ -4331,13 +4331,30 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         Arc::clone(&latest_state),
     ));
     let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
-    if let Some(source) = config.state_source.clone() {
-        *latest_state.write().unwrap() = Some(source.snapshot_json());
-        let _background_tasks = source
-            .clone()
-            .start_background_tasks(state_updates.clone(), shutdown.clone());
-        source.setup_mux_hooks(&config.host, addr.port(), &token_file.to_string_lossy());
-    }
+    let state_operation_lock = Arc::new(AsyncMutex::new(()));
+    let startup_ready = Arc::new(AtomicBool::new(config.state_source.is_none()));
+    // Serve from here on: hook setup and the first snapshot (Git per session,
+    // system-wide ps and lsof) run on the blocking pool. The startup task
+    // holds the state operation lock from before the first accept, so every
+    // state request queues behind it exactly as it used to queue in the
+    // listen backlog.
+    let startup_task = config.state_source.clone().map(|source| {
+        let startup_guard = Arc::clone(&state_operation_lock)
+            .try_lock_owned()
+            .expect("a new state operation lock is uncontended");
+        tokio::spawn(initialize_state_source(StartupContext {
+            source,
+            startup_guard,
+            host: config.host.clone(),
+            port: addr.port(),
+            token_file: token_file.to_string_lossy().into_owned(),
+            startup_ready: Arc::clone(&startup_ready),
+            latest_state: Arc::clone(&latest_state),
+            state_updates: state_updates.clone(),
+            shutdown: shutdown.clone(),
+            shutdown_announcement: Arc::clone(&shutdown_announcement),
+        }))
+    });
     let task_shutdown = shutdown.clone();
     let state_source = config.state_source.clone();
     let cleanup_state_source = state_source.clone();
@@ -4353,8 +4370,14 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             loop_shutdown_announcement,
             token.clone(),
             server_identity,
+            state_operation_lock,
+            startup_ready,
         )
         .await;
+        // Never remove hooks while startup may still be installing them.
+        if let Some(startup_task) = startup_task {
+            let _ = startup_task.await;
+        }
         identity_task.abort();
         let _ = identity_task.await;
         state_cache_task.abort();
@@ -4383,6 +4406,64 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     })
 }
 
+struct StartupContext {
+    source: Arc<dyn StateSource>,
+    startup_guard: tokio::sync::OwnedMutexGuard<()>,
+    host: String,
+    port: u16,
+    token_file: String,
+    startup_ready: Arc<AtomicBool>,
+    latest_state: Arc<RwLock<Option<String>>>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+    shutdown_announcement: Arc<ShutdownAnnouncement>,
+}
+
+/// Installs mux hooks (restoring recorded sidebars), then builds and publishes
+/// the one initial snapshot, then starts the background loops, all while the
+/// accept loop is already serving liveness and ingestion.
+///
+/// The state operation lock is held throughout, so requests that need state
+/// run after the initial snapshot and their newer payloads are published after
+/// it. Background loops, which publish snapshots without that lock, start only
+/// once the initial snapshot is published, so it can never overwrite them.
+async fn initialize_state_source(context: StartupContext) {
+    let StartupContext {
+        source,
+        startup_guard,
+        host,
+        port,
+        token_file,
+        startup_ready,
+        latest_state,
+        state_updates,
+        shutdown,
+        shutdown_announcement,
+    } = context;
+    let hook_source = Arc::clone(&source);
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || hook_source.setup_mux_hooks(&host, port, &token_file))
+            .await
+    {
+        debug_log(format!("startup: mux hook setup failed: {error}"));
+    }
+    startup_ready.store(true, Ordering::Release);
+    if shutdown_announcement.is_announced() {
+        return;
+    }
+    let snapshot_source = Arc::clone(&source);
+    match tokio::task::spawn_blocking(move || snapshot_source.snapshot_json()).await {
+        Ok(snapshot) if !shutdown_announcement.is_announced() => {
+            *latest_state.write().unwrap() = Some(snapshot.clone());
+            let _ = state_updates.send(snapshot);
+        }
+        Ok(_) => return,
+        Err(error) => debug_log(format!("startup: initial snapshot failed: {error}")),
+    }
+    drop(startup_guard);
+    let _background_tasks = source.start_background_tasks(state_updates, shutdown);
+}
+
 async fn run_accept_loop(
     listener: TcpListener,
     shutdown: broadcast::Sender<()>,
@@ -4393,12 +4474,13 @@ async fn run_accept_loop(
     shutdown_announcement: Arc<ShutdownAnnouncement>,
     auth_token: String,
     server_identity: Option<String>,
+    state_operation_lock: Arc<AsyncMutex<()>>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), ServerError> {
     let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let websocket_limit = Arc::new(Semaphore::new(
         MAX_CONCURRENT_CONNECTIONS - RESERVED_HTTP_CONNECTIONS,
     ));
-    let state_operation_lock = Arc::new(AsyncMutex::new(()));
     let ingestion_lock = Arc::new(AsyncMutex::new(()));
     let (state_refreshes, refresh_requests) = mpsc::channel(1);
     tokio::spawn(run_coalesced_state_refreshes(
@@ -4451,6 +4533,7 @@ async fn run_accept_loop(
                 let connection_state_refreshes = state_refreshes.clone();
                 let connection_server_identity = server_identity.clone();
                 let connection_websocket_limit = Arc::clone(&websocket_limit);
+                let connection_startup_ready = Arc::clone(&startup_ready);
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let _ = handle_connection(
@@ -4466,6 +4549,7 @@ async fn run_accept_loop(
                         connection_state_refreshes,
                         connection_server_identity,
                         connection_websocket_limit,
+                        connection_startup_ready,
                     )
                     .await;
                 });
@@ -4643,6 +4727,7 @@ async fn handle_connection(
     state_refreshes: mpsc::Sender<()>,
     server_identity: Option<String>,
     websocket_limit: Arc<Semaphore>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), ServerError> {
     let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
         .await
@@ -4935,23 +5020,40 @@ async fn handle_connection(
         let _websocket_permit = websocket_permit;
         debug_log("ws: client connected, sending hello + initial state");
         websocket.send(Message::text(HELLO_JSON)).await?;
+        // Subscribe before reading the cached state: startup stores its
+        // snapshot before broadcasting it, so a client that finds no cached
+        // state is guaranteed to receive that broadcast.
+        let mut connection_shutdown = shutdown.subscribe();
+        let mut state_rx = state_updates.subscribe();
         let initial_state = latest_state.read().unwrap().clone();
-        let initial_state = if initial_state.is_some() {
-            initial_state
-        } else {
-            run_state_source_blocking(
-                &state_source,
-                &state_operation_lock,
-                StateSource::snapshot_json,
-            )
-            .await?
+        let initial_state = match initial_state {
+            Some(state) => Some(state),
+            // Early clients share the single startup snapshot instead of each
+            // building their own while it is still in flight.
+            None if state_source.is_some() => loop {
+                tokio::select! {
+                    _ = connection_shutdown.recv() => {
+                        let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                        return Ok(());
+                    }
+                    update = state_rx.recv() => match update {
+                        Ok(update) if update == QUIT_JSON => {
+                            let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                            return Ok(());
+                        }
+                        Ok(update) if is_immediate_server_message(&update) => {}
+                        Ok(update) => break Some(update),
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    },
+                }
+            },
+            None => None,
         };
         if let Some(initial_state) = initial_state {
             websocket.send(Message::text(initial_state)).await?;
         }
 
-        let mut connection_shutdown = shutdown.subscribe();
-        let mut state_rx = state_updates.subscribe();
         let mut client_context = ClientConnectionContext::default();
         let mut pending_state: Option<String> = None;
         let mut state_flush =
@@ -5112,7 +5214,16 @@ async fn handle_connection(
         }
     }
 
-    if parsed.method == "GET" && parsed.path == "/" {
+    if parsed.method == "GET" && parsed.path == "/" && !startup_ready.load(Ordering::Acquire) {
+        // Launchers treat a live server as one whose hooks are installed and
+        // whose recorded sidebars are restored; answer, but not as live yet.
+        write_http_response(
+            &mut stream,
+            "503 Service Unavailable",
+            "opensessions server initializing",
+        )
+        .await?;
+    } else if parsed.method == "GET" && parsed.path == "/" {
         let body = server_identity
             .map(|identity| format!("opensessions server {identity}"))
             .unwrap_or_else(|| "opensessions server".to_string());
@@ -7230,6 +7341,310 @@ mod tests {
         );
     }
 
+    /// A test server's identity files, removed (with the identity lock) on drop.
+    struct TestServerFiles {
+        pid_file: PathBuf,
+        token_file: PathBuf,
+    }
+
+    impl TestServerFiles {
+        fn paths(&self) -> (PathBuf, PathBuf) {
+            (self.pid_file.clone(), self.token_file.clone())
+        }
+    }
+
+    impl Drop for TestServerFiles {
+        fn drop(&mut self) {
+            for path in [
+                self.pid_file.with_extension("identity.lock"),
+                self.pid_file.clone(),
+                self.token_file.clone(),
+            ] {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    fn startup_test_paths(label: &str) -> TestServerFiles {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("opensessions-{label}-{}-{id}", process::id()));
+        TestServerFiles {
+            pid_file: root.with_extension("pid"),
+            token_file: root.with_extension("token"),
+        }
+    }
+
+    async fn connect_test_websocket(
+        addr: SocketAddr,
+        token: &str,
+    ) -> tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>> {
+        let uri = format!("ws://{addr}").parse().expect("ws uri");
+        let (websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("authorization"),
+            )
+            .expect("add authorization header")
+            .connect()
+            .await
+            .expect("connect websocket");
+        websocket
+    }
+
+    async fn next_text<S>(websocket: &mut S) -> String
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_websockets::Error>> + Unpin,
+    {
+        let message = tokio::time::timeout(Duration::from_secs(5), websocket.next())
+            .await
+            .expect("websocket frame in time")
+            .expect("websocket open")
+            .expect("websocket frame");
+        message.as_text().expect("text frame").to_string()
+    }
+
+    #[tokio::test]
+    async fn liveness_answers_while_the_initial_snapshot_is_slow() {
+        let files = startup_test_paths("slow-initial-snapshot");
+        let (pid_file, token_file) = files.paths();
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(SlowSnapshotSource {
+                    snapshot_count: Arc::clone(&snapshot_count),
+                    delay: Duration::from_millis(2_000),
+                }),
+        )
+        .await
+        .expect("start server");
+        // Hook setup is instant here; only the snapshot is slow.
+        let liveness = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let response = http_exchange(
+                    server.addr(),
+                    "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                )
+                .await;
+                if !response.starts_with(b"HTTP/1.1 503") {
+                    return response;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let answered_after = started.elapsed();
+        server.shutdown().await.expect("stop server");
+
+        let liveness = liveness.expect("liveness must not wait for the initial snapshot");
+        assert!(
+            liveness.starts_with(b"HTTP/1.1 200 OK"),
+            "unexpected liveness response: {}",
+            String::from_utf8_lossy(&liveness)
+        );
+        assert!(
+            answered_after < Duration::from_millis(500),
+            "liveness answered after {answered_after:?}"
+        );
+    }
+
+    /// Hook setup blocks until released, like tmux installing hooks and
+    /// restoring sidebars on a loaded machine.
+    #[derive(Clone)]
+    struct GatedHookSource {
+        hooks_release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        hooks_installed: Arc<AtomicBool>,
+    }
+
+    impl StateSource for GatedHookSource {
+        fn snapshot_json(&self) -> String {
+            "{}".to_string()
+        }
+
+        fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {
+            let (released, wake) = self.hooks_release.as_ref();
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.hooks_installed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_reports_initializing_until_hooks_are_installed() {
+        let files = startup_test_paths("hook-gate");
+        let (pid_file, token_file) = files.paths();
+        let hooks_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hooks_installed = Arc::new(AtomicBool::new(false));
+        // Safety net so a server that installs hooks on the runtime thread
+        // fails this test instead of hanging it.
+        let fallback_release = Arc::clone(&hooks_release);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            let (released, wake) = fallback_release.as_ref();
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        });
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(GatedHookSource {
+                    hooks_release: Arc::clone(&hooks_release),
+                    hooks_installed: Arc::clone(&hooks_installed),
+                }),
+        )
+        .await
+        .expect("start server");
+        let liveness = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string();
+        let initializing = tokio::time::timeout(
+            Duration::from_millis(500),
+            http_exchange(server.addr(), liveness.clone()),
+        )
+        .await
+        .expect("liveness answers during hook setup");
+
+        let (released, wake) = hooks_release.as_ref();
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = http_exchange(server.addr(), liveness.clone()).await;
+                if response.starts_with(b"HTTP/1.1 200 OK") {
+                    return hooks_installed.load(Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        server.shutdown().await.expect("stop server");
+
+        // Launchers treat a live server as one whose hooks and restored
+        // sidebars are in place, so it must not claim liveness earlier.
+        assert!(
+            initializing.starts_with(b"HTTP/1.1 503 Service Unavailable"),
+            "unexpected response during hook setup: {}",
+            String::from_utf8_lossy(&initializing)
+        );
+        assert!(!initializing.ends_with(b"opensessions server"));
+        assert_eq!(ready, Ok(true), "liveness becomes ready only after hooks");
+    }
+
+    #[tokio::test]
+    async fn early_sidebar_connections_share_one_initial_snapshot() {
+        let files = startup_test_paths("early-sidebars");
+        let (pid_file, token_file) = files.paths();
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(SlowSnapshotSource {
+                    snapshot_count: Arc::clone(&snapshot_count),
+                    delay: Duration::from_millis(400),
+                }),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+        let sidebars = (0..8)
+            .map(|_| {
+                let token = token.clone();
+                tokio::spawn(async move {
+                    let mut websocket = connect_test_websocket(addr, &token).await;
+                    let hello = next_text(&mut websocket).await;
+                    let state = next_text(&mut websocket).await;
+                    (hello, state)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut received = Vec::new();
+        for sidebar in sidebars {
+            received.push(sidebar.await.expect("sidebar task"));
+        }
+        server.shutdown().await.expect("stop server");
+
+        for (hello, state) in received {
+            assert_eq!(hello, HELLO_JSON);
+            assert_eq!(state, "{}");
+        }
+        assert_eq!(snapshot_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// The initial snapshot is slow and marked `initial`; a metadata update
+    /// produces a newer, marked state.
+    #[derive(Clone)]
+    struct InitialThenNewerSource {
+        snapshot_started: Arc<AtomicBool>,
+    }
+
+    impl StateSource for InitialThenNewerSource {
+        fn snapshot_json(&self) -> String {
+            self.snapshot_started.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            r#"{"type":"state","marker":"initial"}"#.to_string()
+        }
+
+        fn handle_http_json(&self, _path: &str, _body: &Value) -> Option<String> {
+            Some(r#"{"type":"state","marker":"newer"}"#.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_initial_snapshot_never_overwrites_newer_state() {
+        let files = startup_test_paths("initial-overwrite");
+        let (pid_file, token_file) = files.paths();
+        let snapshot_started = Arc::new(AtomicBool::new(false));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(InitialThenNewerSource {
+                    snapshot_started: Arc::clone(&snapshot_started),
+                }),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+        let mut early = connect_test_websocket(addr, &token).await;
+        assert_eq!(next_text(&mut early).await, HELLO_JSON);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !snapshot_started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial snapshot starts");
+        let body = r#"{"session":"work","text":"busy"}"#;
+        let update = http_exchange(
+            addr,
+            format!(
+                "POST /set-status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(update.starts_with(b"HTTP/1.1 204 No Content"));
+        let first = next_text(&mut early).await;
+        let second = next_text(&mut early).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut late = connect_test_websocket(addr, &token).await;
+        assert_eq!(next_text(&mut late).await, HELLO_JSON);
+        let late_state = next_text(&mut late).await;
+        server.shutdown().await.expect("stop server");
+
+        assert!(first.contains("initial"), "first state: {first}");
+        assert!(second.contains("newer"), "second state: {second}");
+        assert!(
+            late_state.contains("newer"),
+            "late client state: {late_state}"
+        );
+    }
+
     /// A one-session mux whose sidebar pane listing, part of every full
     /// snapshot, stalls while `slow` is set, like tmux under fork pressure.
     struct StallingSnapshotMux {
@@ -7303,6 +7718,10 @@ mod tests {
             std::env::temp_dir().join(format!("opensessions-event-burst-{}-{id}", process::id()));
         let pid_file = root.with_extension("pid");
         let token_file = root.with_extension("token");
+        let _files = TestServerFiles {
+            pid_file: pid_file.clone(),
+            token_file: token_file.clone(),
+        };
         let agent_home = root.with_extension("home");
         fs::create_dir_all(&agent_home).expect("agent home");
         let slow = Arc::new(AtomicBool::new(false));

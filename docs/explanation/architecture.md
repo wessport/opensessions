@@ -18,8 +18,11 @@ If no healthy server is listening, `integrations/tmux-plugin/scripts/server-comm
 1. loads config from `~/.config/opensessions/config.json`
 2. registers the built-in tmux provider
 3. resolves the primary mux provider
-4. starts built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid
-5. starts the WebSocket and HTTP control server
+4. binds the WebSocket and HTTP control server, publishes its pid and token files, and starts accepting connections
+5. on the blocking pool, installs tmux hooks and restores recorded sidebars, then builds the one initial state snapshot
+6. starts built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid, and the other background loops, once that snapshot is published
+
+Accepting starts before the slow work in steps 5 and 6 (Git per session, system-wide `ps` and `lsof`), so the server never sits silently in the listen backlog. Until hooks are installed, the unauthenticated `GET /` liveness probe answers `503 opensessions server initializing`; launchers keep polling, so a server they consider live has its hooks and restored sidebars in place. Agent-event and Pi runtime ingestion is accepted immediately. Requests that read or change sidebar state wait behind startup and run after the initial snapshot, and sidebars that connect early receive that shared snapshot instead of each building their own. Background loops start only after it is published, so it can never overwrite newer state.
 
 ## State Assembly
 
