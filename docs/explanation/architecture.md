@@ -107,6 +107,7 @@ The runtime keeps a small set of operational files:
 Some pieces are intentionally still narrow in scope:
 
 - the server and TUI are local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden
+- every window that has shown a sidebar keeps one websocket open, so connection capacity follows the descriptor limit: the server raises its soft `RLIMIT_NOFILE` toward 8192 (bounded by the hard limit; macOS defaults to 256) and caps concurrent connections at that limit less 96 descriptors of headroom, at most 2048. `OPENSESSIONS_MAX_CONNECTIONS` can lower the cap. About 1/16 of it stays reserved for HTTP hooks and probes; sidebars connect on `/?client=sidebar` and may use the rest, while other websocket clients are limited to 1/8 of the websocket slots. A slot is released as soon as its connection closes
 - parsed config field `keybinding` is not yet wired through the runtime
 - inline theme objects exist in the core API surface, but the running server currently uses theme names
 - tmux is the only supported mux today

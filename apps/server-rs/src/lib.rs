@@ -67,8 +67,23 @@ pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_CONCURRENT_CONNECTIONS: usize = 128;
-const RESERVED_HTTP_CONNECTIONS: usize = 8;
+/// Descriptors kept free for everything that is not a client connection:
+/// stdio, the listener, identity and log files, and the pipes of concurrent
+/// tmux, Git, `ps`, and `lsof` children.
+const FD_HEADROOM: u64 = 96;
+/// Startup raises the soft descriptor limit toward this (bounded by the hard
+/// limit). macOS defaults to a soft limit of 256 and rejects soft limits above
+/// `OPEN_MAX` (10240) when the hard limit is unlimited.
+const FD_SOFT_LIMIT_TARGET: u64 = 8_192;
+const MIN_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_CONCURRENT_CONNECTIONS: usize = 2_048;
+const MIN_RESERVED_HTTP_CONNECTIONS: usize = 8;
+const MIN_PASSIVE_WEBSOCKETS: usize = 4;
+/// Websocket path sidebars connect on. Every visited window keeps one sidebar
+/// connection, so sidebars may use the whole websocket capacity while other
+/// (passive) websocket clients are limited to a share of it.
+pub const SIDEBAR_WEBSOCKET_PATH: &str = "/?client=sidebar";
+const MAX_CONNECTIONS_ENV: &str = "OPENSESSIONS_MAX_CONNECTIONS";
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
 const IDENTITY_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,6 +115,133 @@ const OPENCODE_SQL_SEP: char = '\u{1f}';
 const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
 const MIN_DETAIL_PANEL_HEIGHT: u16 = 4;
 const MAX_DETAIL_PANEL_HEIGHT: u16 = 60;
+
+/// Connection caps derived from the process descriptor limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLimits {
+    /// All concurrent connections, HTTP and websocket.
+    pub total: usize,
+    /// Websockets; the remainder stays available for HTTP hooks and probes.
+    pub websockets: usize,
+    /// Websockets that did not connect as a sidebar.
+    pub passive_websockets: usize,
+}
+
+impl ConnectionLimits {
+    /// Bounds connections by the soft descriptor limit less `FD_HEADROOM`,
+    /// never above `MAX_CONCURRENT_CONNECTIONS`. A configured cap can lower,
+    /// but not raise, that bound.
+    pub fn from_fd_limit(fd_soft_limit: u64, configured: Option<usize>) -> Self {
+        let fd_budget =
+            usize::try_from(fd_soft_limit.saturating_sub(FD_HEADROOM)).unwrap_or(usize::MAX);
+        let hard_cap = fd_budget.clamp(MIN_CONCURRENT_CONNECTIONS, MAX_CONCURRENT_CONNECTIONS);
+        let total = configured.map_or(hard_cap, |configured| {
+            configured.clamp(MIN_CONCURRENT_CONNECTIONS, hard_cap)
+        });
+        let reserved_http = (total / 16).max(MIN_RESERVED_HTTP_CONNECTIONS);
+        let websockets = total - reserved_http;
+        let passive_websockets = (websockets / 8)
+            .max(MIN_PASSIVE_WEBSOCKETS)
+            .min(websockets / 2);
+        Self {
+            total,
+            websockets,
+            passive_websockets,
+        }
+    }
+}
+
+/// Reads `OPENSESSIONS_MAX_CONNECTIONS`, a positive connection cap.
+pub fn max_connections_from_env(env: impl Fn(&str) -> Option<String>) -> Option<usize> {
+    env(MAX_CONNECTIONS_ENV)?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit > 0)
+}
+
+/// Returns the (soft, hard) `RLIMIT_NOFILE` descriptor limits.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is not `u64` on every unix target.
+fn descriptor_limits() -> Option<(u64, u64)> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the provided, properly sized struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    Some((limit.rlim_cur as u64, limit.rlim_max as u64))
+}
+
+#[cfg(not(unix))]
+fn descriptor_limits() -> Option<(u64, u64)> {
+    None
+}
+
+/// Raises the soft descriptor limit toward `FD_SOFT_LIMIT_TARGET`, bounded by
+/// the hard limit, and returns the resulting soft limit. Never lowers it.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is not `u64` on every unix target.
+pub fn raise_fd_soft_limit() -> Option<u64> {
+    let (soft, hard) = descriptor_limits()?;
+    let target = hard.min(FD_SOFT_LIMIT_TARGET);
+    if soft >= target {
+        return Some(soft);
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    // SAFETY: setrlimit only reads the provided, properly sized struct.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        Some(target)
+    } else {
+        Some(soft)
+    }
+}
+
+#[cfg(not(unix))]
+pub fn raise_fd_soft_limit() -> Option<u64> {
+    None
+}
+
+/// Websocket admission: every websocket takes a websocket slot, and clients
+/// that did not connect as sidebars also take a passive slot, so passive
+/// clients can never crowd out sidebars.
+#[derive(Debug, Clone)]
+struct WebsocketCapacity {
+    websockets: Arc<Semaphore>,
+    passive: Arc<Semaphore>,
+}
+
+impl WebsocketCapacity {
+    fn new(limits: ConnectionLimits) -> Self {
+        Self {
+            websockets: Arc::new(Semaphore::new(limits.websockets)),
+            passive: Arc::new(Semaphore::new(limits.passive_websockets)),
+        }
+    }
+
+    /// Permits are released when the returned guard drops, which happens as
+    /// soon as the connection's handler returns.
+    fn try_admit(
+        &self,
+        sidebar: bool,
+    ) -> Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    )> {
+        let passive = if sidebar {
+            None
+        } else {
+            Some(Arc::clone(&self.passive).try_acquire_owned().ok()?)
+        };
+        let websocket = Arc::clone(&self.websockets).try_acquire_owned().ok()?;
+        Some((websocket, passive))
+    }
+}
 
 #[derive(Debug, Default)]
 struct ShutdownAnnouncement {
@@ -4042,6 +4184,7 @@ pub struct ServerConfig {
     pub pid_file: PathBuf,
     pub token_file: PathBuf,
     pub server_identity: Option<String>,
+    pub max_connections: Option<usize>,
     state_source: Option<Arc<dyn StateSource>>,
 }
 
@@ -4053,8 +4196,16 @@ impl ServerConfig {
             pid_file: pid_file.into(),
             token_file: PathBuf::new(),
             server_identity: None,
+            max_connections: None,
             state_source: None,
         }
+    }
+
+    /// Lowers the connection cap below the one derived from the descriptor
+    /// limit; it can never exceed that bound.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
+        self
     }
 
     pub fn with_token_file(mut self, token_file: impl Into<PathBuf>) -> Self {
@@ -4331,6 +4482,11 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         Arc::clone(&latest_state),
     ));
     let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
+    let connection_limits = ConnectionLimits::from_fd_limit(
+        descriptor_limits().map_or(256, |(soft, _)| soft),
+        config.max_connections,
+    );
+    debug_log(format!("connection limits: {connection_limits:?}"));
     let state_operation_lock = Arc::new(AsyncMutex::new(()));
     let startup_ready = Arc::new(AtomicBool::new(config.state_source.is_none()));
     // Serve from here on: hook setup and the first snapshot (Git per session,
@@ -4372,6 +4528,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             server_identity,
             state_operation_lock,
             startup_ready,
+            connection_limits,
         )
         .await;
         // Never remove hooks while startup may still be installing them.
@@ -4476,11 +4633,10 @@ async fn run_accept_loop(
     server_identity: Option<String>,
     state_operation_lock: Arc<AsyncMutex<()>>,
     startup_ready: Arc<AtomicBool>,
+    connection_limits: ConnectionLimits,
 ) -> Result<(), ServerError> {
-    let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    let websocket_limit = Arc::new(Semaphore::new(
-        MAX_CONCURRENT_CONNECTIONS - RESERVED_HTTP_CONNECTIONS,
-    ));
+    let connection_limit = Arc::new(Semaphore::new(connection_limits.total));
+    let websocket_capacity = WebsocketCapacity::new(connection_limits);
     let ingestion_lock = Arc::new(AsyncMutex::new(()));
     let (state_refreshes, refresh_requests) = mpsc::channel(1);
     tokio::spawn(run_coalesced_state_refreshes(
@@ -4520,6 +4676,11 @@ async fn run_accept_loop(
                     }
                 };
                 let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                    // Refuse without blocking the accept loop; the reply is
+                    // best effort and the descriptor is closed right away.
+                    let _ = stream.try_write(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nconnection capacity",
+                    );
                     continue;
                 };
                 let connection_shutdown = shutdown.clone();
@@ -4532,7 +4693,7 @@ async fn run_accept_loop(
                 let connection_ingestion_lock = Arc::clone(&ingestion_lock);
                 let connection_state_refreshes = state_refreshes.clone();
                 let connection_server_identity = server_identity.clone();
-                let connection_websocket_limit = Arc::clone(&websocket_limit);
+                let connection_websocket_capacity = websocket_capacity.clone();
                 let connection_startup_ready = Arc::clone(&startup_ready);
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
@@ -4548,7 +4709,7 @@ async fn run_accept_loop(
                         connection_ingestion_lock,
                         connection_state_refreshes,
                         connection_server_identity,
-                        connection_websocket_limit,
+                        connection_websocket_capacity,
                         connection_startup_ready,
                     )
                     .await;
@@ -4726,7 +4887,7 @@ async fn handle_connection(
     ingestion_lock: Arc<AsyncMutex<()>>,
     state_refreshes: mpsc::Sender<()>,
     server_identity: Option<String>,
-    websocket_limit: Arc<Semaphore>,
+    websocket_capacity: WebsocketCapacity,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<(), ServerError> {
     let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
@@ -4991,7 +5152,8 @@ async fn handle_connection(
     }
 
     if parsed.is_websocket_upgrade() {
-        let Ok(websocket_permit) = websocket_limit.try_acquire_owned() else {
+        let sidebar = parsed.query_param("client") == Some("sidebar");
+        let Some(websocket_permit) = websocket_capacity.try_admit(sidebar) else {
             write_http_response(
                 &mut stream,
                 "503 Service Unavailable",
@@ -7643,6 +7805,198 @@ mod tests {
             late_state.contains("newer"),
             "late client state: {late_state}"
         );
+    }
+
+    #[test]
+    fn connection_limits_are_derived_from_the_descriptor_limit() {
+        // macOS's default soft limit when raising it is not possible.
+        let constrained = ConnectionLimits::from_fd_limit(256, None);
+        assert_eq!(constrained.total, 160);
+        assert_eq!(constrained.websockets, 150);
+        assert_eq!(constrained.passive_websockets, 18);
+
+        // A raised limit allows far more sidebars than the old fixed 120,
+        // but the hard cap still bounds the server's descriptors.
+        let raised = ConnectionLimits::from_fd_limit(8_192, None);
+        assert_eq!(raised.total, 2_048);
+        assert_eq!(raised.websockets, 1_920);
+        assert_eq!(raised.passive_websockets, 240);
+        assert_eq!(ConnectionLimits::from_fd_limit(u64::MAX, None), raised);
+
+        // A configured cap may lower the limit but never exceed the
+        // descriptor budget or drop below a usable floor.
+        assert_eq!(
+            ConnectionLimits::from_fd_limit(256, Some(10_000)),
+            constrained
+        );
+        let configured = ConnectionLimits::from_fd_limit(8_192, Some(500));
+        assert_eq!(configured.total, 500);
+        assert_eq!(configured.websockets, 469);
+        assert_eq!(ConnectionLimits::from_fd_limit(8_192, Some(1)).total, 16);
+        assert_eq!(ConnectionLimits::from_fd_limit(32, None).total, 16);
+        for limits in [constrained, raised, configured] {
+            assert!(limits.websockets < limits.total);
+            assert!(limits.passive_websockets < limits.websockets);
+        }
+    }
+
+    #[test]
+    fn configured_connection_cap_is_read_from_the_environment() {
+        let env = |value: &'static str| {
+            move |key: &str| (key == "OPENSESSIONS_MAX_CONNECTIONS").then(|| value.to_string())
+        };
+        assert_eq!(max_connections_from_env(env("600")), Some(600));
+        assert_eq!(max_connections_from_env(env(" 600 ")), Some(600));
+        assert_eq!(max_connections_from_env(env("lots")), None);
+        assert_eq!(max_connections_from_env(env("0")), None);
+        assert_eq!(max_connections_from_env(|_| None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raising_the_descriptor_limit_never_lowers_it() {
+        let before = descriptor_limits().expect("read RLIMIT_NOFILE");
+        let raised = raise_fd_soft_limit().expect("raise RLIMIT_NOFILE");
+        let after = descriptor_limits().expect("read RLIMIT_NOFILE");
+        assert_eq!(raised, after.0);
+        assert!(after.0 >= before.0);
+        assert!(after.0 >= before.1.min(FD_SOFT_LIMIT_TARGET));
+        assert_eq!(after.1, before.1, "the hard limit is left alone");
+    }
+
+    async fn try_connect_websocket(
+        addr: SocketAddr,
+        token: &str,
+        path: &str,
+    ) -> Option<tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>>>
+    {
+        let uri = format!("ws://{addr}{path}").parse().expect("ws uri");
+        let (mut websocket, _) = tokio_websockets::ClientBuilder::from_uri(uri)
+            .add_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("authorization"),
+            )
+            .expect("add authorization header")
+            .connect()
+            .await
+            .ok()?;
+        assert_eq!(next_text(&mut websocket).await, HELLO_JSON);
+        let _ = next_text(&mut websocket).await;
+        Some(websocket)
+    }
+
+    async fn connect_websocket_when_released(
+        addr: SocketAddr,
+        token: &str,
+        path: &str,
+    ) -> Option<tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>>>
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(websocket) = try_connect_websocket(addr, token, path).await {
+                return Some(websocket);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_slots_are_reserved_for_sidebars_and_released_on_close() {
+        let files = startup_test_paths("websocket-capacity");
+        let (pid_file, token_file) = files.paths();
+        let limits = ConnectionLimits::from_fd_limit(u64::MAX, Some(32));
+        assert_eq!((limits.websockets, limits.passive_websockets), (24, 4));
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_max_connections(32)
+                .with_state_source(|| "{}".to_string()),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let addr = server.addr();
+        let sidebar = SIDEBAR_WEBSOCKET_PATH;
+
+        let mut passive = Vec::new();
+        for _ in 0..4 {
+            passive.push(try_connect_websocket(addr, &token, "/").await);
+        }
+        let passive_over_share = try_connect_websocket(addr, &token, "/").await.is_some();
+        let mut sidebars = Vec::new();
+        for _ in 0..20 {
+            sidebars.push(try_connect_websocket(addr, &token, sidebar).await);
+        }
+        let sidebar_over_cap = try_connect_websocket(addr, &token, sidebar).await.is_some();
+
+        // Closing a client must free its slot promptly, for either kind.
+        let mut closed_passive = passive.pop().flatten().expect("passive client");
+        closed_passive.close().await.expect("close passive client");
+        drop(closed_passive);
+        let passive_after_close = connect_websocket_when_released(addr, &token, "/").await;
+        drop(sidebars.pop().flatten().expect("sidebar client"));
+        let sidebar_after_close = connect_websocket_when_released(addr, &token, sidebar).await;
+        // HTTP keeps its reserved connections while websockets are full.
+        let liveness =
+            http_exchange(addr, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".into()).await;
+        server.shutdown().await.expect("stop server");
+
+        assert!(
+            passive.iter().all(Option::is_some),
+            "passive share admitted"
+        );
+        assert!(
+            !passive_over_share,
+            "passive clients stay within their share"
+        );
+        assert!(
+            sidebars.iter().all(Option::is_some),
+            "sidebars use the reserve"
+        );
+        assert!(!sidebar_over_cap, "the websocket cap still holds");
+        assert!(
+            passive_after_close.is_some(),
+            "closed passive slot released"
+        );
+        assert!(
+            sidebar_after_close.is_some(),
+            "closed sidebar slot released"
+        );
+        assert!(liveness.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn default_websocket_capacity_admits_more_sidebars_than_the_old_fixed_cap() {
+        if raise_fd_soft_limit().is_none_or(|limit| limit < 1_024) {
+            eprintln!("skipping: descriptor limit too low for 150 in-process sidebars");
+            return;
+        }
+        let files = startup_test_paths("websocket-default-capacity");
+        let (pid_file, token_file) = files.paths();
+        let server = start_server(
+            ServerConfig::new("127.0.0.1", 0, &pid_file)
+                .with_token_file(&token_file)
+                .with_state_source(|| "{}".to_string()),
+        )
+        .await
+        .expect("start server");
+        let token = fs::read_to_string(&token_file).expect("token");
+        let token = token.trim().to_string();
+        let mut sidebars = Vec::new();
+        for _ in 0..150 {
+            match try_connect_websocket(server.addr(), &token, SIDEBAR_WEBSOCKET_PATH).await {
+                Some(websocket) => sidebars.push(websocket),
+                None => break,
+            }
+        }
+        let admitted = sidebars.len();
+        drop(sidebars);
+        server.shutdown().await.expect("stop server");
+        assert_eq!(admitted, 150, "a sidebar was refused after {admitted}");
     }
 
     /// A one-session mux whose sidebar pane listing, part of every full

@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use opensessions_sidebar::app::{App, LaunchTarget, Modal};
 use opensessions_sidebar::cli::{Args, resolve_endpoint};
 use opensessions_sidebar::client::{
-    connect_ws_path_with_token, decode_server_message, encode_client_command,
+    SIDEBAR_WS_PATH, connect_ws_path_with_token, decode_server_message, encode_client_command,
     send_quit_with_http_fallback, validate_hello,
 };
 use opensessions_sidebar::debug_log::{
@@ -80,9 +80,14 @@ async fn main() -> Result<()> {
     debug_log(format!(
         "starting: connecting to ws://{server_host}:{server_port}/ identity={identity:?}"
     ));
-    let mut ws = connect_ws_path_with_token(&server_host, server_port, "/", auth_token.trim())
-        .await
-        .with_context(|| format!("connect ws://{server_host}:{server_port}/"))?;
+    let mut ws = connect_ws_path_with_token(
+        &server_host,
+        server_port,
+        SIDEBAR_WS_PATH,
+        auth_token.trim(),
+    )
+    .await
+    .with_context(|| format!("connect ws://{server_host}:{server_port}/"))?;
     debug_log("ws: connected");
 
     let first = ws.next().await.context("read protocol hello")??;
