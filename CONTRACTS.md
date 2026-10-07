@@ -188,9 +188,9 @@ Provider methods are synchronous because tmux operations are command-driven and 
 
 - The server computes `ServerState` from tmux sessions, git/cache state, metadata, ports, and tracked agent events.
 - Session ordering is persisted separately from tmux ordering.
-- tmux sidebars can be hidden into a stash session instead of being killed.
+- Hiding tmux sidebars kills their panes and records the choice per tmux server; showing them spawns fresh sidebar clients.
 - tmux is the only supported built-in mux today.
-- The sidebar and helper scripts resolve the server port from the tmux socket via `OPENSESSIONS_SERVER_KEY`, defaulting to derived per-socket ports.
+- The server, sidebar, helper scripts, and Amp/Pi integrations derive the port from the tmux socket key, or from `OPENSESSIONS_SERVER_KEY` when set; see [Server key and port](./docs/reference/configuration.md#server-key-and-port).
 - TPM installs use prebuilt binaries in `bin/`; local builds use `target/release` or `target/debug` as fallback paths.
 
 ## Where To Start

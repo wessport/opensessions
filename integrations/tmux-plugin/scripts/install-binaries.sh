@@ -82,9 +82,13 @@ VERSION_FILE="$BIN_DIR/.opensessions-version"
 SOURCE_FILE="$BIN_DIR/.opensessions-release-source"
 RELEASE_SOURCE="${RELEASE_BASE%/}:v$VERSION"
 
-if [ -x "$SIDEBAR_BIN" ] && [ -x "$SERVER_BIN" ] && [ -x "$LAZYDIFF_BIN" ] \
-  && [ "$(cat "$VERSION_FILE" 2>/dev/null || true)" = "$VERSION" ] \
-  && [ "$(cat "$SOURCE_FILE" 2>/dev/null || true)" = "$RELEASE_SOURCE" ]; then
+bundle_current() {
+  [ -x "$SIDEBAR_BIN" ] && [ -x "$SERVER_BIN" ] && [ -x "$LAZYDIFF_BIN" ] \
+    && [ "$(cat "$VERSION_FILE" 2>/dev/null || true)" = "$VERSION" ] \
+    && [ "$(cat "$SOURCE_FILE" 2>/dev/null || true)" = "$RELEASE_SOURCE" ]
+}
+
+if bundle_current; then
   exit 0
 fi
 
@@ -93,13 +97,46 @@ STAGE_DIR="$PARENT_DIR/.opensessions-bin-stage.$$"
 BACKUP_DIR="$PARENT_DIR/.opensessions-bin-backup.$$"
 TMP="$PARENT_DIR/.opensessions-download.$$.$ARTIFACT"
 CHECKSUM="$TMP.sha256"
+# Serializes concurrent installers (e.g. several tmux servers sourcing the
+# plugin at once) so only one downloads and publishes bin/ at a time.
+LOCK_DIR="$PARENT_DIR/.opensessions-bin.lock"
+LOCK_HELD=0
 cleanup() {
   if [ ! -e "$BIN_DIR" ] && [ -e "$BACKUP_DIR" ]; then
     mv "$BACKUP_DIR" "$BIN_DIR" 2>/dev/null || true
   fi
   rm -rf "$TMP" "$CHECKSUM" "$STAGE_DIR" "$BACKUP_DIR"
+  if [ "$LOCK_HELD" = 1 ]; then
+    rm -rf "$LOCK_DIR"
+  fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+acquire_install_lock() {
+  waited=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    if [ "$waited" -ge "${OPENSESSIONS_INSTALL_LOCK_TIMEOUT:-300}" ]; then
+      echo "opensessions: timed out waiting for another binary install; remove $LOCK_DIR if none is running" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  LOCK_HELD=1
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+}
+
+acquire_install_lock
+# Another installer may have published the same bundle while we waited.
+if bundle_current; then
+  exit 0
+fi
 
 mkdir -p "$STAGE_DIR"
 
@@ -143,8 +180,9 @@ printf '%s\n' "$RELEASE_SOURCE" >"$STAGE_DIR/.opensessions-release-source"
 if [ -e "$BIN_DIR" ]; then
   mv "$BIN_DIR" "$BACKUP_DIR"
 fi
-if ! mv "$STAGE_DIR" "$BIN_DIR"; then
-  [ ! -e "$BACKUP_DIR" ] || mv "$BACKUP_DIR" "$BIN_DIR"
+# `mv stage bin` would move stage *into* bin if bin reappeared; refuse instead.
+if [ -e "$BIN_DIR" ] || ! mv "$STAGE_DIR" "$BIN_DIR"; then
+  # cleanup restores the backup when bin/ is absent.
   echo "opensessions: failed to publish validated binary bundle" >&2
   exit 1
 fi

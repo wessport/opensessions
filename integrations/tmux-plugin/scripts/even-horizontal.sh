@@ -5,7 +5,6 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/sidebar-common.sh"
 . "$SCRIPT_DIR/even-horizontal-common.sh"
-. "$SCRIPT_DIR/server-common.sh"
 
 pane_rows_for_window() {
   window_id="$1"
@@ -31,9 +30,29 @@ restore_focus() {
   fi
 }
 
-suppress_sidebar_width_reports() {
-  server_alive || return 0
-  curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST "http://${HOST}:${PORT}/suppress-width-reports?ms=2000" >/dev/null 2>&1 || true
+pane_session() {
+  tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null || true
+}
+
+# Put a stashed sidebar back into the window. If the full-height join at its
+# edge fails, retry a plain join next to the edge pane; as a last resort kill
+# the stashed pane and ask the server for a fresh sidebar so it is never
+# stranded in the stash.
+unstash_sidebar_pane() {
+  restore_sidebar_pane "$SIDEBAR_PANE_ID" "$WINDOW_ID" "$SIDEBAR_SIDE" "$SIDEBAR_WIDTH" && return 0
+  [ "$(pane_session "$SIDEBAR_PANE_ID")" = "$STASH_SESSION" ] || return 0
+
+  fallback_pane_id="$(window_edge_pane "$WINDOW_ID" "$SIDEBAR_SIDE")"
+  fallback_flag="-h"
+  [ "$SIDEBAR_SIDE" != "left" ] || fallback_flag="-hb"
+  if [ -n "$fallback_pane_id" ] &&
+    tmux join-pane "$fallback_flag" -d -l "$SIDEBAR_WIDTH" -s "$SIDEBAR_PANE_ID" -t "$fallback_pane_id" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  tmux kill-pane -t "$SIDEBAR_PANE_ID" >/dev/null 2>&1 || true
+  sh "$SCRIPT_DIR/ensure-sidebar.sh" >/dev/null 2>&1 || true
+  return 1
 }
 
 WINDOW_ID="${1:-$(current_window_id)}"
@@ -79,11 +98,19 @@ SIDEBAR_SIDE="$(detect_sidebar_side "$PANE_ROWS" "$SIDEBAR_LEFT" "$SIDEBAR_RIGHT
 [ -n "$SIDEBAR_WIDTH" ] || exit 0
 [ -n "$SIDEBAR_SIDE" ] || exit 0
 
-suppress_sidebar_width_reports
-stash_sidebar_pane "$SIDEBAR_PANE_ID" || exit 0
+# Move the sidebar out of the window so even-horizontal only spreads the other
+# panes. If stashing fails the sidebar is still in place; leave the layout as is.
+if ! stash_sidebar_pane "$SIDEBAR_PANE_ID"; then
+  tmux switch-client -T root >/dev/null 2>&1 || true
+  exit 0
+fi
 
-tmux select-layout -t "$WINDOW_ID" even-horizontal >/dev/null 2>&1 || exit 0
-restore_sidebar_pane "$SIDEBAR_PANE_ID" "$WINDOW_ID" "$SIDEBAR_SIDE" "$SIDEBAR_WIDTH" || exit 0
-restore_focus "$CURRENT_PANE_ID" "$SIDEBAR_PANE_ID" "$SIDEBAR_ACTIVE"
+# From here on the sidebar must always be restored, even if the layout fails.
+tmux select-layout -t "$WINDOW_ID" even-horizontal >/dev/null 2>&1 || true
+if unstash_sidebar_pane; then
+  restore_focus "$CURRENT_PANE_ID" "$SIDEBAR_PANE_ID" "$SIDEBAR_ACTIVE"
+else
+  restore_focus "$CURRENT_PANE_ID" "" "0"
+fi
 
 tmux switch-client -T root >/dev/null 2>&1 || true

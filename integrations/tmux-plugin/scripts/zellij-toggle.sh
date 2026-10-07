@@ -1,47 +1,26 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # Toggle opensessions sidebar in Zellij via the server.
 # Ensures the server is running first, then calls POST /toggle.
+#
+# Zellij is not a supported mux: the server only manages tmux sidebars. This
+# helper is kept so old keybindings fail gracefully instead of by construction.
+# It resolves the server binary, port, PID file, and auth token exactly like
+# the tmux scripts (server-common.sh). Outside tmux, set OPENSESSIONS_SERVER_KEY
+# (or leave it unset for the default port and /tmp/opensessions.token).
 #
 # Designed to be called from a zellij keybinding. Add to ~/.config/zellij/config.kdl:
 #
 #   bind "s" {
-#     Run "bash" "${OPENSESSIONS_DIR}/integrations/tmux-plugin/scripts/zellij-toggle.sh" {
+#     Run "sh" "${OPENSESSIONS_DIR}/integrations/tmux-plugin/scripts/zellij-toggle.sh" {
 #       close_on_exit true
 #     };
 #     SwitchToMode "Normal";
 #   }
 
-set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/server-common.sh"
 
-PORT="${OPENSESSIONS_PORT:-7391}"
-HOST="${OPENSESSIONS_HOST:-127.0.0.1}"
-
-OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
-
-RUST_SERVER_BIN=""
-if [ -x "$OPENSESSIONS_DIR/target/release/opensessions-server" ]; then
-    RUST_SERVER_BIN="$OPENSESSIONS_DIR/target/release/opensessions-server"
-elif [ -x "$OPENSESSIONS_DIR/target/debug/opensessions-server" ]; then
-    RUST_SERVER_BIN="$OPENSESSIONS_DIR/target/debug/opensessions-server"
-fi
-
-# --- Ensure server is running ---
-server_alive() {
-    curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
-}
-
-if ! server_alive; then
-    if [ -z "$RUST_SERVER_BIN" ]; then
-        echo "opensessions: server binary not found. Run: cd $OPENSESSIONS_DIR && cargo build --release -p opensessions-server" >&2
-        exit 1
-    fi
-    "$RUST_SERVER_BIN" &>/dev/null &
-    disown
-    for i in $(seq 1 30); do
-        sleep 0.1
-        server_alive && break
-    done
-fi
+ensure_server || exit 1
 
 # --- Build context: |session|tabId ---
 SESSION_NAME="${ZELLIJ_SESSION_NAME:-}"
@@ -49,7 +28,7 @@ SESSION_NAME="${ZELLIJ_SESSION_NAME:-}"
 TAB_ID="0"
 TAB_JSON=$(zellij action list-tabs --json 2>/dev/null || echo "")
 if [ -n "$TAB_JSON" ]; then
-    TAB_ID=$(echo "$TAB_JSON" | python3 -c "
+    TAB_ID=$(printf '%s' "$TAB_JSON" | python3 -c "
 import json,sys
 try:
     tabs=json.load(sys.stdin)
@@ -59,4 +38,4 @@ except: print('0')" 2>/dev/null || echo "0")
 fi
 
 CTX="|${SESSION_NAME}|${TAB_ID}"
-curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"
+curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -H "Authorization: Bearer $(auth_token)" -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"

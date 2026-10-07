@@ -29,7 +29,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 
 - Multiple agent instances per session when a watcher emits `threadId`
 - Per-instance unseen tracking
-- Amp thread seen-state integration via Amp's `session.json`
+- Live Amp events through the optional Amp plugin (`integrations/amp`)
 - Status values: `idle`, `running`, `done`, `error`, `waiting`, `interrupted`
 - Automatic pruning of stale running and seen terminal states
 
@@ -47,7 +47,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 ### tmux-specific
 
 - Global hooks for session changes, window selection, window creation, resize, and refresh
-- Sidebar stash session named `_os_stash` so hidden sidebars can be restored
+- Hiding sidebars kills the sidebar panes; showing them again spawns fresh sidebar clients. The `_os_stash` session is only used briefly by the `prefix o → e` layout helper
 - Shown/hidden sidebar choice recorded per tmux server (`@opensessions_sidebar_visible`) and restored when the opensessions server restarts
 - Session creation popup using the bundled `sessionizer.sh` script
 
@@ -67,11 +67,14 @@ Clicking a detected port opens `http://localhost:<port>`.
 | `Alt+Down` | Move focused session down in persisted order |
 | `n`, `c` | Open the directory picker to create or switch to a session |
 | `r` (or `$`) | Rename the focused session |
-| `d`, `x` | Open kill-session confirmation for focused session |
+| `d` | Hide the focused session from the list immediately (in the agents panel: dismiss the focused agent) |
+| `u` | Show all hidden sessions again |
+| `x` | Open kill-session confirmation for the focused session (in the agents panel: kill the focused agent's pane) |
 | `t` | Open theme picker |
 | `R` | Refresh state |
 | `q` | Ask to quit the server and all sidebar panes (`y` confirms; any other key cancels) |
-| `Esc` | Close only the current sidebar client |
+| `Esc` | Return focus to the sessions panel (closes an open picker or prompt) |
+| `Ctrl+C` | Exit only the current sidebar client |
 
 ### tmux plugin shortcuts
 
@@ -83,6 +86,8 @@ Clicking a detected port opens `http://localhost:<port>`.
 | `prefix o → 1` through `prefix o → 9` | Switch directly to the visible session indices |
 | Configurable `@opensessions-focus-global-key` such as `Alt-s` | Reveal and focus the sidebar pane from any tmux pane |
 | Configurable `@opensessions-index-keys` such as `Alt-1` through `Alt-9` | Switch directly to the visible session indices from any tmux pane |
+
+`integrations/tmux-plugin/scripts/ensure-sidebar.sh` is not bound by default. Run it (or bind it with `run-shell`) to ask the server to re-create a missing sidebar in the current window.
 
 ## Session Creation Behavior
 
@@ -110,7 +115,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 ## Files And Paths The UI Depends On
 
 - `~/.local/share/amp/threads/`
-- `~/.local/share/amp/session.json`
+- `~/.cache/amp/logs/threads/`
 - `~/.claude/projects/`
 - `~/.local/share/opencode/opencode.db`
 - `~/.config/opensessions/config.json`

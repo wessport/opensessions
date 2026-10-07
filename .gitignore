@@ -5,3 +5,10 @@ target
 *.log
 .DS_Store
 .agents/skills/grill-me/
+
+# Release binaries downloaded by install-binaries.sh / postinstall.js
+/bin/
+/.opensessions-bin.lock/
+/.opensessions-bin-stage.*/
+/.opensessions-bin-backup.*/
+/.opensessions-download.*
