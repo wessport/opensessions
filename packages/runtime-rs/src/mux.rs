@@ -109,8 +109,11 @@ pub trait MuxProvider: Send + Sync {
         None
     }
     fn create_session(&self, name: Option<&str>, dir: Option<&str>);
-    fn rename_session(&self, _name: &str, _new_name: &str) -> bool {
-        false
+    /// Renames a session and returns the name the mux actually assigned,
+    /// which can differ from `new_name` (tmux replaces `.`/`:` and expands
+    /// formats). `None` means the rename did not happen.
+    fn rename_session(&self, _name: &str, _new_name: &str) -> Option<String> {
+        None
     }
     fn kill_session(&self, name: &str);
     fn setup_hooks(&self, server_host: &str, server_port: u16, token_file: &str);
