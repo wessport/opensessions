@@ -1,6 +1,6 @@
 pub mod cli;
 pub mod client;
-pub mod debug_log;
+pub use opensessions_runtime::debug_log;
 pub mod runtime_config;
 pub mod runtime_context;
 

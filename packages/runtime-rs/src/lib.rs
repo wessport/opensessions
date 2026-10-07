@@ -1,6 +1,7 @@
 pub mod agent_parsers;
 pub mod agent_watchers;
 pub mod config;
+pub mod debug_log;
 pub mod git_info;
 pub mod hibernate;
 pub mod lifecycle_operation;

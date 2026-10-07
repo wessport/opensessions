@@ -1,9 +1,9 @@
-//! Opt-in, size-bounded sidebar debug log.
+//! Opt-in, size-bounded debug log shared by the server and every sidebar.
 //!
 //! Every tmux window runs its own sidebar process and each one logs every
-//! state update, so an always-on log grows without bound. Like the server,
-//! the sidebar only logs when `OPENSESSIONS_DEBUG_LOG` names a path, and it
-//! rotates the file to `<path>.1` once it reaches a size cap.
+//! state update, so an unbounded log grows without limit. The server and the
+//! sidebars only log when `OPENSESSIONS_DEBUG_LOG` names a path, and they
+//! rotate the file to `<path>.1` once it reaches a size cap.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,8 +24,10 @@ where
 }
 
 /// Append `line` (plus a newline) to `path`, first rotating the current file
-/// to `<path>.1` when the append would exceed `max_bytes`. Errors are
-/// swallowed: debug logging must never disturb the sidebar.
+/// to `<path>.1` when the append would exceed `max_bytes`. Each line is
+/// written with a single `write` on an `O_APPEND` file, so lines from the
+/// server and many sidebars sharing the file never interleave. Errors are
+/// swallowed: debug logging must never disturb the server or a sidebar.
 pub fn append_bounded(path: &Path, line: &str, max_bytes: u64) {
     let incoming = line.len() as u64 + 1;
     if let Ok(metadata) = std::fs::metadata(path)
@@ -39,7 +41,10 @@ pub fn append_bounded(path: &Path, line: &str, max_bytes: u64) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{line}");
+        let mut buffer = String::with_capacity(line.len() + 1);
+        buffer.push_str(line);
+        buffer.push('\n');
+        let _ = file.write_all(buffer.as_bytes());
     }
 }
 
@@ -55,7 +60,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "opensessions-sidebar-debug-log-{name}-{}",
+            "opensessions-debug-log-{name}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -97,6 +102,39 @@ mod tests {
         assert!(current <= 1_000, "current log grew to {current} bytes");
         assert!(rotated <= 1_000, "rotated log grew to {rotated} bytes");
         assert!(current > 0, "newest lines must stay in the current log");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writers_never_interleave_lines() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("debug.log");
+        let writers = (0..8)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let line = format!("[writer={writer}] {}", "y".repeat(200));
+                    for _ in 0..300 {
+                        append_bounded(&path, &line, u64::MAX);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 8 * 300);
+        for line in lines {
+            assert!(
+                line.starts_with("[writer=")
+                    && line.ends_with(&"y".repeat(200))
+                    && line.len() == 211,
+                "interleaved line: {line:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

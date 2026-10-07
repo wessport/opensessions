@@ -57,7 +57,7 @@ time, so an older status can never overwrite a newer one.
 | `OPENSESSIONS_PORT` | Explicit server port on `127.0.0.1` |
 | `OPENSESSIONS_SERVER_KEY` | Explicit server key; see the key rule in the [configuration reference](../../docs/reference/configuration.md#server-key-and-port) |
 | `OPENSESSIONS_TOKEN_FILE` | Bearer token file used for every candidate |
-| `OPENSESSIONS_AMP_PLUGIN_LOG` | Plugin log path (default `/tmp/opensessions-plugin.log`) |
+| `OPENSESSIONS_AMP_PLUGIN_LOG` | Plugin log path (default `/tmp/opensessions-plugin.log`); rotated to `<path>.1` past 5 MiB |
 
 ## Event mapping
 
