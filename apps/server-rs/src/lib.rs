@@ -956,13 +956,17 @@ impl ReadOnlyMuxStateSource {
         if wanted.iter().any(|key| !cache.routes.contains_key(key)) {
             // A pid missing from a fresh table belongs to a process that has
             // exited; remembering it as unroutable is safe for this layout.
-            let found = self.agent_panes_by_pid(&self.process_control.process_table());
-            for key in &wanted {
-                cache.routes.insert(key.clone(), None);
+            // An empty table means `ps` failed, which proves nothing.
+            let process_table = self.process_control.process_table();
+            if !process_table.is_empty() {
+                let found = self.agent_panes_by_pid(&process_table);
+                for key in &wanted {
+                    cache.routes.insert(key.clone(), None);
+                }
+                cache
+                    .routes
+                    .extend(found.into_iter().map(|(key, route)| (key, Some(route))));
             }
-            cache
-                .routes
-                .extend(found.into_iter().map(|(key, route)| (key, Some(route))));
         }
         unattributed
             .into_iter()
@@ -5776,13 +5780,18 @@ mod tests {
     struct TermIgnoringProcesses {
         signals: Mutex<Vec<(u32, opensessions_runtime::hibernate::Signal)>>,
         table_reads: AtomicUsize,
+        /// How many of the first process-table reads fail (return nothing),
+        /// like a `ps` that could not run.
+        failed_table_reads: usize,
         /// Runs during the SIGTERM grace period.
         during_grace: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ProcessControl for TermIgnoringProcesses {
         fn process_table(&self) -> Vec<opensessions_runtime::hibernate::ProcessEntry> {
-            self.table_reads.fetch_add(1, Ordering::SeqCst);
+            if self.table_reads.fetch_add(1, Ordering::SeqCst) < self.failed_table_reads {
+                return Vec::new();
+            }
             opensessions_runtime::hibernate::parse_process_table(
                 "100 1 -zsh\n\
                  101 100 /Users/me/.amp/bin/amp threads continue T-bg\n\
@@ -6527,6 +6536,26 @@ mod tests {
         poll.run(&source, current_time_ms());
         poll.run(&source, current_time_ms());
         assert_eq!(reads(), 2, "processes outside agent panes are remembered");
+    }
+
+    #[test]
+    fn a_failed_process_table_read_is_not_remembered_as_unroutable() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "working", 0);
+        let processes = Arc::new(TermIgnoringProcesses {
+            failed_table_reads: 1,
+            ..Default::default()
+        });
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(RestartTestProvider)])
+            .with_process_control(processes.clone())
+            .with_agent_state_home(home.0.clone());
+        let mut poll = AgentWatcherPoll::default();
+
+        poll.run(&source, current_time_ms());
+        assert!(background_threads(&source).is_empty(), "ps failed");
+
+        poll.run(&source, current_time_ms());
+        assert_eq!(background_threads(&source), vec!["T-bg"]);
     }
 
     #[test]
