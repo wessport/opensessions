@@ -28,7 +28,7 @@ use opensessions_runtime::config::{
 use opensessions_runtime::git_info::{GIT_INFO_SECTION_SEPARATOR, GitInfo, parse_git_info_output};
 use opensessions_runtime::hibernate::{
     AgentProcessTarget, HIBERNATE_POLL_INTERVAL_MS, HIBERNATE_TERM_GRACE, ProcessControl,
-    ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes,
+    ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes_if,
 };
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
@@ -47,7 +47,7 @@ use opensessions_runtime::shared::resolve_server_key;
 use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarLifecycle};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
-use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
+use opensessions_runtime::tracker::{AgentTracker, HibernationCandidate, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
@@ -956,13 +956,17 @@ impl ReadOnlyMuxStateSource {
         if wanted.iter().any(|key| !cache.routes.contains_key(key)) {
             // A pid missing from a fresh table belongs to a process that has
             // exited; remembering it as unroutable is safe for this layout.
-            let found = self.agent_panes_by_pid(&self.process_control.process_table());
-            for key in &wanted {
-                cache.routes.insert(key.clone(), None);
+            // An empty table means `ps` failed, which proves nothing.
+            let process_table = self.process_control.process_table();
+            if !process_table.is_empty() {
+                let found = self.agent_panes_by_pid(&process_table);
+                for key in &wanted {
+                    cache.routes.insert(key.clone(), None);
+                }
+                cache
+                    .routes
+                    .extend(found.into_iter().map(|(key, route)| (key, Some(route))));
             }
-            cache
-                .routes
-                .extend(found.into_iter().map(|(key, route)| (key, Some(route))));
         }
         unattributed
             .into_iter()
@@ -1048,20 +1052,13 @@ impl ReadOnlyMuxStateSource {
     /// Stops the agent process in panes whose agent has been idle longer
     /// than the configured threshold, keeping each row as `hibernated`.
     /// Status still comes from the tracker; panes are only used to find the
-    /// process to stop. Sessions and panes the user is looking at are skipped.
+    /// process to stop. Every session an attached client is viewing, and
+    /// every pane a client can see, is skipped.
     fn hibernate_idle_agent_panes(&self) -> bool {
         if !self.auto_hibernate.enabled {
             return false;
         }
-        let mut protected_sessions = HashSet::new();
-        if let Some(session) = self.focused_session.lock().unwrap().clone() {
-            protected_sessions.insert(session);
-        }
-        for provider in &self.providers {
-            if let Some(session) = provider.get_current_session() {
-                protected_sessions.insert(session);
-            }
-        }
+        let (protected_sessions, protected_panes) = self.viewed_sessions_and_panes();
         let candidates = self
             .agent_tracker
             .lock()
@@ -1090,13 +1087,20 @@ impl ReadOnlyMuxStateSource {
         } else {
             HashMap::new()
         };
+        let busy_amp_pids = if candidates.iter().any(|candidate| candidate.agent == "amp") {
+            self.busy_unplaced_amp_pids()
+        } else {
+            HashSet::new()
+        };
         let mut targets = Vec::<AgentProcessTarget>::new();
         let mut planned = Vec::new();
         for candidate in candidates {
             let Some(provider) = self.provider_for_session(&candidate.session) else {
                 continue;
             };
-            if provider.client_tty_for_pane(&candidate.pane_id).is_some() {
+            if protected_panes.contains(&candidate.pane_id)
+                || provider.client_tty_for_pane(&candidate.pane_id).is_some()
+            {
                 continue;
             }
             let Some(pane_pid) = provider.get_pane_pid(&candidate.pane_id) else {
@@ -1129,6 +1133,21 @@ impl ReadOnlyMuxStateSource {
                 ));
                 continue;
             }
+            // Another thread served by the same process may be busy (for
+            // example awaiting approval) in a row the tracker could not
+            // bind to this pane.
+            if candidate.agent == "amp"
+                && target
+                    .processes
+                    .iter()
+                    .any(|process| busy_amp_pids.contains(&process.pid))
+            {
+                debug_log(format!(
+                    "auto-hibernate: process serves a busy thread session={} pane={} pid={}",
+                    candidate.session, candidate.pane_id, target.pid,
+                ));
+                continue;
+            }
             let index = targets
                 .iter()
                 .position(|existing| existing.pid == target.pid)
@@ -1142,18 +1161,37 @@ impl ReadOnlyMuxStateSource {
             return false;
         }
 
-        let outcomes = terminate_agent_processes(
+        // An event or a focus change during the SIGTERM grace period can make
+        // a candidate active again; such agents are neither SIGKILLed nor
+        // marked hibernated.
+        let still_hibernatable = std::cell::OnceCell::new();
+        let still_wanted = |index: usize| {
+            let still = still_hibernatable.get_or_init(|| {
+                let viewed = self.viewed_sessions_and_panes();
+                let tracker = self.agent_tracker.lock().unwrap();
+                self.unviewed_hibernation_candidates(&tracker, &viewed)
+            });
+            planned
+                .iter()
+                .filter(|(_, planned_index)| *planned_index == index)
+                .all(|(candidate, _)| still.contains(candidate))
+        };
+        let outcomes = terminate_agent_processes_if(
             self.process_control.as_ref(),
             &targets,
             HIBERNATE_TERM_GRACE,
+            &still_wanted,
         );
+        let viewed = self.viewed_sessions_and_panes();
         let hibernated_at = (self.now_ms)();
         let mut tracker = self.agent_tracker.lock().unwrap();
+        let still = self.unviewed_hibernation_candidates(&tracker, &viewed);
         let mut changed = false;
         for (candidate, index) in planned {
             let outcome = outcomes[index];
+            let still_quiet = still.contains(&candidate);
             debug_log(format!(
-                "auto-hibernate: session={} pane={} agent={} thread={:?} pid={} terminated={} escalated={}",
+                "auto-hibernate: session={} pane={} agent={} thread={:?} pid={} terminated={} escalated={} stopped={} still_quiet={still_quiet}",
                 candidate.session,
                 candidate.pane_id,
                 candidate.agent,
@@ -1161,12 +1199,110 @@ impl ReadOnlyMuxStateSource {
                 outcome.pid,
                 outcome.terminated,
                 outcome.escalated,
+                outcome.stopped,
             ));
-            if outcome.terminated {
+            if outcome.stopped && still_quiet {
                 changed = tracker.mark_hibernated(&candidate, hibernated_at) || changed;
             }
         }
         changed
+    }
+
+    /// Hibernation candidates as of now, minus every session and pane in
+    /// `viewed` (from [`Self::viewed_sessions_and_panes`]).
+    fn unviewed_hibernation_candidates(
+        &self,
+        tracker: &AgentTracker,
+        (protected_sessions, protected_panes): &(HashSet<String>, HashSet<String>),
+    ) -> Vec<HibernationCandidate> {
+        tracker
+            .find_hibernation_candidates(
+                (self.now_ms)(),
+                self.auto_hibernate.idle_after_ms,
+                protected_sessions,
+            )
+            .into_iter()
+            .filter(|candidate| !protected_panes.contains(&candidate.pane_id))
+            .collect()
+    }
+
+    /// Sessions and panes the user may be looking at: the focused session,
+    /// each provider's current session, and every session and pane shown
+    /// to an attached client.
+    fn viewed_sessions_and_panes(&self) -> (HashSet<String>, HashSet<String>) {
+        let mut sessions = HashSet::new();
+        let mut panes = HashSet::new();
+        if let Some(session) = self.focused_session.lock().unwrap().clone() {
+            sessions.insert(session);
+        }
+        for provider in &self.providers {
+            if let Some(session) = provider.get_current_session() {
+                sessions.insert(session);
+            }
+            for viewed in provider.list_viewed_panes() {
+                sessions.insert(viewed.session_name);
+                panes.insert(viewed.pane_id);
+            }
+        }
+        (sessions, panes)
+    }
+
+    /// Pids of the Amp processes that last wrote busy threads (not quiet
+    /// past the idle threshold) whose rows have no known pane. Pane-bound
+    /// rows are already grouped by pane in the tracker.
+    fn busy_unplaced_amp_pids(&self) -> HashSet<u32> {
+        let Some(home) = self.agent_state_home.as_deref() else {
+            return HashSet::new();
+        };
+        let now = (self.now_ms)();
+        let idle_after_ms = self.auto_hibernate.idle_after_ms;
+        let sessions = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.list_sessions())
+            .map(|session| session.name)
+            .collect::<HashSet<_>>();
+        let busy_threads = {
+            let tracker = self.agent_tracker.lock().unwrap();
+            sessions
+                .iter()
+                .flat_map(|session| tracker.get_agents(session))
+                .filter(|event| {
+                    event.agent == "amp"
+                        && event.pane_id.is_none()
+                        && event.liveness != Some(AgentLiveness::Exited)
+                        && event.status != AgentStatus::Hibernated
+                        && (!matches!(
+                            event.status,
+                            AgentStatus::Idle
+                                | AgentStatus::Done
+                                | AgentStatus::Error
+                                | AgentStatus::Interrupted
+                        ) || now.saturating_sub(event.ts) <= idle_after_ms)
+                })
+                .filter_map(|event| event.thread_id)
+                .collect::<HashSet<_>>()
+        };
+        let logs_dir = home.join(".cache/amp/logs/threads");
+        busy_threads
+            .into_iter()
+            // Thread ids come from external events; never let one escape the
+            // log directory.
+            .filter(|thread_id| {
+                !thread_id.is_empty()
+                    && thread_id
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            })
+            .filter_map(|thread_id| {
+                read_file_tail(
+                    &logs_dir.join(format!("{thread_id}.log")),
+                    AMP_LOG_PID_TAIL_BYTES,
+                )
+                .as_deref()
+                .and_then(amp_log_pid)
+            })
+            .collect()
     }
 
     pub fn with_port_command_runner(mut self, runner: Arc<dyn PortCommandRunner>) -> Self {
@@ -2121,13 +2257,20 @@ impl ReadOnlyMuxStateSource {
         // Amp snapshots are stamped with the log's mtime; a row with newer
         // activity came from a live event (such as the Amp plugin) that the
         // log has not caught up with, so the older snapshot must not win.
+        // That row may live in another session (a plugin event resolved by
+        // project dir), where the snapshot would otherwise add a duplicate.
         if snapshot.agent == "amp"
-            && let Some(existing) = existing.as_ref()
-            && existing.ts > snapshot.ts
+            && let Some(thread_id) = snapshot.thread_id.as_deref()
+            && let Some(row_ts) = self
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .newest_thread_activity(snapshot.agent, thread_id)
+            && row_ts > snapshot.ts
         {
             debug_log(format!(
-                "watcher-snapshot older than tracked row session={} agent={} thread_id={:?} snapshot_ts={} row_ts={}",
-                session, snapshot.agent, snapshot.thread_id, snapshot.ts, existing.ts,
+                "watcher-snapshot older than tracked row session={} agent={} thread_id={:?} snapshot_ts={} row_ts={row_ts}",
+                session, snapshot.agent, snapshot.thread_id, snapshot.ts,
             ));
             return false;
         }
@@ -5583,7 +5726,7 @@ mod tests {
         }
 
         fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
-            ["focused", "background"]
+            ["focused", "background", "viewed"]
                 .into_iter()
                 .map(|name| opensessions_runtime::mux::MuxSessionInfo {
                     name: name.to_string(),
@@ -5607,11 +5750,25 @@ mod tests {
                 "%2" => Some(200),
                 "%3" => Some(300),
                 "%visible" => Some(400),
+                "%5" => Some(500),
+                "%6" => Some(600),
                 _ => None,
             }
         }
         fn client_tty_for_pane(&self, pane_id: &str) -> Option<String> {
             (pane_id == "%visible").then(|| "/dev/ttys009".to_string())
+        }
+        /// A second client shows session `viewed`, whose active window holds
+        /// `%5` and a window linked from `background` holding `%6`; neither
+        /// is that client's active pane.
+        fn list_viewed_panes(&self) -> Vec<opensessions_runtime::mux::ViewedPane> {
+            ["%5", "%6"]
+                .into_iter()
+                .map(|pane_id| opensessions_runtime::mux::ViewedPane {
+                    session_name: "viewed".to_string(),
+                    pane_id: pane_id.to_string(),
+                })
+                .collect()
         }
         fn get_pane_count(&self, _name: &str) -> u32 {
             1
@@ -5630,11 +5787,18 @@ mod tests {
     struct TermIgnoringProcesses {
         signals: Mutex<Vec<(u32, opensessions_runtime::hibernate::Signal)>>,
         table_reads: AtomicUsize,
+        /// How many of the first process-table reads fail (return nothing),
+        /// like a `ps` that could not run.
+        failed_table_reads: usize,
+        /// Runs during the SIGTERM grace period.
+        during_grace: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ProcessControl for TermIgnoringProcesses {
         fn process_table(&self) -> Vec<opensessions_runtime::hibernate::ProcessEntry> {
-            self.table_reads.fetch_add(1, Ordering::SeqCst);
+            if self.table_reads.fetch_add(1, Ordering::SeqCst) < self.failed_table_reads {
+                return Vec::new();
+            }
             opensessions_runtime::hibernate::parse_process_table(
                 "100 1 -zsh\n\
                  101 100 /Users/me/.amp/bin/amp threads continue T-bg\n\
@@ -5644,7 +5808,11 @@ mod tests {
                  300 1 -zsh\n\
                  301 300 vim notes.md\n\
                  400 1 -zsh\n\
-                 401 400 /Users/me/.amp/bin/amp\n",
+                 401 400 /Users/me/.amp/bin/amp\n\
+                 500 1 -zsh\n\
+                 501 500 /Users/me/.amp/bin/amp\n\
+                 600 1 -zsh\n\
+                 601 600 /Users/me/.amp/bin/amp\n",
             )
         }
 
@@ -5653,7 +5821,11 @@ mod tests {
             true
         }
 
-        fn sleep(&self, _duration: Duration) {}
+        fn sleep(&self, _duration: Duration) {
+            if let Some(during_grace) = self.during_grace.lock().unwrap().as_ref() {
+                during_grace();
+            }
+        }
     }
 
     const HIBERNATE_TEST_NOW: u64 = 1_000 + 6 * 60 * 60 * 1000 + 1;
@@ -5672,6 +5844,8 @@ mod tests {
             ("background", "T-no-agent", "idle", "%3"),
             ("background", "T-visible", "idle", "%visible"),
             ("background", "T-working", "running", "%4"),
+            ("viewed", "T-viewed", "done", "%5"),
+            ("background", "T-linked", "done", "%6"),
         ] {
             source
                 .apply_agent_event(&serde_json::json!({
@@ -5735,6 +5909,62 @@ mod tests {
         processes.signals.lock().unwrap().clear();
         assert!(!source.hibernate_idle_agent_panes());
         assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_hibernate_protects_every_session_and_pane_a_client_is_viewing() {
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings::default());
+
+        assert!(source.hibernate_idle_agent_panes());
+
+        let signalled = processes
+            .signals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect::<HashSet<_>>();
+        assert!(!signalled.contains(&501), "{signalled:?}");
+        assert!(!signalled.contains(&601), "{signalled:?}");
+        for (session, thread_id) in [("viewed", "T-viewed"), ("background", "T-linked")] {
+            assert_eq!(
+                agent_status(&source, session, thread_id).status,
+                AgentStatus::Done
+            );
+        }
+    }
+
+    #[test]
+    fn auto_hibernate_spares_an_agent_that_becomes_active_during_the_grace_period() {
+        use opensessions_runtime::hibernate::Signal;
+        let (source, processes) = hibernate_test_source(AutoHibernateSettings::default());
+        let source = Arc::new(source);
+        let resumed = Arc::downgrade(&source);
+        *processes.during_grace.lock().unwrap() = Some(Box::new(move || {
+            resumed
+                .upgrade()
+                .expect("source")
+                .apply_agent_event(&serde_json::json!({
+                    "agent": "amp",
+                    "tmuxSession": "background",
+                    "threadId": "T-bg",
+                    "status": "running",
+                    "paneId": "%1",
+                    "ts": HIBERNATE_TEST_NOW,
+                }))
+                .expect("apply running event");
+        }));
+
+        assert!(!source.hibernate_idle_agent_panes());
+
+        assert_eq!(
+            *processes.signals.lock().unwrap(),
+            vec![(101, Signal::Term)],
+            "the agent that resumed during the grace period is not killed"
+        );
+        let resumed = agent_status(&source, "background", "T-bg");
+        assert_eq!(resumed.status, AgentStatus::Running);
+        assert_eq!(resumed.pane_id.as_deref(), Some("%1"));
     }
 
     #[test]
@@ -6021,6 +6251,30 @@ mod tests {
     }
 
     #[test]
+    fn hibernation_skips_a_process_serving_a_busy_thread_tracked_elsewhere() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        // The same Amp process has another thread awaiting approval, tracked
+        // in a different session (for example from a plugin event resolved
+        // by project dir) and quiet for longer than the idle threshold.
+        home.amp_log("T-approval", 101, "awaiting_approval", 50 * HOUR_MS);
+        let (source, processes) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "amp",
+                "tmuxSession": "focused",
+                "threadId": "T-approval",
+                "status": "waiting",
+                "ts": current_time_ms() - 50 * HOUR_MS,
+            }))
+            .expect("apply agent event");
+
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn newer_activity_on_a_seeded_thread_releases_its_restored_idle_clock() {
         let home = AgentStateHome::new();
         home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
@@ -6289,6 +6543,53 @@ mod tests {
         poll.run(&source, current_time_ms());
         poll.run(&source, current_time_ms());
         assert_eq!(reads(), 2, "processes outside agent panes are remembered");
+    }
+
+    #[test]
+    fn older_log_activity_does_not_duplicate_a_thread_tracked_in_another_session() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "working", 60_000);
+        let (source, _) = restarted_source(&home);
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "amp",
+                "tmuxSession": "focused",
+                "threadId": "T-bg",
+                "status": "done",
+                "ts": current_time_ms(),
+            }))
+            .expect("apply plugin event");
+
+        AgentWatcherPoll::default().run(&source, current_time_ms());
+
+        assert!(
+            background_threads(&source).is_empty(),
+            "the pid-routed older snapshot must not add a second T-bg row"
+        );
+        assert_eq!(
+            agent_status(&source, "focused", "T-bg").status,
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn a_failed_process_table_read_is_not_remembered_as_unroutable() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "working", 0);
+        let processes = Arc::new(TermIgnoringProcesses {
+            failed_table_reads: 1,
+            ..Default::default()
+        });
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(RestartTestProvider)])
+            .with_process_control(processes.clone())
+            .with_agent_state_home(home.0.clone());
+        let mut poll = AgentWatcherPoll::default();
+
+        poll.run(&source, current_time_ms());
+        assert!(background_threads(&source).is_empty(), "ps failed");
+
+        poll.run(&source, current_time_ms());
+        assert_eq!(background_threads(&source), vec!["T-bg"]);
     }
 
     #[test]

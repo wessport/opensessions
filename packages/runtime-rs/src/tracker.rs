@@ -37,7 +37,6 @@ pub struct AgentTracker {
     /// Rows restored from durable agent state at startup rather than from a
     /// live event. Keys use the same `session\0instance` shape as unseen.
     seeded_instances: HashSet<String>,
-    active: HashSet<String>,
 }
 
 impl AgentTracker {
@@ -159,6 +158,17 @@ impl AgentTracker {
             .unwrap_or_default()
     }
 
+    /// The newest activity timestamp of any row for `agent`/`thread_id`,
+    /// in any session.
+    pub fn newest_thread_activity(&self, agent: &str, thread_id: &str) -> Option<u64> {
+        let key = instance_key(agent, Some(thread_id));
+        self.instances
+            .values()
+            .filter_map(|instances| instances.get(&key))
+            .map(|event| event.ts)
+            .max()
+    }
+
     pub fn rename_session(&mut self, session: &str, new_name: &str) {
         if let Some(mut instances) = self.instances.remove(session) {
             for event in instances.values_mut() {
@@ -195,9 +205,6 @@ impl AgentTracker {
             self.seeded_instances.remove(&old_key);
             self.seeded_instances.insert(new_key);
         }
-        if self.active.remove(session) {
-            self.active.insert(new_name.to_string());
-        }
     }
 
     pub fn mark_seen(&mut self, session: &str) -> bool {
@@ -206,9 +213,10 @@ impl AgentTracker {
             return false;
         }
 
-        if let Some(session_instances) = self.instances.get(session) {
-            for key in session_instances.keys() {
-                self.unseen_instances.remove(&self.unseen_key(session, key));
+        if let Some(session_instances) = self.instances.get_mut(session) {
+            for (key, event) in session_instances.iter_mut() {
+                event.unseen = None;
+                self.unseen_instances.remove(&format!("{session}\0{key}"));
             }
         }
         true
@@ -253,6 +261,8 @@ impl AgentTracker {
         for key in removed_keys {
             self.unseen_instances
                 .remove(&self.unseen_key(session, &key));
+            self.seeded_instances
+                .remove(&self.unseen_key(session, &key));
         }
         if should_remove_session {
             self.instances.remove(session);
@@ -287,6 +297,8 @@ impl AgentTracker {
 
             if removed {
                 self.unseen_instances
+                    .remove(&self.unseen_key(&other_session, &key));
+                self.seeded_instances
                     .remove(&self.unseen_key(&other_session, &key));
                 if empty {
                     self.instances.remove(&other_session);
@@ -339,6 +351,7 @@ impl AgentTracker {
 
         for key in unseen_to_remove {
             self.unseen_instances.remove(&key);
+            self.seeded_instances.remove(&key);
         }
         changed
     }
@@ -354,7 +367,7 @@ impl AgentTracker {
                 let keys = session_instances
                     .iter()
                     .filter(|(key, event)| {
-                        is_terminal_status(event.status)
+                        is_prunable_status(event.status)
                             && !unseen_instances.contains(&format!("{session}\0{key}"))
                             && event.liveness != Some(AgentLiveness::Alive)
                             && now.saturating_sub(event.ts) > TERMINAL_PRUNE_MS
@@ -363,6 +376,7 @@ impl AgentTracker {
                     .collect::<Vec<_>>();
                 for key in keys {
                     session_instances.remove(&key);
+                    self.seeded_instances.remove(&format!("{session}\0{key}"));
                 }
                 empty = session_instances.is_empty();
             }
@@ -373,32 +387,55 @@ impl AgentTracker {
     }
 
     /// Live agents with a known pane that have been quiet for longer than
-    /// `idle_after_ms`. Active work and sessions the user is looking at
-    /// (`protected_sessions` plus tracker-active sessions) are never returned.
+    /// `idle_after_ms`. A pane is offered only when every row bound to it
+    /// (in any session; pane ids are global) is quiet, and no busy row of
+    /// the same agent in its session has an unknown pane, because that row
+    /// may be served by the same process (for example after Claude's
+    /// `/clear`). Sessions the user is looking at (`protected_sessions`,
+    /// supplied by the server from tmux) are never returned.
     pub fn find_hibernation_candidates(
         &self,
         now_ms: u64,
         idle_after_ms: u64,
         protected_sessions: &HashSet<String>,
     ) -> Vec<HibernationCandidate> {
-        let mut candidates = self
-            .instances
-            .iter()
-            .filter(|(session, _)| {
-                !self.active.contains(*session) && !protected_sessions.contains(*session)
-            })
-            .flat_map(|(session, instances)| {
+        let is_quiet = |event: &AgentEvent| {
+            is_hibernatable_status(event.status) && now_ms.saturating_sub(event.ts) > idle_after_ms
+        };
+        let rows = || {
+            self.instances.iter().flat_map(|(session, instances)| {
                 instances
                     .iter()
-                    .filter(|(key, _)| !is_synthetic_pane_key(key))
-                    .map(move |(_, event)| (session, event))
+                    .map(move |(key, event)| (session, key, event))
             })
-            .filter(|(_, event)| {
-                event.liveness == Some(AgentLiveness::Alive)
-                    && is_hibernatable_status(event.status)
-                    && now_ms.saturating_sub(event.ts) > idle_after_ms
+        };
+        let busy_rows = || {
+            rows()
+                .filter(|(_, _, event)| event.status != AgentStatus::Hibernated && !is_quiet(event))
+        };
+        let busy_panes = busy_rows()
+            .filter_map(|(_, _, event)| event.pane_id.as_deref())
+            .collect::<HashSet<_>>();
+        let unplaced_busy_agents = busy_rows()
+            .filter(|(_, _, event)| {
+                event.pane_id.is_none() && event.liveness != Some(AgentLiveness::Exited)
             })
-            .filter_map(|(session, event)| {
+            .map(|(session, _, event)| (session.as_str(), event.agent.as_str()))
+            .collect::<HashSet<_>>();
+
+        let mut candidates = rows()
+            .filter(|(session, key, event)| {
+                !is_synthetic_pane_key(key)
+                    && !protected_sessions.contains(*session)
+                    && event.liveness == Some(AgentLiveness::Alive)
+                    && is_quiet(event)
+                    && event
+                        .pane_id
+                        .as_deref()
+                        .is_some_and(|pane_id| !busy_panes.contains(pane_id))
+                    && !unplaced_busy_agents.contains(&(session.as_str(), event.agent.as_str()))
+            })
+            .filter_map(|(session, _, event)| {
                 Some(HibernationCandidate {
                     session: session.clone(),
                     agent: event.agent.clone(),
@@ -420,7 +457,9 @@ impl AgentTracker {
     }
 
     /// Records that the candidate's agent process was stopped. The row stays
-    /// visible (restorable) with no pane and exited liveness.
+    /// visible (restorable) with no pane and exited liveness. A hibernated
+    /// seed keeps its seed mark so newer activity on its own thread can
+    /// still release it; other threads' events never supersede it.
     pub fn mark_hibernated(&mut self, candidate: &HibernationCandidate, ts: u64) -> bool {
         let Some(session_instances) = self.instances.get_mut(&candidate.session) else {
             return false;
@@ -468,8 +507,6 @@ impl AgentTracker {
     }
 
     pub fn handle_focus(&mut self, session: &str) -> bool {
-        self.active.clear();
-        self.active.insert(session.to_string());
         if self.unseen_instance_count(session) == 1 {
             return self.mark_single_unseen_seen(session);
         }
@@ -589,11 +626,6 @@ impl AgentTracker {
         changed
     }
 
-    pub fn set_active_sessions(&mut self, sessions: impl IntoIterator<Item = String>) {
-        self.active.clear();
-        self.active.extend(sessions);
-    }
-
     pub fn apply_pane_presence(
         &mut self,
         session: &str,
@@ -603,7 +635,15 @@ impl AgentTracker {
 
         let active_pane_ids = pane_agents
             .iter()
-            .map(|pane| pane.pane_id.as_str())
+            .map(|pane| pane.pane_id.clone())
+            .collect::<HashSet<_>>();
+        let titled_agent_panes = pane_agents
+            .iter()
+            .filter_map(|pane| {
+                pane.thread_name
+                    .as_ref()
+                    .map(|name| format!("{}\0{name}", pane.agent))
+            })
             .collect::<HashSet<_>>();
         let agents_with_thread_ids = pane_agents
             .iter()
@@ -776,6 +816,25 @@ impl AgentTracker {
                     }
                     continue;
                 }
+                // An untitled pane must not take a row that a titled pane
+                // names or that is already bound to another live agent pane;
+                // otherwise the row would flip between panes every pass.
+                if pane.thread_name.is_none()
+                    && self
+                        .instances
+                        .get(session)
+                        .and_then(|instances| instances.get(&watcher_entries[0]))
+                        .is_some_and(|event| {
+                            event.thread_name.as_ref().is_some_and(|name| {
+                                titled_agent_panes.contains(&format!("{}\0{name}", event.agent))
+                            }) || (event.liveness == Some(AgentLiveness::Alive)
+                                && event.pane_id.as_deref().is_some_and(|bound| {
+                                    bound != pane.pane_id && active_pane_ids.contains(bound)
+                                }))
+                        })
+                {
+                    continue;
+                }
                 if self.stamp_alive(session, &watcher_entries[0], &pane.pane_id) {
                     changed = true;
                 }
@@ -880,6 +939,22 @@ impl AgentTracker {
                             event.liveness = provisional.liveness;
                         }
                         removed_unseen_keys.push(format!("{}\0{provisional_key}", event.session));
+                    }
+                }
+            }
+            // One agent process serves one thread at a time, so a newer
+            // thread reporting from a pane (Claude `/clear`, Amp switching
+            // threads) means older threads of that agent no longer run there.
+            if let Some(pane_id) = event.pane_id.as_deref() {
+                for (other_key, other) in session_instances.iter_mut() {
+                    if *other_key != key
+                        && !is_synthetic_pane_key(other_key)
+                        && other.agent == event.agent
+                        && other.pane_id.as_deref() == Some(pane_id)
+                        && other.ts <= event.ts
+                    {
+                        other.pane_id = None;
+                        other.liveness = Some(AgentLiveness::Exited);
                     }
                 }
             }
@@ -1009,7 +1084,9 @@ impl AgentTracker {
     }
 
     /// A live event is authoritative over seeds for the same agent in its
-    /// session, except seeds bound to a different, known pane.
+    /// session, except seeds bound to a different, known pane and hibernated
+    /// seeds, which stay visible until their own thread resumes (or newer
+    /// activity on that thread releases them).
     fn supersede_seeds(&mut self, event: &AgentEvent, key: &str) {
         self.seeded_instances
             .remove(&self.unseen_key(&event.session, key));
@@ -1021,6 +1098,7 @@ impl AgentTracker {
             .filter(|(seed_key, seed)| {
                 *seed_key != key
                     && seed.agent == event.agent
+                    && seed.status != AgentStatus::Hibernated
                     && self.is_seeded(&event.session, seed_key)
                     && !matches!(
                         (event.pane_id.as_deref(), seed.pane_id.as_deref()),
@@ -1133,21 +1211,28 @@ fn is_synthetic_pane_key(key: &str) -> bool {
     key.contains(SYNTHETIC_PANE_MARKER)
 }
 
+/// Terminal states per CONTRACTS.md; only these make a row unseen.
 fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Done | AgentStatus::Error | AgentStatus::Interrupted | AgentStatus::Stale
+        AgentStatus::Done | AgentStatus::Error | AgentStatus::Interrupted
     )
 }
 
+/// Rows `prune_terminal` may drop once they are old, seen, and paneless.
+/// `stale` is not terminal, but a stale row with no live pane is as dead as
+/// a finished one.
+fn is_prunable_status(status: AgentStatus) -> bool {
+    is_terminal_status(status) || status == AgentStatus::Stale
+}
+
+/// Quiet states whose process may be stopped. `stale` is excluded: it means
+/// the last known state was running or waiting (CONTRACTS.md), so the agent
+/// may be mid-tool or holding an approval prompt.
 fn is_hibernatable_status(status: AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Idle
-            | AgentStatus::Done
-            | AgentStatus::Error
-            | AgentStatus::Interrupted
-            | AgentStatus::Stale
+        AgentStatus::Idle | AgentStatus::Done | AgentStatus::Error | AgentStatus::Interrupted
     )
 }
 
@@ -1371,6 +1456,35 @@ mod tests {
             .expect("tracked agent");
         assert_eq!(agent.pane_id.as_deref(), Some("%9"));
         assert_eq!(agent.liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn untitled_agent_pane_does_not_steal_a_title_matched_row() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(event("amp", "work", Some("T-1"), Some("Fix focus")));
+        let pane = |pane_id: &str, thread_name: Option<&str>| PanePresenceInput {
+            agent: "amp".to_string(),
+            pane_id: pane_id.to_string(),
+            active: false,
+            thread_id: None,
+            thread_name: thread_name.map(str::to_string),
+        };
+
+        for panes in [
+            vec![pane("%1", Some("Fix focus")), pane("%2", None)],
+            vec![pane("%2", None), pane("%1", Some("Fix focus"))],
+        ] {
+            tracker.apply_pane_presence("work", panes.clone());
+            assert_eq!(
+                tracker.get_agents("work")[0].pane_id.as_deref(),
+                Some("%1"),
+                "the row stays on the pane whose title names its thread"
+            );
+            assert!(
+                !tracker.apply_pane_presence("work", panes),
+                "an unchanged layout reports no change"
+            );
+        }
     }
 
     #[test]
@@ -1645,6 +1759,43 @@ mod tests {
         assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
     }
 
+    #[test]
+    fn stale_events_are_not_terminal_and_do_not_mark_rows_unseen() {
+        let mut tracker = AgentTracker::new();
+        let mut stale = event("claude-code", "work", Some("T-1"), None);
+        stale.status = AgentStatus::Stale;
+        tracker.apply_event(stale);
+
+        assert!(!tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, None);
+    }
+
+    #[test]
+    fn stale_rows_without_a_live_pane_are_still_pruned() {
+        let mut tracker = AgentTracker::new();
+        let mut stale = event("claude-code", "work", Some("T-1"), None);
+        stale.status = AgentStatus::Stale;
+        stale.ts = now_ms() - TERMINAL_PRUNE_MS - 1_000;
+        tracker.apply_event(stale);
+
+        tracker.prune_terminal();
+
+        assert!(tracker.get_agents("work").is_empty());
+    }
+
+    #[test]
+    fn mark_seen_clears_the_unseen_flag_reported_on_rows() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event("amp", "work", Some("T-1"), None, None));
+        assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+
+        assert!(tracker.mark_seen("work"));
+
+        assert!(!tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, None);
+        assert_eq!(tracker.get_state("work").unwrap().unseen, None);
+    }
+
     const IDLE_AFTER_MS: u64 = 6 * 60 * 60 * 1000;
 
     fn live_event(
@@ -1677,7 +1828,9 @@ mod tests {
             ("done", AgentStatus::Done, true),
             ("error", AgentStatus::Error, true),
             ("interrupted", AgentStatus::Interrupted, true),
-            ("stale", AgentStatus::Stale, true),
+            // Stale means the last known state was running or waiting (for
+            // example an approval prompt), so it is never hibernated.
+            ("stale", AgentStatus::Stale, false),
             ("running", AgentStatus::Running, false),
             ("tool-running", AgentStatus::ToolRunning, false),
             ("waiting", AgentStatus::Waiting, false),
@@ -1726,12 +1879,10 @@ mod tests {
     }
 
     #[test]
-    fn hibernation_candidates_skip_protected_and_active_sessions() {
+    fn hibernation_candidates_skip_protected_sessions() {
         let mut tracker = AgentTracker::new();
         tracker.apply_event(live_event("focused", "T-focused", AgentStatus::Done, "%1"));
-        tracker.apply_event(live_event("active", "T-active", AgentStatus::Done, "%2"));
         tracker.apply_event(live_event("background", "T-bg", AgentStatus::Done, "%3"));
-        tracker.set_active_sessions(["active".to_string()]);
 
         let candidates = tracker.find_hibernation_candidates(
             1_000 + IDLE_AFTER_MS + 1,
@@ -1748,6 +1899,55 @@ mod tests {
                 thread_name: Some("T-bg".to_string()),
                 pane_id: "%3".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn a_new_thread_claiming_a_pane_releases_it_from_older_threads() {
+        // Claude `/clear` starts thread B in the same process and pane as A.
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-A", AgentStatus::Done, "%1"));
+        let mut thread_b = live_event("work", "T-B", AgentStatus::Running, "%1");
+        thread_b.ts = 2_000;
+        tracker.apply_event(thread_b);
+
+        let agents = tracker.get_agents("work");
+        let thread_a = agents
+            .iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("T-A"))
+            .unwrap();
+        assert_eq!(thread_a.pane_id, None);
+        assert_eq!(thread_a.liveness, Some(AgentLiveness::Exited));
+        assert!(candidate_threads(&tracker, u64::MAX / 2).is_empty());
+    }
+
+    #[test]
+    fn a_pane_is_hibernated_only_when_every_row_bound_to_it_is_idle() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-A", AgentStatus::Idle, "%1"));
+        // An older event cannot take the pane from the newer row, so both
+        // rows stay bound to it.
+        let mut waiting = live_event("other", "T-B", AgentStatus::Waiting, "%1");
+        waiting.ts = 900;
+        tracker.apply_event(waiting);
+
+        assert!(candidate_threads(&tracker, 1_000 + IDLE_AFTER_MS + 1).is_empty());
+    }
+
+    #[test]
+    fn a_busy_row_with_an_unknown_pane_protects_its_agents_panes_in_the_session() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(live_event("work", "T-A", AgentStatus::Done, "%1"));
+        let mut unplaced = live_event("work", "T-B", AgentStatus::Waiting, "%1");
+        unplaced.pane_id = None;
+        unplaced.liveness = None;
+        tracker.apply_event(unplaced);
+        tracker.apply_event(live_event("other", "T-C", AgentStatus::Done, "%2"));
+
+        assert_eq!(
+            candidate_threads(&tracker, 1_000 + IDLE_AFTER_MS + 1),
+            ["T-C"],
+            "T-B may be running in %1, so only the other session's pane is a candidate"
         );
     }
 
@@ -2042,6 +2242,28 @@ mod tests {
         let agents = tracker.get_agents("work");
         assert_eq!(agents[0].pane_id.as_deref(), Some("%1"));
         assert_eq!(agents[0].liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn hibernated_seeds_stay_visible_when_another_thread_reports() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_seed_event(seed("T-old", 1_000, Some("%1")));
+        let candidate = tracker
+            .find_hibernation_candidates(1_000 + IDLE_AFTER_MS + 1, IDLE_AFTER_MS, &HashSet::new())
+            .pop()
+            .expect("seeded candidate");
+        assert!(tracker.mark_hibernated(&candidate, now_ms()));
+
+        let mut other = event("amp", "work", Some("T-new"), None);
+        other.ts = now_ms();
+        tracker.apply_event(other);
+
+        let old = tracker
+            .get_agents("work")
+            .into_iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("T-old"))
+            .expect("hibernated row stays until resumed");
+        assert_eq!(old.status, AgentStatus::Hibernated);
     }
 
     #[test]

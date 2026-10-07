@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, MuxWindowInfo, SidebarPane,
-    SidebarPosition,
+    SidebarPosition, ViewedPane,
 };
 use crate::tmux_scripting::{
     REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION, SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION,
@@ -195,6 +195,25 @@ impl TmuxClient {
         .lines()
         .filter(|pane_id| !pane_id.is_empty())
         .map(str::to_string)
+        .collect()
+    }
+
+    /// `(session, pane)` for every pane in the active window of every
+    /// attached session, in one batched call.
+    pub fn list_viewed_panes(&self) -> Vec<(String, String)> {
+        self.run(&[
+            "list-panes",
+            "-a",
+            "-f",
+            "#{&&:#{session_attached},#{window_active}}",
+            "-F",
+            "#{session_name}\t#{pane_id}",
+        ])
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once(SEP))
+        .filter(|(session, pane_id)| !session.is_empty() && !pane_id.is_empty())
+        .map(|(session, pane_id)| (session.to_string(), pane_id.to_string()))
         .collect()
     }
 
@@ -1196,6 +1215,17 @@ impl MuxProvider for TmuxProvider {
         self.client.list_visible_sidebar_pane_ids()
     }
 
+    fn list_viewed_panes(&self) -> Vec<ViewedPane> {
+        self.client
+            .list_viewed_panes()
+            .into_iter()
+            .map(|(session_name, pane_id)| ViewedPane {
+                session_name,
+                pane_id,
+            })
+            .collect()
+    }
+
     fn list_agent_panes(&self, session_name: &str) -> Vec<AgentPane> {
         self.client
             .list_panes(PaneScope::Session(session_name))
@@ -1249,42 +1279,27 @@ impl MuxProvider for TmuxProvider {
         _thread_id: Option<&str>,
         thread_name: Option<&str>,
     ) -> Option<String> {
-        let panes = self
+        // This pane may be killed, so never guess: an Amp thread must match
+        // its "<thread> - amp - <dir>" title exactly, and otherwise the
+        // session must have exactly one pane running the agent.
+        let mut agent_panes = self
             .client
             .list_panes(PaneScope::Session(session))
             .into_iter()
             .filter(|pane| pane.title != "opensessions-sidebar")
-            .collect::<Vec<_>>();
+            .filter(|pane| agent_from_pane(pane).as_deref() == Some(agent));
 
         if agent == "amp"
             && let Some(thread_name) = thread_name
         {
-            let matches = panes
-                .iter()
-                .filter(|pane| {
-                    pane.title.to_lowercase().starts_with("amp - ")
-                        && pane.title.contains(thread_name)
-                })
+            let matches = agent_panes
+                .filter(|pane| thread_name_from_pane(pane, agent).as_deref() == Some(thread_name))
                 .collect::<Vec<_>>();
-            if matches.len() == 1 {
-                return Some(matches[0].id.clone());
-            }
+            return (matches.len() == 1).then(|| matches[0].id.clone());
         }
 
-        let patterns = match agent {
-            "amp" => &["amp"][..],
-            "claude-code" => &["claude"][..],
-            "codex" => &["codex"][..],
-            "opencode" => &["opencode"][..],
-            _ => return None,
-        };
-        panes
-            .into_iter()
-            .find(|pane| {
-                let title = pane.title.to_lowercase();
-                patterns.iter().any(|pattern| title.contains(pattern))
-            })
-            .map(|pane| pane.id)
+        let pane = agent_panes.next()?;
+        agent_panes.next().is_none().then_some(pane.id)
     }
 
     fn resize_sidebar_pane(&self, pane_id: &str, width: u16) {
@@ -1545,13 +1560,32 @@ fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     if title == "pi" || title.starts_with("pi ") || title.starts_with('π') || command == "pi" {
         return Some("pi".to_string());
     }
-    let haystack = format!("{title} {command}");
-    for (agent, aliases) in AGENT_ALIASES {
-        if aliases.iter().any(|alias| haystack.contains(alias)) {
-            return Some((*agent).to_string());
+    // Amp titles its pane "<thread> - amp - <dir>"; the thread name may
+    // mention other agents, so the structured form wins.
+    if title.contains(AMP_TITLE_SEPARATOR) {
+        return Some("amp".to_string());
+    }
+    // Whole words only: "sample.rs" or "timestamp" must not read as Amp.
+    // The running command is more reliable than free-form title text.
+    for text in [&command, &title] {
+        let words = agent_words(text);
+        for (agent, aliases) in AGENT_ALIASES {
+            if aliases.iter().any(|alias| words.contains(alias)) {
+                return Some((*agent).to_string());
+            }
         }
     }
     None
+}
+
+const AMP_TITLE_SEPARATOR: &str = " - amp - ";
+
+/// Words of a pane title or command; hyphens and underscores stay inside a
+/// word so names like `amp-local` and `claude-code` are matched whole.
+fn agent_words(text: &str) -> Vec<&str> {
+    text.split(|ch: char| !(ch.is_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 // Keep this broad and process/title based for zero-config agent
@@ -1587,6 +1621,161 @@ fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod agent_pane_tests {
+    use super::*;
+
+    /// Serves one fixed `list-panes` table: `(pane id, command, title)`.
+    struct PaneTableRunner(Vec<(&'static str, &'static str, &'static str)>);
+
+    impl CommandRunner for PaneTableRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            let stdout = if args.first().map(String::as_str) == Some("list-panes") {
+                self.0
+                    .iter()
+                    .map(|(id, command, title)| {
+                        format!(
+                            "{id}\twork\t@1\t0\t0\t0\t/dev/ttys1\t10\t/tmp\t{command}\t{title}\t80\t24\t0\t79"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+
+    fn provider(panes: Vec<(&'static str, &'static str, &'static str)>) -> TmuxProvider {
+        TmuxProvider::new(Arc::new(PaneTableRunner(panes)))
+    }
+
+    #[test]
+    fn agent_panes_are_detected_by_whole_words_not_substrings() {
+        let provider = provider(vec![
+            ("%1", "nvim", "sample.rs"),
+            ("%2", "zsh", "timestamp"),
+            ("%3", "zsh", "campaign - notes"),
+            ("%4", "node", "Fix focus - amp - repo"),
+            ("%5", "amp", "zsh"),
+            ("%6", "node", "✳ Claude Code"),
+            ("%7", "claude", "host.local"),
+            ("%8", "codex", "repo"),
+            ("%9", "amp-local", "repo"),
+            ("%10", "node", "Debug cursor - amp - repo"),
+            ("%11", "zsh", "my-codex-notes"),
+        ]);
+
+        let agents = provider
+            .list_agent_panes("work")
+            .into_iter()
+            .map(|pane| (pane.pane_id, pane.agent, pane.thread_name))
+            .collect::<Vec<_>>();
+
+        let pane = |id: &str, agent: &str, thread: Option<&str>| {
+            (
+                id.to_string(),
+                agent.to_string(),
+                thread.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            agents,
+            vec![
+                pane("%4", "amp", Some("Fix focus")),
+                pane("%5", "amp", None),
+                pane("%6", "claude-code", None),
+                pane("%7", "claude-code", None),
+                pane("%8", "codex", None),
+                pane("%9", "amp", None),
+                pane("%10", "amp", Some("Debug cursor")),
+            ]
+        );
+    }
+
+    #[test]
+    fn viewed_panes_are_the_active_windows_of_attached_sessions() {
+        struct ViewedRunner(std::sync::Mutex<Vec<Vec<String>>>);
+        impl CommandRunner for ViewedRunner {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                self.0.lock().unwrap().push(args.to_vec());
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: "work\t%1\nwork\t%2\nreview\t%2\n".to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+        let runner = Arc::new(ViewedRunner(Default::default()));
+        let provider = TmuxProvider::new(runner.clone());
+
+        let viewed = provider
+            .list_viewed_panes()
+            .into_iter()
+            .map(|pane| (pane.session_name, pane.pane_id))
+            .collect::<Vec<_>>();
+
+        let pair = |session: &str, pane: &str| (session.to_string(), pane.to_string());
+        assert_eq!(
+            viewed,
+            vec![pair("work", "%1"), pair("work", "%2"), pair("review", "%2")]
+        );
+        assert_eq!(
+            runner.0.lock().unwrap().as_slice(),
+            [[
+                "list-panes",
+                "-a",
+                "-f",
+                "#{&&:#{session_attached},#{window_active}}",
+                "-F",
+                "#{session_name}\t#{pane_id}",
+            ]
+            .map(str::to_string)
+            .to_vec()]
+        );
+    }
+
+    #[test]
+    fn resolving_an_amp_pane_matches_the_real_title_format_or_fails() {
+        let two_amp_panes = provider(vec![
+            ("%1", "zsh", "sample.rs"),
+            ("%2", "node", "Fix focus - amp - repo"),
+            ("%3", "node", "Fix focus later - amp - repo"),
+        ]);
+        let resolve =
+            |thread_name| two_amp_panes.resolve_agent_pane_id("work", "amp", None, thread_name);
+
+        assert_eq!(resolve(Some("Fix focus")).as_deref(), Some("%2"));
+        assert_eq!(resolve(Some("Fix focus later")).as_deref(), Some("%3"));
+        assert_eq!(
+            resolve(Some("Unknown thread")),
+            None,
+            "a thread with no matching pane is not guessed"
+        );
+        assert_eq!(resolve(None), None, "two Amp panes are ambiguous");
+
+        let single = provider(vec![
+            ("%1", "zsh", "sample.rs"),
+            ("%2", "node", "Fix focus - amp - repo"),
+        ]);
+        assert_eq!(
+            single
+                .resolve_agent_pane_id("work", "amp", None, None)
+                .as_deref(),
+            Some("%2")
+        );
+        assert_eq!(
+            single.resolve_agent_pane_id("work", "codex", None, None),
+            None
+        );
+    }
 }
 
 fn shell_quote(value: &str) -> String {
