@@ -225,6 +225,13 @@ exit 0
     killServer();
   }, 15000);
 
+  test("zellij-toggle.sh starts the bin/ server and sends an authenticated toggle", async () => {
+    const { runToggle, toggles, killServer } = await fixture();
+    expect(await runToggle({}, "zellij-toggle.sh")).toBe(0);
+    expect(toggles()).toEqual(["/toggle Bearer secret"]);
+    killServer();
+  }, 15000);
+
   test("a slow running server is toggled even when its probe timed out", async () => {
     const { runToggle, startServer, toggles, killServer, files } = await fixture();
     startServer({ FAKE_SLOW_PROBES: "2" });
