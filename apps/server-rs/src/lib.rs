@@ -1303,12 +1303,15 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn mux_namespace_available(&self) -> bool {
+        // A failed listing (fork pressure, a slow server) says nothing about
+        // the namespace; only a successful empty listing means it is gone.
         self.tmux_socket_path.as_ref().is_none_or(|socket_path| {
             tmux_socket_is_live(socket_path)
-                && self
-                    .providers
-                    .iter()
-                    .any(|provider| !provider.list_sessions().is_empty())
+                && self.providers.iter().any(|provider| {
+                    provider
+                        .try_list_sessions()
+                        .is_none_or(|sessions| !sessions.is_empty())
+                })
         })
     }
 
@@ -1363,16 +1366,14 @@ impl StateSource for ReadOnlyMuxStateSource {
         self.sync_agent_pane_presence();
         self.agent_tracker.lock().unwrap().prune_terminal();
 
-        let valid_session_names = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .map(|session| session.name)
-            .collect::<Vec<_>>();
-        self.metadata_store
-            .lock()
-            .unwrap()
-            .prune_sessions(valid_session_names);
+        // Never prune on a failed listing: that would drop every session's
+        // metadata for one transient tmux error.
+        if let Some(valid_session_names) = self.try_sorted_session_names() {
+            self.metadata_store
+                .lock()
+                .unwrap()
+                .prune_sessions(valid_session_names);
+        }
 
         let providers = self
             .providers
@@ -2645,31 +2646,44 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
-        let names = self.sorted_session_names();
-        let mut session_order = self.session_order.lock().unwrap();
-        session_order.sync(names.clone());
-        if let Some(current_session) = self
+        let names = self.try_sorted_session_names();
+        let current_session = self
             .providers
             .iter()
-            .find_map(|provider| provider.get_current_session())
-        {
+            .find_map(|provider| provider.get_current_session());
+        let mut session_order = self.session_order.lock().unwrap();
+        // A failed listing must not prune the order or hidden list; fall
+        // back to the last known sessions until tmux answers again.
+        let names = match names {
+            Some(names) => {
+                session_order.sync(names.clone());
+                names
+            }
+            None => session_order.known_names(),
+        };
+        if let Some(current_session) = current_session {
             session_order.show(&current_session);
         }
         Some(session_order.apply(names))
     }
 
     fn sorted_session_names(&self) -> Vec<String> {
-        let mut sessions = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .collect::<Vec<_>>();
+        self.try_sorted_session_names().unwrap_or_default()
+    }
+
+    /// Session names in creation order, or `None` if any provider failed to
+    /// list its sessions.
+    fn try_sorted_session_names(&self) -> Option<Vec<String>> {
+        let mut sessions = Vec::new();
+        for provider in &self.providers {
+            sessions.extend(provider.try_list_sessions()?);
+        }
         sessions.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        sessions.into_iter().map(|session| session.name).collect()
+        Some(sessions.into_iter().map(|session| session.name).collect())
     }
 }
 
@@ -7211,5 +7225,109 @@ mod tests {
         source.handle_http_hook("/pane-exited", "");
 
         assert_eq!(*provider.restores.lock().unwrap(), vec![1]);
+    }
+
+    /// Lists `alpha` and `beta` until told to fail like a `tmux list-sessions`
+    /// that could not run.
+    #[derive(Default)]
+    struct FlakySessionsTestProvider {
+        failing: AtomicBool,
+    }
+
+    impl MuxProvider for FlakySessionsTestProvider {
+        fn name(&self) -> &str {
+            "flaky-sessions-test"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            self.try_list_sessions().unwrap_or_default()
+        }
+        fn try_list_sessions(&self) -> Option<Vec<opensessions_runtime::mux::MuxSessionInfo>> {
+            if self.failing.load(Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                ["alpha", "beta"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| opensessions_runtime::mux::MuxSessionInfo {
+                        name: name.to_string(),
+                        created_at: index as u64,
+                        dir: String::new(),
+                        windows: 1,
+                    })
+                    .collect(),
+            )
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn a_failed_session_listing_keeps_metadata_order_and_hidden_sessions() {
+        let order_path = std::env::temp_dir().join(format!(
+            "opensessions-flaky-order-{}-{}.json",
+            process::id(),
+            current_time_ms()
+        ));
+        let provider = Arc::new(FlakySessionsTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()])
+            .with_session_order_path(order_path.clone());
+        source.snapshot_json();
+        source
+            .metadata_store
+            .lock()
+            .unwrap()
+            .set_status("alpha", Some(("building".to_string(), None)));
+        source.handle_client_command(&serde_json::json!({
+            "type": "hide-session",
+            "name": "beta",
+        }));
+
+        provider.failing.store(true, Ordering::SeqCst);
+        source.snapshot_json();
+        provider.failing.store(false, Ordering::SeqCst);
+
+        assert!(source.metadata_store.lock().unwrap().get("alpha").is_some());
+        assert_eq!(
+            source.visible_session_names(),
+            Some(vec!["alpha".to_string()])
+        );
+        let persisted = fs::read_to_string(&order_path).unwrap_or_default();
+        let _ = fs::remove_file(&order_path);
+        assert!(persisted.contains("beta"), "{persisted}");
+    }
+
+    #[test]
+    fn a_failed_session_listing_does_not_mean_the_namespace_is_gone() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "os-flaky-{}-{}.sock",
+            process::id(),
+            current_time_ms() % 100_000
+        ));
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let provider = Arc::new(FlakySessionsTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()])
+            .with_tmux_socket_path(socket_path.clone());
+
+        provider.failing.store(true, Ordering::SeqCst);
+        let available = source.mux_namespace_available();
+        let _ = fs::remove_file(&socket_path);
+
+        assert!(available);
     }
 }

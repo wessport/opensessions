@@ -143,7 +143,18 @@ impl TmuxClient {
     }
 
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
-        parse_sessions(&self.run(&["list-sessions", "-F", session_format()]).stdout)
+        self.try_list_sessions().unwrap_or_default()
+    }
+
+    /// `None` when `list-sessions` failed transiently (tmux could not be
+    /// spawned, the server was too busy to accept), as opposed to listing no
+    /// sessions. A tmux server that is gone or exiting has no sessions.
+    pub fn try_list_sessions(&self) -> Option<Vec<SessionInfo>> {
+        let output = self.run(&["list-sessions", "-F", session_format()]);
+        if output.ok() {
+            return Some(parse_sessions(&output.stdout));
+        }
+        tmux_server_is_gone(&output.stderr).then(Vec::new)
     }
 
     pub fn list_windows(&self) -> Vec<WindowInfo> {
@@ -774,6 +785,17 @@ pub enum PaneScope<'a> {
     Window(&'a str),
 }
 
+/// Whether a failed tmux command reported that its server does not exist or
+/// is exiting, rather than a transient failure to run or reach it.
+fn tmux_server_is_gone(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("server exited")
+        || stderr.contains("lost server")
+        || (stderr.contains("error connecting to")
+            && (stderr.contains("No such file or directory")
+                || stderr.contains("Connection refused")))
+}
+
 /// tmux resolves a bare `-t name` by exact match, then prefix, then pattern,
 /// so a missing `api` silently targets `api-v2`. `=` forces an exact match.
 fn exact_session_target(session_name: &str) -> String {
@@ -807,9 +829,13 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+        self.try_list_sessions().unwrap_or_default()
+    }
+
+    fn try_list_sessions(&self) -> Option<Vec<MuxSessionInfo>> {
         let active_dirs = self.client.get_active_session_dirs();
-        self.client
-            .list_sessions()
+        let sessions = self.client.try_list_sessions()?;
+        let sessions = sessions
             .into_iter()
             .filter(|session| session.name != STASH_SESSION)
             .map(|session| MuxSessionInfo {
@@ -821,7 +847,8 @@ impl MuxProvider for TmuxProvider {
                     .unwrap_or(session.dir),
                 windows: session.window_count,
             })
-            .collect()
+            .collect();
+        Some(sessions)
     }
 
     fn state_fingerprint(&self) -> Option<u64> {
@@ -2234,6 +2261,43 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         (runner.clone(), TmuxProvider::new(runner))
+    }
+
+    #[test]
+    fn a_failed_session_listing_is_not_an_empty_one() {
+        let failing = |stderr: &str| {
+            TmuxProvider::new(Arc::new(PanePidRunner {
+                output: CommandOutput {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                },
+                calls: Mutex::new(Vec::new()),
+            }))
+        };
+        assert_eq!(
+            pane_pid_provider(0, "").1.try_list_sessions(),
+            Some(Vec::new())
+        );
+        for transient in [
+            "No such file or directory (os error 2)",
+            "error connecting to /tmp/tmux-501/default (Resource temporarily unavailable)",
+            "",
+        ] {
+            assert_eq!(failing(transient).try_list_sessions(), None, "{transient}");
+        }
+        for gone in [
+            "no server running on /tmp/tmux-501/default",
+            "error connecting to /tmp/tmux-501/default (No such file or directory)",
+            "server exited unexpectedly",
+        ] {
+            assert_eq!(
+                failing(gone).try_list_sessions(),
+                Some(Vec::new()),
+                "{gone}"
+            );
+        }
+        assert!(failing("").list_sessions().is_empty());
     }
 
     #[test]

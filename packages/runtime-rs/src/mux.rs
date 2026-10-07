@@ -66,6 +66,12 @@ pub trait MuxProvider: Send + Sync {
 
     fn name(&self) -> &str;
     fn list_sessions(&self) -> Vec<MuxSessionInfo>;
+    /// Like `list_sessions`, but `None` when listing failed rather than found
+    /// no sessions. Callers that prune or persist state, or decide the mux
+    /// namespace is gone, must not treat a failed listing as empty.
+    fn try_list_sessions(&self) -> Option<Vec<MuxSessionInfo>> {
+        Some(self.list_sessions())
+    }
 
     fn state_fingerprint(&self) -> Option<u64> {
         let sessions = self.list_sessions();

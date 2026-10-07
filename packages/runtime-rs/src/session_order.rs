@@ -42,6 +42,11 @@ impl SessionOrder {
         }
     }
 
+    /// Every session name currently in the order, hidden ones included.
+    pub fn known_names(&self) -> Vec<String> {
+        self.order.clone()
+    }
+
     pub fn set_visible_order(&mut self, visible_names: Vec<String>) {
         let visible_set = visible_names.iter().cloned().collect::<BTreeSet<_>>();
         let mut order = visible_names;
