@@ -2517,12 +2517,30 @@ mod tests {
     impl FakeTmux {
         fn new(name: &str, script: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
+            const PROBE: &str = "__opensessions_fake_tmux_probe__";
             let path = std::env::temp_dir().join(format!(
                 "opensessions-fake-tmux-{name}-{}",
                 std::process::id()
             ));
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n[ \"$1\" = {PROBE} ] && exit 0\n{script}\n"),
+            )
+            .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // On Linux, a child forked by another test thread while the script
+            // was open for writing can briefly keep it "busy", so executing it
+            // right away fails with ETXTBSY. Probe until it runs; after that no
+            // inherited write handle can remain.
+            for _ in 0..200 {
+                match std::process::Command::new(&path).arg(PROBE).status() {
+                    Ok(_) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("fake tmux {path:?} is not executable: {err}"),
+                }
+            }
             Self(path)
         }
 
