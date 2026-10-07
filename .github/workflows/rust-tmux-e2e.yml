@@ -3,7 +3,7 @@ name: Rust tmux E2E
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, rust-main]
 
 jobs:
   tmux-e2e:
@@ -14,16 +14,29 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 tmux
+          sudo apt-get install -y git python3 tmux dash curl
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Build binaries used by tmux E2E
         run: cargo build --workspace --bins
 
-      - name: Run tmux sidebar E2E
-        run: cargo test -p opensessions-sidebar --test tmux_e2e -- --nocapture
+      # Unit tests, private-socket tmux integration tests, and the tmux sidebar
+      # E2E suite, all against the runner's tmux (3.4 on Ubuntu 24.04).
+      - name: Run Rust tests
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Run script and integration tests
+        run: bun test scripts/
