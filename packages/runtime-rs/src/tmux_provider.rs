@@ -7,16 +7,15 @@ use crate::mux::{
     SidebarPosition,
 };
 use crate::tmux_scripting::{
-    SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION, hook_context_format, http_hook_command,
-    pane_died_hook_command, pane_exited_hook_command, resized_pane_width_repair_command,
-    sidebar_mouse_resize_marker_script, sidebar_mouse_resize_report_script,
+    REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION, SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION,
+    hook_context_format, http_hook_command, pane_died_hook_command, pane_exited_hook_command,
+    resized_pane_width_repair_command, sidebar_mouse_resize_marker_script,
+    sidebar_mouse_resize_report_script,
 };
 
 const SEP: &str = "\t";
 const STASH_SESSION: &str = "_os_stash";
 const OPENSESSIONS_HOOK_INDEX: u16 = 909;
-const REMAIN_ON_EXIT_PREVIOUS_OPTION: &str = "@opensessions_remain_on_exit_previous";
-const REMAIN_ON_EXIT_INHERITED: &str = "__inherited__";
 /// Tmux-server-scoped record of the user's last explicit sidebar show/hide
 /// choice. It intentionally survives opensessions server restarts and hook
 /// cleanup, and disappears with the tmux server itself.
@@ -448,35 +447,105 @@ impl TmuxClient {
     /// the `pane-died` hook removes their panes, so a sidebar-pane scan would
     /// skip windows and leave them with `remain-on-exit on`.
     pub fn restore_remain_on_exit_for_marked_windows(&self) {
+        for (window_id, previous) in self.remain_on_exit_marked_windows() {
+            self.restore_window_remain_on_exit(&window_id, &previous);
+        }
+    }
+
+    /// Restores `remain-on-exit` on marked windows that no longer have a
+    /// sidebar pane (hidden by toggle or killed by hand), and removes their
+    /// dead content panes that the restored value would not have kept.
+    /// Otherwise panes the user exits there linger as "Pane is dead".
+    pub fn restore_remain_on_exit_for_windows_without_sidebar(&self) {
+        let marked = self.remain_on_exit_marked_windows();
+        if marked.is_empty() {
+            return;
+        }
+        let listing = self.run(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_dead}\t#{pane_dead_status}",
+        ]);
+        if !listing.ok() {
+            return;
+        }
+        let panes = listing
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let parts = split(line);
+                (parts.len() >= 5)
+                    .then(|| (parts[0], parts[1], parts[2], parts[3] == "1", parts[4]))
+            })
+            .collect::<Vec<_>>();
+        let mut global = None;
+        for (window_id, previous) in marked {
+            let window_panes = panes
+                .iter()
+                .filter(|(window, ..)| *window == window_id)
+                .collect::<Vec<_>>();
+            if window_panes.is_empty()
+                || window_panes
+                    .iter()
+                    .any(|(_, _, title, ..)| *title == "opensessions-sidebar")
+            {
+                continue;
+            }
+            self.restore_window_remain_on_exit(&window_id, &previous);
+            let effective = if previous == REMAIN_ON_EXIT_INHERITED {
+                global
+                    .get_or_insert_with(|| {
+                        self.run(&["show-options", "-gwv", "remain-on-exit"]).stdout
+                    })
+                    .clone()
+            } else {
+                previous
+            };
+            for (_, pane_id, _, dead, status) in window_panes {
+                let kept = effective == "on" || (effective == "failed" && *status != "0");
+                if *dead && !kept {
+                    self.kill_pane(pane_id);
+                }
+            }
+        }
+    }
+
+    /// Windows carrying the saved-value marker, found by marker rather than
+    /// by sidebar panes: during shutdown sidebar clients exit before cleanup
+    /// and the `pane-died` hook removes their panes.
+    fn remain_on_exit_marked_windows(&self) -> Vec<(String, String)> {
         let format = format!("#{{window_id}}{SEP}#{{{REMAIN_ON_EXIT_PREVIOUS_OPTION}}}");
         let output = self.run(&["list-windows", "-a", "-F", &format]);
         let mut seen_windows = HashSet::new();
-        for line in output.stdout.lines() {
-            let Some((window_id, previous)) = line.split_once(SEP) else {
-                continue;
-            };
-            if previous.is_empty() || !seen_windows.insert(window_id) {
-                continue;
-            }
-            if previous == REMAIN_ON_EXIT_INHERITED {
-                self.run(&["set-window-option", "-t", window_id, "-u", "remain-on-exit"]);
-            } else {
-                self.run(&[
-                    "set-window-option",
-                    "-t",
-                    window_id,
-                    "remain-on-exit",
-                    previous,
-                ]);
-            }
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once(SEP))
+            .filter(|(window_id, previous)| !previous.is_empty() && seen_windows.insert(*window_id))
+            .map(|(window_id, previous)| (window_id.to_string(), previous.to_string()))
+            .collect()
+    }
+
+    fn restore_window_remain_on_exit(&self, window_id: &str, previous: &str) {
+        if previous == REMAIN_ON_EXIT_INHERITED {
+            self.run(&["set-window-option", "-t", window_id, "-u", "remain-on-exit"]);
+        } else {
             self.run(&[
                 "set-window-option",
                 "-t",
                 window_id,
-                "-u",
-                REMAIN_ON_EXIT_PREVIOUS_OPTION,
+                "remain-on-exit",
+                previous,
             ]);
         }
+        self.run(&[
+            "set-window-option",
+            "-t",
+            window_id,
+            "-u",
+            REMAIN_ON_EXIT_PREVIOUS_OPTION,
+        ]);
     }
 
     pub fn split_sidebar_pane(
@@ -1126,6 +1195,11 @@ impl MuxProvider for TmuxProvider {
 
     fn prepare_sidebar_window(&self, window_id: &str) {
         self.client.ensure_window_remain_on_exit(window_id);
+    }
+
+    fn restore_windows_without_sidebar(&self) {
+        self.client
+            .restore_remain_on_exit_for_windows_without_sidebar();
     }
 
     fn focus_pane(&self, pane_id: &str) {

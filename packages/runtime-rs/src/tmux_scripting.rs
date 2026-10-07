@@ -1,6 +1,12 @@
 const SIDEBAR_PANE_TITLE: &str = "opensessions-sidebar";
 const SIDEBAR_WIDTH_OPTION: &str = "@opensessions_width";
 pub const SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION: &str = "@opensessions_mouse_resize_window";
+/// Window option holding the window's `remain-on-exit` value from before
+/// opensessions forced it `on` for a sidebar window.
+pub const REMAIN_ON_EXIT_PREVIOUS_OPTION: &str = "@opensessions_remain_on_exit_previous";
+/// `REMAIN_ON_EXIT_PREVIOUS_OPTION` value for a window that had no local
+/// `remain-on-exit` and inherited the global one.
+pub const REMAIN_ON_EXIT_INHERITED: &str = "__inherited__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxVar {
@@ -234,14 +240,40 @@ pub fn pane_died_hook_command(base: &str, token_file: &str) -> String {
     )
 }
 
+/// `pane-died` handler. opensessions forces `remain-on-exit on` in sidebar
+/// windows so that the last content pane's exit closes the window instead of
+/// leaving a lone sidebar. The dead pane is then removed exactly when the
+/// user's own `remain-on-exit` (saved in `REMAIN_ON_EXIT_PREVIOUS_OPTION`)
+/// would not have kept it: never for a user's `on`, only clean exits for
+/// `failed`. Dead sidebar panes are always removed. A window that no longer
+/// has a sidebar gets its original `remain-on-exit` back.
 pub fn close_dead_content_pane_pipeline() -> String {
-    let pane_title = TmuxVar::PaneTitle.format().render_for_hook();
+    let is_sidebar = sidebar_pane_filter().render_for_hook();
     let pane_dead = TmuxFormat::var_name("pane_dead").render_for_hook();
+    let pane_dead_status = TmuxFormat::var_name("pane_dead_status").render_for_hook();
+    let previous = TmuxFormat::var_name(REMAIN_ON_EXIT_PREVIOUS_OPTION).render_for_hook();
+    let window_id = TmuxFormat::var_name("window_id").render_for_hook();
     let session_id = TmuxFormat::var_name("session_id").render_for_hook();
+    let pane_id = TmuxVar::PaneId.format().render_for_hook();
     let client_tty = TmuxFormat::var_name("client_tty").render_for_hook();
+    let info = [
+        window_id.as_str(),
+        session_id.as_str(),
+        is_sidebar.as_str(),
+        previous.as_str(),
+        pane_dead_status.as_str(),
+    ]
+    .join("|");
+    let rows = [
+        pane_id.as_str(),
+        is_sidebar.as_str(),
+        pane_dead.as_str(),
+        pane_dead_status.as_str(),
+    ]
+    .join("|");
 
     format!(
-        "pane='#{{hook_pane}}'; set -- $(tmux display-message -p -t \"$pane\" '##{{window_id}} ##{{session_id}}'); window=$1; session=$2; counts=$(tmux list-panes -t \"$window\" -F '{pane_title}\t{pane_dead}' | awk -F '\\t' '{{ if ($1==\"opensessions-sidebar\") sidebars++; else if ($2!=\"1\") live++ }} END {{ print sidebars+0, live+0 }}'); set -- $counts; if [ \"$1\" -gt 0 ]; then if [ \"$2\" -eq 0 ]; then windows=$(tmux list-windows -t \"$session\" -F x | wc -l | tr -d ' '); if [ \"$windows\" -le 1 ]; then fallback=$(tmux list-sessions -F '{session_id}' | awk -v s=\"$session\" '$0 != s {{ print; exit }}'); tmux list-clients -t \"$session\" -F '{client_tty}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux switch-client -c \"$client\" -t \"$fallback\" >/dev/null 2>&1 || true; done; fi; tmux kill-window -t \"$window\" >/dev/null 2>&1 || true; else tmux kill-pane -t \"$pane\" >/dev/null 2>&1 || true; fi; fi"
+        "pane='#{{hook_pane}}'; tmux display-message -p -t \"$pane\" '{info}' | {{ IFS='|' read -r window session sidebar previous status; [ -n \"$window\" ] || exit 0; effective=on; if [ \"$previous\" = '{REMAIN_ON_EXIT_INHERITED}' ]; then effective=$(tmux show-options -gwv remain-on-exit); elif [ -n \"$previous\" ]; then effective=$previous; fi; if [ \"$sidebar\" != 1 ]; then [ \"$effective\" = on ] && exit 0; [ \"$effective\" = failed ] && [ \"$status\" != 0 ] && exit 0; fi; counts=$(tmux list-panes -t \"$window\" -F '{rows}' | awk -F '|' -v pane=\"$pane\" -v keep=\"$effective\" '{{ if ($2==\"1\") sidebars++; else if ($1!=pane && ($3!=\"1\" || keep==\"on\" || (keep==\"failed\" && $4!=\"0\"))) remaining++ }} END {{ print sidebars+0, remaining+0 }}'); set -- $counts; if [ \"$1\" -eq 0 ] && [ -n \"$previous\" ]; then if [ \"$previous\" = '{REMAIN_ON_EXIT_INHERITED}' ]; then tmux set-window-option -t \"$window\" -u remain-on-exit; else tmux set-window-option -t \"$window\" remain-on-exit \"$previous\"; fi; tmux set-window-option -t \"$window\" -u {REMAIN_ON_EXIT_PREVIOUS_OPTION}; fi; if [ \"$1\" -gt 0 ] && [ \"$2\" -eq 0 ]; then windows=$(tmux list-windows -t \"$session\" -F x | wc -l | tr -d ' '); if [ \"$windows\" -le 1 ]; then fallback=$(tmux list-sessions -F '{session_id}' | awk -v s=\"$session\" '$0 != s {{ print; exit }}'); tmux list-clients -t \"$session\" -F '{client_tty}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux switch-client -c \"$client\" -t \"$fallback\" >/dev/null 2>&1 || true; done; fi; tmux kill-window -t \"$window\" >/dev/null 2>&1 || true; else tmux kill-pane -t \"$pane\" >/dev/null 2>&1 || true; fi; }}"
     )
 }
 

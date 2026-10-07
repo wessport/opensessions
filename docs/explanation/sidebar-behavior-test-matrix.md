@@ -22,6 +22,7 @@ The intended test surface is product E2E only: each test creates real fake git r
 | A single resize immediately followed by a switch is adopted from the source window even if no prior drag report established an owner. | `tmux_sidebar_single_resize_immediately_before_switch_is_adopted` |
 | Returning to a stale session keeps evenly split content panes, and a proportional repair computed before a window resize is never applied after it. | `tmux_sidebar_preserves_even_content_panes_when_returning_to_stale_session`, `tmux_sidebar_proportional_repair_skips_stale_content_widths_after_window_resize` |
 | Shutdown restores each window's original `remain-on-exit` even after sidebar panes have already exited. | `tmux_sidebar_preserves_unrelated_indexed_hooks_across_startup_and_shutdown` |
+| A sidebar window with the user's own `remain-on-exit on` keeps both previously dead and newly exited panes. | `tmux_sidebar_pane_death_preserves_an_unrelated_retained_pane` |
 | Session switching remains responsive while 100 websocket sidebar clients are connected and state broadcasts are bursting. | `tmux_sidebar_switch_stays_responsive_with_100_connected_clients` |
 
 ## Important Invariants Covered Indirectly
