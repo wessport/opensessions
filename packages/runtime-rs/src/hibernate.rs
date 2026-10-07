@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::subprocess::{PROCESS_PROBE_TIMEOUT, output_with_timeout};
+
 /// How often the server looks for idle agents to hibernate.
 pub const HIBERNATE_POLL_INTERVAL_MS: u64 = 5 * 60 * 1000;
 /// How long a SIGTERM'd agent gets to exit before it is SIGKILLed. Amp ignores
@@ -81,23 +83,25 @@ pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
     fn process_table(&self) -> Vec<ProcessEntry> {
-        Command::new("ps")
-            .args(["-axo", "pid=,ppid=,args="])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| parse_process_table(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or_default()
+        output_with_timeout(
+            Command::new("ps").args(["-axo", "pid=,ppid=,args="]),
+            PROCESS_PROBE_TIMEOUT,
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_process_table(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
     }
 
     fn signal(&self, pid: u32, signal: Signal) -> bool {
         if pid <= 1 {
             return false;
         }
-        Command::new("kill")
-            .args([signal.flag(), &pid.to_string()])
-            .output()
-            .is_ok_and(|output| output.status.success())
+        output_with_timeout(
+            Command::new("kill").args([signal.flag(), &pid.to_string()]),
+            PROCESS_PROBE_TIMEOUT,
+        )
+        .is_ok_and(|output| output.status.success())
     }
 }
 
