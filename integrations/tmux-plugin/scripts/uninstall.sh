@@ -12,25 +12,38 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "opensessions: uninstalling..."
 
+# --- Stop the server ---
+# A running server removes its own hooks, bindings, and sidebars on /quit.
+curl -s -o /dev/null -m 2 -H "Authorization: Bearer $(auth_token)" -X POST "http://${HOST}:${PORT}/quit" 2>/dev/null || true
+echo "  ✓ stopped server (if running)"
+
 # --- Remove global hooks ---
+# The server installs every hook in its own array slot (OPENSESSIONS_HOOK_INDEX
+# in packages/runtime-rs/src/tmux_provider.rs) so user hooks in other slots
+# survive. Unset only that slot, for every hook the server installs
+# (TmuxProvider::cleanup_hooks), in case the server was not running.
+OPENSESSIONS_HOOK_INDEX=909
 for hook in \
   client-session-changed \
+  after-select-pane \
   session-created \
   after-new-session \
   session-closed \
-  client-resized \
   after-select-window \
   after-new-window \
+  client-resized \
   after-kill-pane \
   pane-exited \
-  after-resize-pane; do
-  tmux set-hook -gu "$hook" 2>/dev/null || true
+  pane-died \
+  after-resize-pane \
+  after-resize-window; do
+  tmux set-hook -gu "${hook}[${OPENSESSIONS_HOOK_INDEX}]" 2>/dev/null || true
 done
-echo "  ✓ removed global hooks"
+echo "  ✓ removed opensessions global hooks"
 
 # --- Kill sidebar panes ---
 # Find all panes titled "opensessions-sidebar" and kill them
-sidebar_panes=$(tmux list-panes -a -F '#{pane_id} #{pane_title}' 2>/dev/null | grep 'opensessions-sidebar' | awk '{print $1}') || true
+sidebar_panes=$(tmux list-panes -a -F '#{pane_id} #{pane_title}' 2>/dev/null | awk '$2 == "opensessions-sidebar" { print $1 }') || true
 if [ -n "$sidebar_panes" ]; then
   for pane in $sidebar_panes; do
     tmux kill-pane -t "$pane" 2>/dev/null || true
@@ -41,10 +54,6 @@ fi
 # --- Kill stash session ---
 tmux kill-session -t "_os_stash" 2>/dev/null || true
 echo "  ✓ removed stash session"
-
-# --- Kill the server ---
-curl -s -o /dev/null -H "Authorization: Bearer $(auth_token)" -X POST "http://${HOST}:${PORT}/quit" 2>/dev/null || true
-echo "  ✓ stopped server (if running)"
 
 # --- Remove keybindings ---
 # Command table bindings (opensessions key table)
@@ -81,6 +90,7 @@ echo "  ✓ removed keybindings"
 
 # --- Remove recorded sidebar visibility ---
 tmux set-option -gu @opensessions_sidebar_visible 2>/dev/null || true
+tmux set-option -gu @opensessions_width 2>/dev/null || true
 
 # --- Remove environment variables ---
 tmux set-environment -gu OPENSESSIONS_DIR 2>/dev/null || true
