@@ -316,3 +316,81 @@ exec "${realTmux}" -S "${socket}" "$@"
     expect(stashPanes()).not.toContain(sidebar);
   }, 20000);
 });
+
+describe("install-binaries.sh", () => {
+  const triples: Record<string, string> = {
+    "Darwin arm64": "aarch64-apple-darwin",
+    "Darwin x86_64": "x86_64-apple-darwin",
+    "Linux x86_64": "x86_64-unknown-linux-gnu",
+    "Linux aarch64": "aarch64-unknown-linux-gnu",
+  };
+  const uname = spawnSync("uname", ["-sm"], { encoding: "utf8" }).stdout.trim();
+  const triple = triples[uname];
+
+  test.skipIf(!triple)("concurrent installs publish one complete bin/ directory", async () => {
+    const dir = tempDir("os-install-");
+    const release = join(dir, "release", "v9.9.9");
+    const payload = join(dir, "payload");
+    const plugin = join(dir, "plugin");
+    mkdirSync(release, { recursive: true });
+    mkdirSync(payload);
+    mkdirSync(plugin);
+    writeFileSync(join(plugin, "package.json"), '{ "version": "9.9.9" }\n');
+    for (const name of ["opensessions-sidebar", "opensessions-server", "lazydiff"]) {
+      writeExecutable(join(payload, name), "#!/bin/sh\n");
+    }
+    const artifact = join(release, `opensessions-sidebar-${triple}.tar.gz`);
+    expect(spawnSync("tar", ["-czf", artifact, "-C", payload, "."]).status).toBe(0);
+    const sum = new Bun.CryptoHasher("sha256").update(readFileSync(artifact)).digest("hex");
+    writeFileSync(`${artifact}.sha256`, `${sum}  opensessions-sidebar-${triple}.tar.gz\n`);
+
+    const env = { ...process.env, OPENSESSIONS_RELEASE_BASE: `file://${join(dir, "release")}` };
+    delete env.OPENSESSIONS_SKIP_BINARY_DOWNLOAD;
+    delete env.OPENSESSIONS_RELEASE_VERSION;
+    const runs = Array.from({ length: 4 }, () =>
+      new Promise<number>((done) => {
+        const child = spawn("sh", [join(scriptsDir, "install-binaries.sh"), plugin], { env, stdio: "ignore" });
+        child.on("exit", (code) => done(code ?? -1));
+      }),
+    );
+    expect(await Promise.all(runs)).toEqual([0, 0, 0, 0]);
+    const entries = spawnSync("ls", ["-A", join(plugin, "bin")], { encoding: "utf8" }).stdout.trim().split("\n").sort();
+    expect(entries).toEqual([
+      ".opensessions-release-source",
+      ".opensessions-version",
+      "lazydiff",
+      "opensessions-server",
+      "opensessions-sidebar",
+    ]);
+    const leftovers = spawnSync("ls", ["-A", plugin], { encoding: "utf8" }).stdout.trim().split("\n").sort();
+    expect(leftovers).toEqual(["bin", "package.json"]);
+  }, 30000);
+});
+
+describe("server-common.sh tmux environment parsing", () => {
+  test("ignores variables marked for removal and keeps '=' in values", () => {
+    const dir = tempDir("os-env-");
+    writeExecutable(
+      join(dir, "tmux"),
+      `#!/bin/sh
+case "$3" in
+  OPENSESSIONS_PORT) echo "-OPENSESSIONS_PORT" ;;
+  OPENSESSIONS_TOKEN_FILE) echo "OPENSESSIONS_TOKEN_FILE=/tmp/a=b.token" ;;
+  *) exit 1 ;;
+esac
+`,
+    );
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      PATH: `${dir}:${process.env.PATH}`,
+      SCRIPT_DIR: scriptsDir,
+    };
+    delete env.TMUX;
+    delete env.OPENSESSIONS_SERVER_KEY;
+    const result = spawnSync("sh", ["-c", '. "$SCRIPT_DIR/server-common.sh"; printf "%s|%s" "$PORT" "$TOKEN_FILE"'], {
+      env,
+      encoding: "utf8",
+    });
+    expect(result.stdout).toBe("7391|/tmp/a=b.token");
+  });
+});
