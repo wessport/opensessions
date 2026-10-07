@@ -115,7 +115,7 @@ The accepted rule set is:
 - `after-resize-pane` starts direct background repair of only the pane that triggered the hook, except while that pane's window carries the short-lived mouse-resize marker; it fires during our own repairs, so it must remain idempotent and must not launch a global scan
 - OpenSessions extends only tmux's default `MouseDrag1Border resize-pane -M` binding; an existing custom border binding is preserved rather than overwritten
 - `after-kill-pane`, `pane-exited`, `after-resize-window`, and `client-resized` request server-owned global repair; queued requests settle for 50 ms and coalesce into one pass
-- `pane-exited` also notifies the server for orphan-sidebar cleanup
+- `pane-exited` (and `pane-died`) also notify the server for orphan-sidebar cleanup and the dead-pane sweep
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - global repair is single-flight: a request that arrives during a pass causes one follow-up pass rather than concurrent work, and every pass reads the latest configured width
 - each provider starts a global pass with one mux invocation when possible, then uses independent race-tolerant pane repairs so interactive commands can interleave
@@ -215,6 +215,9 @@ These are non-negotiable:
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
 - `remain-on-exit` is forced `on` only while a window has a sidebar (the prior value is saved in `@opensessions_remain_on_exit_previous`); hiding the sidebar, a sidebar pane exiting or being killed, and shutdown restore the saved value, so panes in sidebar-less windows exit normally instead of lingering as "Pane is dead"
 - the `pane-died` hook removes a dead content pane only when the user's saved `remain-on-exit` would not have kept it (never for `on`, clean exits only for `failed`); dead sidebar panes are always removed, and a window found without a sidebar gets its saved value back
+- `pane-died` is best-effort: tmux 3.4 (Ubuntu 24.04) runs no hook at all for a sizeable share of pane deaths (those for which it never records an exit status), so the server sweeps dead panes as a fallback with the same rules (`MuxProvider::close_dead_content_panes`): every window with a sidebar or a saved `remain-on-exit`, one `list-panes -a` read, then only the option, kill, and fallback-switch commands the hook would have run; closing a window is guarded by its listed pane count so a pane created after the read is never taken along. The rules live in `dead_pane_cleanup` (Rust) and the hook script, and a unit test runs the script against every case to keep them identical
+- a dead pane without a recorded exit status counts as failed, as tmux itself treats it: under the user's `failed` it is kept (tmux 3.4 alone keeps it too), under `off` it is removed
+- the sweep runs whenever the tmux state fingerprint changes (it covers `pane_dead`, so a death is noticed by the next poll: 2 s while active, up to 30 s when idle) and on every `/pane-exited` request, which catches a pane whose hook was skipped when a sibling's hook did run
 - target sessions by exact name (`=name`, or `=name:` for window/pane targets); a bare `-t name` falls back to prefix/pattern matches and can act on another session
 
 ## Per-tmux-server Technical Contract
@@ -245,7 +248,7 @@ The control plane may have a sidebar process in every managed window, but only s
 
 Server backstops are adaptive rather than fixed-rate full snapshots:
 
-- tmux topology/focus fingerprints back off while unchanged, and only a changed fingerprint builds a complete state snapshot
+- tmux topology/focus fingerprints back off while unchanged, and only a changed fingerprint builds a complete state snapshot and sweeps dead panes (one extra `list-panes -a` when nothing is dead)
 - agent filesystem scans back off while no agent is active
 - Git and port discovery run independently on a slower adaptive schedule, so routine tmux polling cannot launch Git, `ps`, or `lsof`
 - synchronous state-provider work (tmux commands, Git, `ps`, and `lsof`) runs on Tokio's blocking pool rather than the HTTP/WebSocket event loop

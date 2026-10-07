@@ -772,6 +772,14 @@ impl ReadOnlyMuxStateSource {
         Some(hasher.finish())
     }
 
+    /// Fallback for pane-death hooks the mux did not run: tmux 3.4 skips
+    /// `pane-died` for some deaths, which would leave "Pane is dead" panes.
+    fn close_dead_content_panes(&self) {
+        for provider in &self.providers {
+            provider.close_dead_content_panes();
+        }
+    }
+
     fn recorded_sidebar_visibility(&self) -> Option<bool> {
         self.providers
             .iter()
@@ -2222,6 +2230,9 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if self.is_sidebar_visible() {
                     self.request_sidebar_width_repair();
                 }
+                // Dead panes whose own pane-died hook tmux skipped (two
+                // panes dying together on tmux 3.4) go by the hook's rules.
+                self.close_dead_content_panes();
                 // One snapshot serves every sidebar; computing it per pane
                 // held the state-operation lock for seconds under load.
                 let display_names = self.sidebar_display_session_names().unwrap_or_default();
@@ -3283,30 +3294,46 @@ async fn run_tmux_state_poll_loop(
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = tokio::time::sleep(Duration::from_millis(delay)) => {
-                let fingerprint_source = source.clone();
-                let fingerprint = tokio::task::spawn_blocking(move || {
-                    fingerprint_source.tmux_state_fingerprint()
-                }).await.unwrap_or(None);
-                let Some(fingerprint) = fingerprint else {
+                if poll_tmux_state_once(&source, &state_updates, &mut last_fingerprint).await {
+                    unchanged_polls = 0;
+                } else {
                     unchanged_polls = unchanged_polls.saturating_add(1);
-                    continue;
-                };
-                if last_fingerprint == Some(fingerprint) {
-                    unchanged_polls = unchanged_polls.saturating_add(1);
-                    continue;
-                }
-                last_fingerprint = Some(fingerprint);
-                unchanged_polls = 0;
-                debug_log("tmux_state_poll_loop: state changed, broadcasting");
-                let snapshot_source = source.clone();
-                if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
-                    snapshot_source.snapshot_json()
-                }).await {
-                    let _ = state_updates.send(snapshot);
                 }
             }
         }
     }
+}
+
+/// One tmux state poll; returns whether the state changed. A change first
+/// sweeps dead panes: the fingerprint covers `pane_dead`, so a pane whose
+/// `pane-died` hook tmux skipped (tmux 3.4 drops some) is removed here by
+/// the hook's own rules. An unchanged state costs only the fingerprint.
+async fn poll_tmux_state_once(
+    source: &Arc<ReadOnlyMuxStateSource>,
+    state_updates: &broadcast::Sender<String>,
+    last_fingerprint: &mut Option<u64>,
+) -> bool {
+    let fingerprint_source = source.clone();
+    let fingerprint =
+        tokio::task::spawn_blocking(move || fingerprint_source.tmux_state_fingerprint())
+            .await
+            .unwrap_or(None);
+    let Some(fingerprint) = fingerprint else {
+        return false;
+    };
+    if *last_fingerprint == Some(fingerprint) {
+        return false;
+    }
+    *last_fingerprint = Some(fingerprint);
+    let sweep_source = source.clone();
+    let _ = tokio::task::spawn_blocking(move || sweep_source.close_dead_content_panes()).await;
+    debug_log("tmux_state_poll_loop: state changed, broadcasting");
+    let snapshot_source = source.clone();
+    if let Ok(snapshot) = tokio::task::spawn_blocking(move || snapshot_source.snapshot_json()).await
+    {
+        let _ = state_updates.send(snapshot);
+    }
+    true
 }
 
 async fn run_agent_watcher_loop(
@@ -8689,6 +8716,79 @@ mod tests {
         source.handle_http_hook("/pane-exited", "");
 
         assert_eq!(*provider.restores.lock().unwrap(), vec![1]);
+    }
+
+    /// A tmux layout whose fingerprint the test changes, counting sweeps for
+    /// dead panes whose pane-died hook never ran.
+    #[derive(Default)]
+    struct DeadPaneSweepTestProvider {
+        fingerprint: AtomicUsize,
+        sweeps: AtomicUsize,
+    }
+
+    impl MuxProvider for DeadPaneSweepTestProvider {
+        fn name(&self) -> &str {
+            "dead-pane-sweep-test"
+        }
+        fn state_fingerprint(&self) -> Option<u64> {
+            Some(self.fingerprint.load(Ordering::SeqCst) as u64)
+        }
+        fn close_dead_content_panes(&self) {
+            self.sweeps.fetch_add(1, Ordering::SeqCst);
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            Vec::new()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            0
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[tokio::test]
+    async fn tmux_state_poll_sweeps_dead_panes_whenever_tmux_state_changes() {
+        let provider = Arc::new(DeadPaneSweepTestProvider::default());
+        let source = Arc::new(ReadOnlyMuxStateSource::new(vec![provider.clone()]));
+        let (state_updates, mut snapshots) = broadcast::channel(8);
+        let mut last_fingerprint = None;
+
+        assert!(poll_tmux_state_once(&source, &state_updates, &mut last_fingerprint).await);
+        assert_eq!(provider.sweeps.load(Ordering::SeqCst), 1);
+        assert!(snapshots.try_recv().is_ok());
+
+        // An unchanged layout costs only the fingerprint.
+        assert!(!poll_tmux_state_once(&source, &state_updates, &mut last_fingerprint).await);
+        assert_eq!(provider.sweeps.load(Ordering::SeqCst), 1);
+        assert!(snapshots.try_recv().is_err());
+
+        // A pane died (the fingerprint covers `pane_dead`) without its hook.
+        provider.fingerprint.store(1, Ordering::SeqCst);
+        assert!(poll_tmux_state_once(&source, &state_updates, &mut last_fingerprint).await);
+        assert_eq!(provider.sweeps.load(Ordering::SeqCst), 2);
+        assert!(snapshots.try_recv().is_ok());
+    }
+
+    #[test]
+    fn pane_exited_hook_sweeps_dead_panes_whose_hooks_tmux_skipped() {
+        let provider = Arc::new(DeadPaneSweepTestProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()]);
+
+        source.handle_http_hook("/pane-exited", "");
+
+        assert_eq!(provider.sweeps.load(Ordering::SeqCst), 1);
     }
 
     /// Lists `alpha` and `beta` until told to fail like a `tmux list-sessions`

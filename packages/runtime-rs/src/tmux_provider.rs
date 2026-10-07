@@ -9,10 +9,11 @@ use crate::mux::{
 };
 use crate::subprocess::{TMUX_COMMAND_TIMEOUT, output_with_timeout};
 use crate::tmux_scripting::{
-    REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION, SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION,
-    hook_context_format, http_hook_command, pane_died_hook_command, pane_exited_hook_command,
-    resized_pane_width_repair_command, sidebar_mouse_resize_marker_script,
-    sidebar_mouse_resize_report_script,
+    CleanupPane, DeadPaneCleanup, REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION,
+    SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION, dead_pane_cleanup, dead_pane_is_removable,
+    effective_remain_on_exit, fallback_session_id, hook_context_format, http_hook_command,
+    pane_died_hook_command, pane_exited_hook_command, resized_pane_width_repair_command,
+    sidebar_mouse_resize_marker_script, sidebar_mouse_resize_report_script,
 };
 
 const SEP: &str = "\t";
@@ -534,19 +535,126 @@ impl TmuxClient {
                 continue;
             }
             self.restore_window_remain_on_exit(&window_id, &previous);
-            let effective = if previous == REMAIN_ON_EXIT_INHERITED {
+            let effective = effective_remain_on_exit(&previous, || {
                 global
-                    .get_or_insert_with(|| {
-                        self.run(&["show-options", "-gwv", "remain-on-exit"]).stdout
-                    })
+                    .get_or_insert_with(|| self.global_remain_on_exit())
                     .clone()
-            } else {
-                previous
-            };
+            });
             for (_, pane_id, _, dead, status) in window_panes {
-                let kept = effective == "on" || (effective == "failed" && *status != "0");
-                if *dead && !kept {
+                if *dead && dead_pane_is_removable(&effective, false, status) {
                     self.kill_pane(pane_id);
+                }
+            }
+        }
+    }
+
+    fn global_remain_on_exit(&self) -> String {
+        self.run(&["show-options", "-gwv", "remain-on-exit"]).stdout
+    }
+
+    /// Removes dead panes the way the `pane-died` hook does, for every
+    /// window with a sidebar or a saved `remain-on-exit`. tmux 3.4 skips
+    /// that hook for some pane deaths, which would leave "Pane is dead"
+    /// panes behind, so the server runs this as a fallback. It costs one
+    /// `list-panes -a` when nothing is dead; otherwise it adds only the
+    /// option, kill, and switch commands the hook would have run.
+    pub fn close_dead_content_panes(&self) {
+        let listing = self.run(&["list-panes", "-a", "-F", &dead_pane_sweep_format()]);
+        if !listing.ok() {
+            return;
+        }
+        let mut windows: Vec<SweepWindow> = Vec::new();
+        let mut seen_panes = HashSet::new();
+        for line in listing.stdout.lines() {
+            let parts = split(line);
+            if parts.len() < 8 || !seen_panes.insert(parts[3]) {
+                continue;
+            }
+            let pane = CleanupPane {
+                pane_id: parts[3].to_string(),
+                is_sidebar: parts[4] == "1",
+                dead: parts[5] == "1",
+                dead_status: parts[6].to_string(),
+            };
+            match windows.iter_mut().find(|window| window.id == parts[2]) {
+                Some(window) => window.panes.push(pane),
+                None => windows.push(SweepWindow {
+                    id: parts[2].to_string(),
+                    session_id: parts[0].to_string(),
+                    session_windows: parts[1].parse().unwrap_or(1),
+                    previous: parts[7].to_string(),
+                    panes: vec![pane],
+                }),
+            }
+        }
+        let mut global = None;
+        let mut session_ids = None;
+        let mut clients = None;
+        for window in windows {
+            let ours =
+                !window.previous.is_empty() || window.panes.iter().any(|pane| pane.is_sidebar);
+            if !ours || !window.panes.iter().any(|pane| pane.dead) {
+                continue;
+            }
+            let effective = effective_remain_on_exit(&window.previous, || {
+                global
+                    .get_or_insert_with(|| self.global_remain_on_exit())
+                    .clone()
+            });
+            match dead_pane_cleanup(&effective, &window.panes) {
+                DeadPaneCleanup::Keep => {}
+                DeadPaneCleanup::KillPanes {
+                    panes,
+                    window_has_sidebar,
+                } => {
+                    if !window_has_sidebar && !window.previous.is_empty() {
+                        self.restore_window_remain_on_exit(&window.id, &window.previous);
+                    }
+                    for pane_id in panes {
+                        self.kill_pane(&pane_id);
+                    }
+                }
+                DeadPaneCleanup::KillWindow => {
+                    let mut commands = Vec::new();
+                    if window.session_windows <= 1 {
+                        let session_ids = session_ids.get_or_insert_with(|| {
+                            self.run(&["list-sessions", "-F", "#{session_id}"])
+                                .stdout
+                                .lines()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        });
+                        if let Some(fallback) = fallback_session_id(session_ids, &window.session_id)
+                        {
+                            let clients = clients.get_or_insert_with(|| {
+                                self.run(&["list-clients", "-F", "#{client_tty}\t#{session_id}"])
+                                    .stdout
+                                    .lines()
+                                    .filter_map(|line| line.split_once(SEP))
+                                    .map(|(tty, session)| (tty.to_string(), session.to_string()))
+                                    .collect::<Vec<_>>()
+                            });
+                            for (tty, _) in clients.iter().filter(|(tty, session)| {
+                                *session == window.session_id
+                                    && !tty.is_empty()
+                                    && !tty.contains('\'')
+                            }) {
+                                commands.push(format!("switch-client -c '{tty}' -t '{fallback}'"));
+                            }
+                        }
+                    }
+                    commands.push(format!("kill-window -t '{}'", window.id));
+                    // Close the window only if no pane appeared since the
+                    // listing; a stale listing must not take a new pane along.
+                    let unchanged = format!("#{{==:#{{window_panes}},{}}}", window.panes.len());
+                    self.run(&[
+                        "if-shell",
+                        "-F",
+                        "-t",
+                        &window.id,
+                        &unchanged,
+                        &commands.join(" ; "),
+                    ]);
                 }
             }
         }
@@ -806,6 +914,29 @@ impl TmuxClient {
         }
         self.unset_global_option(SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION);
     }
+}
+
+/// A window's panes as `close_dead_content_panes` lists them.
+struct SweepWindow {
+    id: String,
+    session_id: String,
+    session_windows: u32,
+    previous: String,
+    panes: Vec<CleanupPane>,
+}
+
+fn dead_pane_sweep_format() -> String {
+    [
+        "#{session_id}",
+        "#{session_windows}",
+        "#{window_id}",
+        "#{pane_id}",
+        "#{==:#{pane_title},opensessions-sidebar}",
+        "#{pane_dead}",
+        "#{pane_dead_status}",
+        &format!("#{{{REMAIN_ON_EXIT_PREVIOUS_OPTION}}}"),
+    ]
+    .join(SEP)
 }
 
 pub enum PaneScope<'a> {
@@ -1273,6 +1404,10 @@ impl MuxProvider for TmuxProvider {
             .restore_remain_on_exit_for_windows_without_sidebar();
     }
 
+    fn close_dead_content_panes(&self) {
+        self.client.close_dead_content_panes();
+    }
+
     fn focus_pane(&self, pane_id: &str) {
         let window_id = self.client.display("#{window_id}", Some(pane_id));
         if !window_id.is_empty() {
@@ -1565,7 +1700,7 @@ fn flat_content_width_repairs(
 }
 
 fn state_fingerprint_format() -> &'static str {
-    "#{session_id}\t#{session_name}\t#{session_created}\t#{session_attached}\t#{session_windows}\t#{session_path}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_panes}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
+    "#{session_id}\t#{session_name}\t#{session_created}\t#{session_attached}\t#{session_windows}\t#{session_path}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_panes}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}"
 }
 
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
@@ -2697,5 +2832,356 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["alpha", "zeta", "mid"]);
+    }
+}
+
+#[cfg(test)]
+mod dead_pane_sweep_tests {
+    use super::*;
+    use crate::tmux_scripting::close_dead_content_pane_pipeline;
+    use std::sync::Mutex;
+
+    const DYING: &str = "%5";
+    const SIDEBAR: &str = "%4";
+    const OTHER: &str = "%6";
+    const WINDOW: &str = "@1";
+    const SESSION: &str = "$2";
+    const SESSIONS: [&str; 3] = ["$1", "$2", "$3"];
+    const CLIENT: &str = "/dev/pts/9";
+
+    #[derive(Debug, Clone, Copy)]
+    enum Other {
+        None,
+        Alive,
+        Dead(&'static str),
+    }
+
+    /// Window `@1` of session `$2` (of `$1`..`$3`, one client attached to
+    /// `$2`) where pane `%5` just died, beside an optional sidebar `%4` and
+    /// an optional content pane `%6`.
+    #[derive(Debug, Clone, Copy)]
+    struct Case {
+        previous: &'static str,
+        global: &'static str,
+        dying_is_sidebar: bool,
+        status: &'static str,
+        sidebar: bool,
+        other: Other,
+        windows: u32,
+    }
+
+    impl Case {
+        /// `(pane, is_sidebar, dead, status)` in window order.
+        fn panes(&self) -> Vec<(&'static str, bool, bool, &'static str)> {
+            let mut panes = Vec::new();
+            if self.sidebar {
+                panes.push((SIDEBAR, true, false, ""));
+            }
+            panes.push((DYING, self.dying_is_sidebar, true, self.status));
+            match self.other {
+                Other::None => {}
+                Other::Alive => panes.push((OTHER, false, false, "")),
+                Other::Dead(status) => panes.push((OTHER, false, true, status)),
+            }
+            panes
+        }
+    }
+
+    fn cases() -> Vec<Case> {
+        let mut cases = Vec::new();
+        let effectives = [
+            ("", "off"),
+            ("on", "off"),
+            ("failed", "off"),
+            ("off", "on"),
+            (REMAIN_ON_EXIT_INHERITED, "on"),
+            (REMAIN_ON_EXIT_INHERITED, "failed"),
+            (REMAIN_ON_EXIT_INHERITED, "off"),
+        ];
+        for (previous, global) in effectives {
+            for dying_is_sidebar in [false, true] {
+                // "" is a death whose status tmux 3.4 never recorded.
+                for status in ["0", "3", ""] {
+                    for sidebar in [false, true] {
+                        for other in [
+                            Other::None,
+                            Other::Alive,
+                            Other::Dead("0"),
+                            Other::Dead("3"),
+                        ] {
+                            for windows in [1, 2] {
+                                cases.push(Case {
+                                    previous,
+                                    global,
+                                    dying_is_sidebar,
+                                    status,
+                                    sidebar,
+                                    other,
+                                    windows,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    /// Mutating tmux commands the `pane-died` hook script runs for `%5` in
+    /// each case, executed by one `sh` against a `tmux` shell function that
+    /// serves the case's state.
+    fn hook_commands(cases: &[Case]) -> Vec<Vec<String>> {
+        let script = close_dead_content_pane_pipeline()
+            .replace("#{hook_pane}", DYING)
+            .replace("##", "#");
+        let mut program = String::from(
+            r#"tmux() {
+  case "$1" in
+    display-message) printf '%s\n' "$FAKE_INFO" ;;
+    show-options) printf '%s\n' "$FAKE_GLOBAL" ;;
+    list-panes) printf '%s\n' "$FAKE_ROWS" ;;
+    list-windows) i=0; while [ "$i" -lt "$FAKE_WINDOWS" ]; do echo x; i=$((i + 1)); done ;;
+    list-sessions) printf '$1\tzeta\n$2\twork\n$3\talpha\n' ;;
+    list-clients) printf '%s\n' "$FAKE_CLIENT" ;;
+    *) printf '%s\n' "$*" >&3 ;;
+  esac
+}
+"#,
+        );
+        program.push_str(&format!("hook() {{ {script}\n}}\n"));
+        for case in cases {
+            let rows = case
+                .panes()
+                .iter()
+                .map(|(pane, sidebar, dead, status)| {
+                    format!("{pane}|{}|{}|{status}", *sidebar as u8, *dead as u8)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let info = format!(
+                "{WINDOW}|{SESSION}|{}|{}|{}",
+                case.dying_is_sidebar as u8, case.previous, case.status
+            );
+            program.push_str(&format!(
+                "( FAKE_INFO={}; FAKE_GLOBAL={}; FAKE_ROWS={}; FAKE_WINDOWS={}; FAKE_CLIENT={}; hook 3>&1 >/dev/null 2>&1 ); echo '<end>'\n",
+                shell_quote(&info),
+                shell_quote(case.global),
+                shell_quote(&rows),
+                case.windows,
+                shell_quote(CLIENT),
+            ));
+        }
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(program)
+            .output()
+            .expect("run sh");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut results = vec![Vec::new()];
+        for line in stdout.lines() {
+            if line == "<end>" {
+                results.push(Vec::new());
+            } else {
+                results.last_mut().unwrap().push(line.to_string());
+            }
+        }
+        results.pop();
+        assert_eq!(results.len(), cases.len());
+        results
+    }
+
+    /// Serves one case's tmux state to `close_dead_content_panes`, with an
+    /// unrelated window `@2` (no sidebar, no saved value) holding a dead
+    /// pane, and records every other command.
+    struct CaseRunner {
+        case: Case,
+        commands: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CommandRunner for CaseRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            let case = &self.case;
+            let format = args.last().cloned().unwrap_or_default();
+            let stdout = match args.first().map(String::as_str) {
+                Some("list-panes") => {
+                    let row = |session: &str,
+                               windows: u32,
+                               window: &str,
+                               pane: &str,
+                               sidebar: bool,
+                               dead: bool,
+                               status: &str,
+                               previous: &str| {
+                        format
+                            .replace("#{session_id}", session)
+                            .replace("#{session_windows}", &windows.to_string())
+                            .replace("#{window_id}", window)
+                            .replace("#{pane_id}", pane)
+                            .replace(
+                                "#{==:#{pane_title},opensessions-sidebar}",
+                                if sidebar { "1" } else { "0" },
+                            )
+                            .replace("#{pane_dead}", if dead { "1" } else { "0" })
+                            .replace("#{pane_dead_status}", status)
+                            .replace("#{@opensessions_remain_on_exit_previous}", previous)
+                    };
+                    let mut rows = case
+                        .panes()
+                        .into_iter()
+                        .map(|(pane, sidebar, dead, status)| {
+                            row(
+                                SESSION,
+                                case.windows,
+                                WINDOW,
+                                pane,
+                                sidebar,
+                                dead,
+                                status,
+                                case.previous,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    rows.push(row("$3", 1, "@2", "%9", false, true, "0", ""));
+                    rows.join("\n")
+                }
+                Some("show-options") => case.global.to_string(),
+                Some("list-sessions") => SESSIONS.join("\n"),
+                Some("list-clients") => format!("{CLIENT}\t{SESSION}\n/dev/pts/7\t$3"),
+                _ => {
+                    self.commands.lock().unwrap().push(args.to_vec());
+                    String::new()
+                }
+            };
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+
+    /// Mutating commands the sweep runs, with a passing `if-shell` guard
+    /// expanded into its commands.
+    fn sweep_commands(case: &Case) -> Vec<String> {
+        let runner = Arc::new(CaseRunner {
+            case: *case,
+            commands: Mutex::new(Vec::new()),
+        });
+        TmuxProvider::new(runner.clone()).close_dead_content_panes();
+        let commands = runner.commands.lock().unwrap().clone();
+        commands
+            .into_iter()
+            .flat_map(|args| {
+                if args[0] == "if-shell" {
+                    let panes = case.panes().len();
+                    assert_eq!(
+                        args[..5],
+                        [
+                            "if-shell".to_string(),
+                            "-F".to_string(),
+                            "-t".to_string(),
+                            WINDOW.to_string(),
+                            format!("#{{==:#{{window_panes}},{panes}}}"),
+                        ],
+                        "{case:?}"
+                    );
+                    args[5]
+                        .split(" ; ")
+                        .map(|command| command.replace('\'', ""))
+                        .collect()
+                } else {
+                    vec![args.join(" ")]
+                }
+            })
+            .collect()
+    }
+
+    /// The hook handles only `%5`; the sweep handles every dead pane. What
+    /// the sweep does about `%5` is what the hook must do.
+    fn sweep_commands_for_dying_pane(case: &Case) -> Vec<String> {
+        let commands = sweep_commands(case);
+        let removes_dying = commands.iter().any(|command| {
+            command == &format!("kill-pane -t {DYING}") || command.starts_with("kill-window")
+        });
+        if !removes_dying {
+            return Vec::new();
+        }
+        commands
+            .into_iter()
+            .filter(|command| !command.starts_with("kill-pane") || command.ends_with(DYING))
+            .collect()
+    }
+
+    #[test]
+    fn the_sweep_and_the_pane_died_hook_agree_on_every_dead_pane() {
+        let cases = cases();
+        let mut outcomes = HashMap::<&str, usize>::new();
+        let hooks = hook_commands(&cases);
+        for (case, hook) in cases.iter().zip(hooks) {
+            assert_eq!(hook, sweep_commands_for_dying_pane(case), "{case:?}");
+            let outcome = if hook.iter().any(|c| c.starts_with("switch-client")) {
+                "switch"
+            } else if hook.iter().any(|c| c.starts_with("kill-window")) {
+                "kill-window"
+            } else if hook.iter().any(|c| c.starts_with("set-window-option")) {
+                "restore"
+            } else if hook.is_empty() {
+                "keep"
+            } else {
+                "kill-pane"
+            };
+            *outcomes.entry(outcome).or_default() += 1;
+        }
+        for outcome in ["switch", "kill-window", "restore", "keep", "kill-pane"] {
+            assert!(
+                outcomes.get(outcome).is_some_and(|n| *n > 0),
+                "{outcomes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_lists_panes_once_when_nothing_is_dead() {
+        struct Alive(Mutex<Vec<Vec<String>>>);
+        impl CommandRunner for Alive {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                self.0.lock().unwrap().push(args.to_vec());
+                CommandOutput {
+                    exit_code: 0,
+                    stdout:
+                        "$1\t1\t@1\t%1\t1\t0\t\t__inherited__\n$1\t1\t@1\t%2\t0\t0\t\t__inherited__"
+                            .to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+        let runner = Arc::new(Alive(Mutex::new(Vec::new())));
+        TmuxProvider::new(runner.clone()).close_dead_content_panes();
+        let commands = runner.0.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(
+            commands[0][..2],
+            ["list-panes".to_string(), "-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_sweep_leaves_windows_opensessions_does_not_manage_alone() {
+        let runner = Arc::new(CaseRunner {
+            case: Case {
+                previous: "",
+                global: "off",
+                dying_is_sidebar: false,
+                status: "0",
+                sidebar: false,
+                other: Other::Alive,
+                windows: 1,
+            },
+            commands: Mutex::new(Vec::new()),
+        });
+        TmuxProvider::new(runner.clone()).close_dead_content_panes();
+        assert!(runner.commands.lock().unwrap().is_empty());
     }
 }
