@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, MuxWindowInfo, SidebarPane,
-    SidebarPosition,
+    SidebarPosition, ViewedPane,
 };
 use crate::tmux_scripting::{
     REMAIN_ON_EXIT_INHERITED, REMAIN_ON_EXIT_PREVIOUS_OPTION, SIDEBAR_MOUSE_RESIZE_WINDOW_OPTION,
@@ -195,6 +195,25 @@ impl TmuxClient {
         .lines()
         .filter(|pane_id| !pane_id.is_empty())
         .map(str::to_string)
+        .collect()
+    }
+
+    /// `(session, pane)` for every pane in the active window of every
+    /// attached session, in one batched call.
+    pub fn list_viewed_panes(&self) -> Vec<(String, String)> {
+        self.run(&[
+            "list-panes",
+            "-a",
+            "-f",
+            "#{&&:#{session_attached},#{window_active}}",
+            "-F",
+            "#{session_name}\t#{pane_id}",
+        ])
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once(SEP))
+        .filter(|(session, pane_id)| !session.is_empty() && !pane_id.is_empty())
+        .map(|(session, pane_id)| (session.to_string(), pane_id.to_string()))
         .collect()
     }
 
@@ -1196,6 +1215,17 @@ impl MuxProvider for TmuxProvider {
         self.client.list_visible_sidebar_pane_ids()
     }
 
+    fn list_viewed_panes(&self) -> Vec<ViewedPane> {
+        self.client
+            .list_viewed_panes()
+            .into_iter()
+            .map(|(session_name, pane_id)| ViewedPane {
+                session_name,
+                pane_id,
+            })
+            .collect()
+    }
+
     fn list_agent_panes(&self, session_name: &str) -> Vec<AgentPane> {
         self.client
             .list_panes(PaneScope::Session(session_name))
@@ -1667,6 +1697,48 @@ mod agent_pane_tests {
                 pane("%9", "amp", None),
                 pane("%10", "amp", Some("Debug cursor")),
             ]
+        );
+    }
+
+    #[test]
+    fn viewed_panes_are_the_active_windows_of_attached_sessions() {
+        struct ViewedRunner(std::sync::Mutex<Vec<Vec<String>>>);
+        impl CommandRunner for ViewedRunner {
+            fn run(&self, args: &[String]) -> CommandOutput {
+                self.0.lock().unwrap().push(args.to_vec());
+                CommandOutput {
+                    exit_code: 0,
+                    stdout: "work\t%1\nwork\t%2\nreview\t%2\n".to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+        let runner = Arc::new(ViewedRunner(Default::default()));
+        let provider = TmuxProvider::new(runner.clone());
+
+        let viewed = provider
+            .list_viewed_panes()
+            .into_iter()
+            .map(|pane| (pane.session_name, pane.pane_id))
+            .collect::<Vec<_>>();
+
+        let pair = |session: &str, pane: &str| (session.to_string(), pane.to_string());
+        assert_eq!(
+            viewed,
+            vec![pair("work", "%1"), pair("work", "%2"), pair("review", "%2")]
+        );
+        assert_eq!(
+            runner.0.lock().unwrap().as_slice(),
+            [[
+                "list-panes",
+                "-a",
+                "-f",
+                "#{&&:#{session_attached},#{window_active}}",
+                "-F",
+                "#{session_name}\t#{pane_id}",
+            ]
+            .map(str::to_string)
+            .to_vec()]
         );
     }
 
