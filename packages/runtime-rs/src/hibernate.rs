@@ -210,18 +210,26 @@ pub fn find_agent_process(
     })
 }
 
-/// Sends SIGTERM to every target, waits once for `grace`, then SIGKILLs any
-/// captured process that is still running with the same command line.
+/// Sends SIGTERM to every target that is still running with the command line
+/// it was selected with, waits once for `grace`, then SIGKILLs any captured
+/// process that is still running with the same command line.
 pub fn terminate_agent_processes(
     control: &dyn ProcessControl,
     targets: &[AgentProcessTarget],
     grace: Duration,
 ) -> Vec<TerminationOutcome> {
+    // The targets come from an earlier process-table snapshot; re-read it so
+    // a pid recycled since then is never signalled.
+    let running = process_args_by_pid(control);
     let mut outcomes = targets
         .iter()
         .map(|target| TerminationOutcome {
             pid: target.pid,
-            terminated: control.signal(target.pid, Signal::Term),
+            terminated: target
+                .processes
+                .first()
+                .is_some_and(|process| running.get(&process.pid) == Some(&process.args))
+                && control.signal(target.pid, Signal::Term),
             escalated: false,
         })
         .collect::<Vec<_>>();
@@ -230,11 +238,7 @@ pub fn terminate_agent_processes(
     }
 
     control.sleep(grace);
-    let survivors = control
-        .process_table()
-        .into_iter()
-        .map(|entry| (entry.pid, entry.args))
-        .collect::<HashMap<_, _>>();
+    let survivors = process_args_by_pid(control);
     for (target, outcome) in targets.iter().zip(outcomes.iter_mut()) {
         if !outcome.terminated {
             continue;
@@ -250,6 +254,14 @@ pub fn terminate_agent_processes(
         }
     }
     outcomes
+}
+
+fn process_args_by_pid(control: &dyn ProcessControl) -> HashMap<u32, String> {
+    control
+        .process_table()
+        .into_iter()
+        .map(|entry| (entry.pid, entry.args))
+        .collect()
 }
 
 #[cfg(test)]
@@ -353,6 +365,9 @@ mod tests {
     }
 
     struct FakeControl {
+        /// The table before signalling; `None` means the process table is
+        /// unchanged since the target was selected.
+        table_before_term: Option<Vec<ProcessEntry>>,
         table_after_grace: Vec<ProcessEntry>,
         fail_term: HashSet<u32>,
         signals: Mutex<Vec<(u32, Signal)>>,
@@ -362,6 +377,7 @@ mod tests {
     impl FakeControl {
         fn new(table_after_grace: Vec<ProcessEntry>) -> Self {
             Self {
+                table_before_term: None,
                 table_after_grace,
                 fail_term: HashSet::new(),
                 signals: Mutex::new(Vec::new()),
@@ -372,6 +388,12 @@ mod tests {
 
     impl ProcessControl for FakeControl {
         fn process_table(&self) -> Vec<ProcessEntry> {
+            if self.slept.lock().unwrap().is_empty() {
+                return self
+                    .table_before_term
+                    .clone()
+                    .unwrap_or_else(amp_pane_table);
+            }
             self.table_after_grace.clone()
         }
 
@@ -435,6 +457,20 @@ mod tests {
 
         assert!(!outcomes[0].escalated);
         assert_eq!(*control.signals.lock().unwrap(), vec![(200, Signal::Term)]);
+    }
+
+    #[test]
+    fn does_not_term_a_pid_recycled_since_the_target_was_selected() {
+        let table = amp_pane_table();
+        let target = find_agent_process(100, "amp", &table).unwrap();
+        let mut control = FakeControl::new(table);
+        control.table_before_term = Some(vec![entry(200, 1, "/usr/bin/unrelated")]);
+
+        let outcomes = terminate_agent_processes(&control, &[target], HIBERNATE_TERM_GRACE);
+
+        assert!(!outcomes[0].terminated);
+        assert!(control.signals.lock().unwrap().is_empty());
+        assert!(control.slept.lock().unwrap().is_empty());
     }
 
     #[test]
