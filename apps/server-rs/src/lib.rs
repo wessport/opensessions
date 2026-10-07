@@ -2861,11 +2861,10 @@ impl ReadOnlyMuxStateSource {
         for provider in &self.providers {
             sessions.extend(provider.try_list_sessions()?);
         }
-        sessions.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        // `created_at` has whole-second resolution, so ties keep the
+        // provider's creation order. A name tiebreak would make the order of
+        // sessions created together depend on whether a second ticked.
+        sessions.sort_by_key(|session| session.created_at);
         Some(sessions.into_iter().map(|session| session.name).collect())
     }
 }
@@ -8109,6 +8108,71 @@ mod tests {
         assert_eq!(
             provider.spawned_windows().last().map(String::as_str),
             Some("@7")
+        );
+    }
+
+    /// Lists sessions created within one second, in creation order, the way
+    /// tmux reports `#{session_created}` with whole-second resolution.
+    struct SameSecondSessionsTestProvider;
+
+    impl MuxProvider for SameSecondSessionsTestProvider {
+        fn name(&self) -> &str {
+            "same-second-sessions-test"
+        }
+        fn list_sessions(&self) -> Vec<opensessions_runtime::mux::MuxSessionInfo> {
+            ["opensessions", "effect-ts", "lazydiff"]
+                .into_iter()
+                .map(|name| opensessions_runtime::mux::MuxSessionInfo {
+                    name: name.to_string(),
+                    created_at: 1_791_401_685,
+                    dir: String::new(),
+                    windows: 1,
+                })
+                .collect()
+        }
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16, _token_file: &str) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    /// Whether sessions created within one tmux second are listed in name
+    /// order must not depend on when the clock ticks, so `Tab` from the first
+    /// created session always reaches the second created session.
+    #[test]
+    fn tab_follows_creation_order_for_sessions_created_in_the_same_second() {
+        let source = ReadOnlyMuxStateSource::new(vec![Arc::new(SameSecondSessionsTestProvider)]);
+        let mut sidebar = app_from_state_json(&source.snapshot_json()).expect("state snapshot");
+        sidebar.apply_server_message(
+            opensessions_sidebar_core::generated::protocol::ServerMessage::YourSession {
+                name: "opensessions".to_string(),
+                client_tty: None,
+            },
+        );
+
+        sidebar.handle_tab(false);
+
+        assert_eq!(
+            sidebar.drain_commands(),
+            vec![
+                opensessions_sidebar_core::generated::protocol::ClientCommand::SwitchSession {
+                    name: "effect-ts".to_string(),
+                    client_tty: None,
+                }
+            ]
         );
     }
 }

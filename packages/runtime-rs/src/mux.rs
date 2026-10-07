@@ -73,6 +73,8 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn name(&self) -> &str;
+    /// Sessions in creation order. `created_at` may be coarse (tmux reports
+    /// whole seconds), so callers keep this order for equal timestamps.
     fn list_sessions(&self) -> Vec<MuxSessionInfo>;
     /// Like `list_sessions`, but `None` when listing failed rather than found
     /// no sessions. Callers that prune or persist state, or decide the mux

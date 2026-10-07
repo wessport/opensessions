@@ -1792,9 +1792,11 @@ fn tmux_sidebar_switch_stays_responsive_with_100_connected_clients() {
             post_refresh(lab.port, &lab.auth_token());
         }
 
+        // Sessions are ordered by creation, even within one tmux second, so
+        // the session created after `opensessions` is always next.
         let started = Instant::now();
         lab.tmux_ok(["send-keys", "-t", source.as_str(), "C-i"]);
-        lab.wait_for_client_session("os-demo-feat-agent-panel");
+        lab.wait_for_client_session("effect-ts");
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(2),
