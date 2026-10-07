@@ -38,9 +38,9 @@ If the file does not exist, opensessions falls back to defaults.
 
 ## Auto-Hibernate
 
-Idle CLI agents keep hundreds of megabytes resident for as long as their tmux pane stays open. Every 5 minutes the server looks for live agents that have been `idle`, `done`, `error`, `interrupted`, or `stale` for longer than `idleAfterMs` (default 6 hours) and stops only the agent process inside that pane. It sends `SIGTERM`, then `SIGKILL` after one second if the agent ignores `SIGTERM` (Amp does). The pane, its shell, and the tmux session are never killed, and only agent-named descendants of the pane's own process are signalled.
+Idle CLI agents keep hundreds of megabytes resident for as long as their tmux pane stays open. Every 5 minutes the server looks for live agents that have been `idle`, `done`, `error`, or `interrupted` for longer than `idleAfterMs` (default 6 hours) and stops only the agent process inside that pane. A pane is stopped only when every thread bound to it, and every busy thread of the same agent process, is that quiet. It sends `SIGTERM`, then `SIGKILL` after one second if the agent ignores `SIGTERM` (Amp does). The pane, its shell, and the tmux session are never killed, and only agent-named descendants of the pane's own process are signalled.
 
-Running, tool-running, and waiting agents are never hibernated, nor are agents in the current session or in a pane that a tmux client is showing. The agent row stays in the sidebar as `hibernated` (`◌`) so the thread can be resumed later, for example with `amp threads continue <thread-id>`.
+Running, tool-running, waiting, and `stale` agents (whose last known state was running or waiting, such as an approval prompt) are never hibernated, nor are agents in the current session or in a pane that a tmux client is showing. The agent row stays in the sidebar as `hibernated` (`◌`) so the thread can be resumed later, for example with `amp threads continue <thread-id>`.
 
 Built-in hibernation recognizes Amp, Claude Code, Codex, OpenCode, Pi, and Droid processes. Hibernation state is in memory, so it is lost when the server restarts.
 

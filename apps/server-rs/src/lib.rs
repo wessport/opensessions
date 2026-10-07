@@ -1085,6 +1085,11 @@ impl ReadOnlyMuxStateSource {
         } else {
             HashMap::new()
         };
+        let busy_amp_pids = if candidates.iter().any(|candidate| candidate.agent == "amp") {
+            self.busy_unplaced_amp_pids()
+        } else {
+            HashSet::new()
+        };
         let mut targets = Vec::<AgentProcessTarget>::new();
         let mut planned = Vec::new();
         for candidate in candidates {
@@ -1120,6 +1125,21 @@ impl ReadOnlyMuxStateSource {
             {
                 debug_log(format!(
                     "auto-hibernate: recent durable activity session={} pane={} pid={} activity={activity}",
+                    candidate.session, candidate.pane_id, target.pid,
+                ));
+                continue;
+            }
+            // Another thread served by the same process may be busy (for
+            // example awaiting approval) in a row the tracker could not
+            // bind to this pane.
+            if candidate.agent == "amp"
+                && target
+                    .processes
+                    .iter()
+                    .any(|process| busy_amp_pids.contains(&process.pid))
+            {
+                debug_log(format!(
+                    "auto-hibernate: process serves a busy thread session={} pane={} pid={}",
                     candidate.session, candidate.pane_id, target.pid,
                 ));
                 continue;
@@ -1162,6 +1182,64 @@ impl ReadOnlyMuxStateSource {
             }
         }
         changed
+    }
+
+    /// Pids of the Amp processes that last wrote busy threads (not quiet
+    /// past the idle threshold) whose rows have no known pane. Pane-bound
+    /// rows are already grouped by pane in the tracker.
+    fn busy_unplaced_amp_pids(&self) -> HashSet<u32> {
+        let Some(home) = self.agent_state_home.as_deref() else {
+            return HashSet::new();
+        };
+        let now = (self.now_ms)();
+        let idle_after_ms = self.auto_hibernate.idle_after_ms;
+        let sessions = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.list_sessions())
+            .map(|session| session.name)
+            .collect::<HashSet<_>>();
+        let busy_threads = {
+            let tracker = self.agent_tracker.lock().unwrap();
+            sessions
+                .iter()
+                .flat_map(|session| tracker.get_agents(session))
+                .filter(|event| {
+                    event.agent == "amp"
+                        && event.pane_id.is_none()
+                        && event.liveness != Some(AgentLiveness::Exited)
+                        && event.status != AgentStatus::Hibernated
+                        && (!matches!(
+                            event.status,
+                            AgentStatus::Idle
+                                | AgentStatus::Done
+                                | AgentStatus::Error
+                                | AgentStatus::Interrupted
+                        ) || now.saturating_sub(event.ts) <= idle_after_ms)
+                })
+                .filter_map(|event| event.thread_id)
+                .collect::<HashSet<_>>()
+        };
+        let logs_dir = home.join(".cache/amp/logs/threads");
+        busy_threads
+            .into_iter()
+            // Thread ids come from external events; never let one escape the
+            // log directory.
+            .filter(|thread_id| {
+                !thread_id.is_empty()
+                    && thread_id
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            })
+            .filter_map(|thread_id| {
+                read_file_tail(
+                    &logs_dir.join(format!("{thread_id}.log")),
+                    AMP_LOG_PID_TAIL_BYTES,
+                )
+                .as_deref()
+                .and_then(amp_log_pid)
+            })
+            .collect()
     }
 
     pub fn with_port_command_runner(mut self, runner: Arc<dyn PortCommandRunner>) -> Self {
@@ -5796,6 +5874,30 @@ mod tests {
         // The same Amp process moved on to a new thread the live watcher
         // cannot attribute to a session.
         home.amp_log("T-new", 101, "working", 0);
+
+        assert!(!source.hibernate_idle_agent_panes());
+        assert!(processes.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hibernation_skips_a_process_serving_a_busy_thread_tracked_elsewhere() {
+        let home = AgentStateHome::new();
+        home.amp_log("T-bg", 101, "idle", 48 * HOUR_MS);
+        // The same Amp process has another thread awaiting approval, tracked
+        // in a different session (for example from a plugin event resolved
+        // by project dir) and quiet for longer than the idle threshold.
+        home.amp_log("T-approval", 101, "awaiting_approval", 50 * HOUR_MS);
+        let (source, processes) = restarted_source(&home);
+        assert!(source.seed_agents_from_durable_state());
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "amp",
+                "tmuxSession": "focused",
+                "threadId": "T-approval",
+                "status": "waiting",
+                "ts": current_time_ms() - 50 * HOUR_MS,
+            }))
+            .expect("apply agent event");
 
         assert!(!source.hibernate_idle_agent_panes());
         assert!(processes.signals.lock().unwrap().is_empty());
