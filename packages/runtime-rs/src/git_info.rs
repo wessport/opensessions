@@ -21,20 +21,21 @@ impl GitInfo {
     }
 }
 
+/// Separates the sections of `git_info_output`. Git ref names and porcelain
+/// status lines cannot contain NUL, so no branch or path can forge a boundary
+/// (a text marker such as `---` is a legal branch name).
+pub const GIT_INFO_SECTION_SEPARATOR: char = '\0';
+
+/// Parses `rev-parse --abbrev-ref HEAD --git-dir`, `status --porcelain`, and
+/// `diff --numstat` output joined by `GIT_INFO_SECTION_SEPARATOR`.
 pub fn parse_git_info_output(output: &str) -> GitInfo {
-    let output = output.trim();
-    if output.is_empty() {
+    let mut sections = output.split(GIT_INFO_SECTION_SEPARATOR);
+    let header = sections.next().unwrap_or_default().trim();
+    if header.is_empty() {
         return GitInfo::empty();
     }
-
-    let (header, rest) = output
-        .split_once("---")
-        .map(|(header, rest)| (header.trim(), rest.trim()))
-        .unwrap_or((output, ""));
-    let (status, numstat) = rest
-        .split_once("---NUMSTAT---")
-        .map(|(status, numstat)| (status.trim(), numstat.trim()))
-        .unwrap_or((rest, ""));
+    let status = sections.next().unwrap_or_default();
+    let numstat = sections.next().unwrap_or_default();
     let mut lines = header.lines();
     let branch = lines.next().unwrap_or_default().trim().to_string();
     let git_dir = lines.next().unwrap_or_default().trim();
@@ -69,4 +70,36 @@ fn parse_numstat_totals(numstat: &str) -> (u32, u32) {
                 .unwrap_or(0);
             (insertions + added, deletions + removed)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_names_containing_dashes_do_not_split_sections() {
+        let output = [
+            "fix---races\n/repo/.git/worktrees/fix",
+            " M src/a.rs\n?? b.rs\n",
+            "3\t1\tsrc/a.rs\n",
+        ]
+        .join(&GIT_INFO_SECTION_SEPARATOR.to_string());
+
+        assert_eq!(
+            parse_git_info_output(&output),
+            GitInfo {
+                branch: "fix---races".to_string(),
+                dirty: true,
+                is_worktree: true,
+                changed_files: 2,
+                insertions: 3,
+                deletions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_output_is_no_git_info() {
+        assert_eq!(parse_git_info_output(""), GitInfo::empty());
+    }
 }

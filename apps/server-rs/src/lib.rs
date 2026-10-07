@@ -25,7 +25,7 @@ use opensessions_runtime::config::{
     AutoHibernateSettings, OpensessionsConfig, SidebarPosition as ConfigSidebarPosition,
     load_config_from_home, save_config_to_home,
 };
-use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
+use opensessions_runtime::git_info::{GIT_INFO_SECTION_SEPARATOR, GitInfo, parse_git_info_output};
 use opensessions_runtime::hibernate::{
     AgentProcessTarget, HIBERNATE_POLL_INTERVAL_MS, HIBERNATE_TERM_GRACE, ProcessControl,
     ProcessEntry, SystemProcessControl, find_agent_process, terminate_agent_processes,
@@ -374,10 +374,11 @@ impl GitCommandRunner for SystemGitCommandRunner {
             return String::new();
         };
 
+        let separator = GIT_INFO_SECTION_SEPARATOR;
         format!(
-            "{}\n---\n{}\n---NUMSTAT---\n{}",
+            "{}{separator}{}{separator}{}",
             String::from_utf8_lossy(&rev_parse.stdout).trim(),
-            String::from_utf8_lossy(&status.stdout).trim(),
+            String::from_utf8_lossy(&status.stdout),
             String::from_utf8_lossy(&numstat.stdout).trim()
         )
     }
@@ -7702,5 +7703,39 @@ mod tests {
                 "{fatal}"
             );
         }
+    }
+
+    #[test]
+    fn git_info_survives_branch_names_containing_dashes() {
+        let repo = std::env::temp_dir().join(format!(
+            "opensessions-git-dashes-{}-{}",
+            process::id(),
+            NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            process::Command::new("git")
+                .current_dir(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        if !git(&["init", "-q", "-b", "fix---races"]).status.success() {
+            let _ = fs::remove_dir_all(&repo);
+            return;
+        }
+        fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+
+        let info =
+            parse_git_info_output(&SystemGitCommandRunner.git_info_output(&repo.to_string_lossy()));
+        let _ = fs::remove_dir_all(&repo);
+
+        assert_eq!(info.branch, "fix---races");
+        assert_eq!(info.changed_files, 1);
+        assert_eq!((info.insertions, info.deletions), (1, 0));
     }
 }
