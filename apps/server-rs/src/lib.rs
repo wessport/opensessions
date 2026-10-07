@@ -140,27 +140,28 @@ impl SidebarWidthRepairScheduler {
     }
 }
 
-/// Append a single debug line when explicit diagnostics are enabled.
+/// Append a single debug line when explicit diagnostics are enabled. Shares
+/// the sidebars' size cap and whole-line writes, so leaving
+/// `OPENSESSIONS_DEBUG_LOG` set can't grow the file without bound.
 fn debug_log(line: impl AsRef<str>) {
-    use std::io::Write;
-    let Ok(path) = std::env::var("OPENSESSIONS_DEBUG_LOG") else {
+    let Some(path) =
+        opensessions_runtime::debug_log::debug_log_path_from_env(|key| std::env::var(key).ok())
+    else {
         return;
     };
-    if path.is_empty() {
-        return;
-    }
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            file,
+    opensessions_runtime::debug_log::append_bounded(
+        &path,
+        &format!(
             "[{now}] [server pid={}] {}",
             std::process::id(),
             line.as_ref()
-        );
-    }
+        ),
+        opensessions_runtime::debug_log::DEBUG_LOG_MAX_BYTES,
+    );
 }
 
 pub trait StateSource: Send + Sync + 'static {

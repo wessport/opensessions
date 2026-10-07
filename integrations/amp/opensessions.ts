@@ -27,14 +27,31 @@
 
 // @i-know-the-amp-plugin-api-is-wip-and-very-experimental-right-now
 import type { PluginAPI } from "@ampcode/plugin";
-import { appendFileSync, readFileSync, readdirSync, realpathSync } from "fs";
+import { appendFileSync, readFileSync, readdirSync, realpathSync, renameSync, statSync } from "fs";
 import { createHash } from "crypto";
 import { join } from "path";
 import { homedir } from "os";
 
 const PLUGIN_LOG_PATH = process.env.OPENSESSIONS_AMP_PLUGIN_LOG || "/tmp/opensessions-plugin.log";
+/** Same cap as the server and sidebar debug logs: keep `<path>` and `<path>.1`. */
+const PLUGIN_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Append one line, first rotating `path` to `<path>.1` when the append would
+ * pass `maxBytes`. Every Amp session runs this plugin, so the log is shared;
+ * each line is a single append so concurrent sessions never interleave.
+ */
+export function appendBoundedLog(path: string, line: string, maxBytes: number): void {
+  const entry = `${line}\n`;
+  try {
+    const size = statSync(path).size;
+    if (size > 0 && size + Buffer.byteLength(entry) > maxBytes) renameSync(path, `${path}.1`);
+  } catch {}
+  try { appendFileSync(path, entry); } catch {}
+}
+
 function plog(msg: string): void {
-  try { appendFileSync(PLUGIN_LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+  appendBoundedLog(PLUGIN_LOG_PATH, `[${new Date().toISOString()}] ${msg}`, PLUGIN_LOG_MAX_BYTES);
 }
 
 const DEFAULT_SERVER_PORT = 7391;

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,7 +39,7 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-const { default: plugin } = await import("../integrations/amp/opensessions");
+const { default: plugin, appendBoundedLog } = await import("../integrations/amp/opensessions");
 
 type Handler = (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<unknown>;
 const handlers = new Map<string, Handler>();
@@ -82,5 +82,20 @@ describe("Amp plugin event delivery", () => {
     await Bun.sleep(1_200);
     expect(delivered).toEqual(["done"]);
     expect(requested).toEqual(["done", "done", "done"]);
+  });
+});
+
+describe("Amp plugin log", () => {
+  test("rotates instead of growing past its size cap and keeps whole lines", () => {
+    const path = join(root, "bounded.log");
+    const line = "z".repeat(99);
+    for (let i = 0; i < 25; i += 1) appendBoundedLog(path, line, 1_000);
+
+    expect(statSync(path).size).toBeLessThanOrEqual(1_000);
+    expect(existsSync(`${path}.1`)).toBe(true);
+    expect(statSync(`${path}.1`).size).toBeLessThanOrEqual(1_000);
+    for (const file of [path, `${path}.1`]) {
+      for (const entry of readFileSync(file, "utf8").trimEnd().split("\n")) expect(entry).toBe(line);
+    }
   });
 });
