@@ -17,6 +17,7 @@ pub mod session_order;
 pub mod shared;
 pub mod sidebar_coordinator;
 pub mod sidebar_width_sync;
+pub mod subprocess;
 pub mod tmux_provider;
 pub mod tmux_scripting;
 pub mod tracker;

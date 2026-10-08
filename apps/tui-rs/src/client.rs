@@ -87,6 +87,11 @@ where
     ws_result.map_err(anyhow::Error::from)
 }
 
+/// Websocket path sidebars connect on. The server admits sidebars ahead of
+/// other websocket clients, whose share of its capacity is limited; keep in
+/// sync with `opensessions_server::SIDEBAR_WEBSOCKET_PATH`.
+pub const SIDEBAR_WS_PATH: &str = "/?client=sidebar";
+
 pub async fn connect_ws(
     host: &str,
     port: u16,

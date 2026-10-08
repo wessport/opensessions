@@ -211,12 +211,37 @@ pub fn sidebar_mouse_resize_report_script(base: &str, token_file: &str) -> Strin
     )
 }
 
+/// How a fallback script names the closing session in `$session` and its
+/// printed fallback: by `#{session_name}` or `#{session_id}`.
+#[derive(Debug, Clone, Copy)]
+enum SessionKey {
+    Name,
+    Id,
+}
+
+/// Shell pipeline printing the session before `$session` in creation order,
+/// else the one after it, matching the sidebar's default order and its
+/// fallback when a session closes. tmux lists sessions by name and
+/// `#{session_created}` has whole-second resolution, so sessions are sorted
+/// by their `$N` id, which increases with creation.
+fn fallback_session_script(tmux: &str, key: SessionKey) -> String {
+    let id = TmuxFormat::var_name("session_id").render_for_hook();
+    let name = TmuxFormat::var_name("session_name").render_for_hook();
+    let key = match key {
+        SessionKey::Name => "$2",
+        SessionKey::Id => "\"$\" $1",
+    };
+    format!(
+        "{tmux} list-sessions -F '{id}\t{name}' | sed 's/^\\$//' | sort -n | awk -F '\\t' -v s=\"$session\" '{{ key = {key} }} key == s {{ if (prev != \"\") {{ print prev; exit }}; seen = 1; next }} seen {{ print key; exit }} {{ prev = key }}'"
+    )
+}
+
 pub fn close_orphan_sidebar_pipeline() -> String {
     format!(
-        "tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | while IFS=$(printf '\\t') read -r session pane windows; do if [ \"$windows\" -le 1 ]; then fallback=$(tmux -S #{{socket_path}} list-sessions -F '{}' | awk -v s=\"$session\" '$0==s {{ if (prev != \"\") {{ print prev; exit }}; seen=1; next }} seen {{ print; exit }} {{ prev=$0 }}'); tmux -S #{{socket_path}} list-clients -t \"=$session:\" -F '{}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux -S #{{socket_path}} switch-client -c \"$client\" -t \"=$fallback:\" >/dev/null 2>&1 || true; done; fi; tmux -S #{{socket_path}} kill-pane -t \"$pane\" >/dev/null 2>&1 || true; done",
+        "tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | while IFS=$(printf '\\t') read -r session pane windows; do if [ \"$windows\" -le 1 ]; then fallback=$({}); tmux -S #{{socket_path}} list-clients -t \"=$session:\" -F '{}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux -S #{{socket_path}} switch-client -c \"$client\" -t \"=$fallback:\" >/dev/null 2>&1 || true; done; fi; tmux -S #{{socket_path}} kill-pane -t \"$pane\" >/dev/null 2>&1 || true; done",
         orphan_sidebar_filter().render_for_hook(),
         orphan_sidebar_row_format(),
-        TmuxFormat::var_name("session_name").render_for_hook(),
+        fallback_session_script("tmux -S #{socket_path}", SessionKey::Name),
         TmuxFormat::var_name("client_tty").render_for_hook(),
     )
 }
@@ -247,6 +272,11 @@ pub fn pane_died_hook_command(base: &str, token_file: &str) -> String {
 /// would not have kept it: never for a user's `on`, only clean exits for
 /// `failed`. Dead sidebar panes are always removed. A window that no longer
 /// has a sidebar gets its original `remain-on-exit` back.
+///
+/// tmux 3.4 does not run this hook for every pane death, so the server's
+/// sweep (`TmuxClient::close_dead_content_panes`) applies the same rules
+/// through `dead_pane_cleanup`; a unit test runs this script against every
+/// case of that decision to keep the two identical.
 pub fn close_dead_content_pane_pipeline() -> String {
     let is_sidebar = sidebar_pane_filter().render_for_hook();
     let pane_dead = TmuxFormat::var_name("pane_dead").render_for_hook();
@@ -256,6 +286,7 @@ pub fn close_dead_content_pane_pipeline() -> String {
     let session_id = TmuxFormat::var_name("session_id").render_for_hook();
     let pane_id = TmuxVar::PaneId.format().render_for_hook();
     let client_tty = TmuxFormat::var_name("client_tty").render_for_hook();
+    let fallback = fallback_session_script("tmux", SessionKey::Id);
     let info = [
         window_id.as_str(),
         session_id.as_str(),
@@ -273,8 +304,103 @@ pub fn close_dead_content_pane_pipeline() -> String {
     .join("|");
 
     format!(
-        "pane='#{{hook_pane}}'; tmux display-message -p -t \"$pane\" '{info}' | {{ IFS='|' read -r window session sidebar previous status; [ -n \"$window\" ] || exit 0; effective=on; if [ \"$previous\" = '{REMAIN_ON_EXIT_INHERITED}' ]; then effective=$(tmux show-options -gwv remain-on-exit); elif [ -n \"$previous\" ]; then effective=$previous; fi; if [ \"$sidebar\" != 1 ]; then [ \"$effective\" = on ] && exit 0; [ \"$effective\" = failed ] && [ \"$status\" != 0 ] && exit 0; fi; counts=$(tmux list-panes -t \"$window\" -F '{rows}' | awk -F '|' -v pane=\"$pane\" -v keep=\"$effective\" '{{ if ($2==\"1\") sidebars++; else if ($1!=pane && ($3!=\"1\" || keep==\"on\" || (keep==\"failed\" && $4!=\"0\"))) remaining++ }} END {{ print sidebars+0, remaining+0 }}'); set -- $counts; if [ \"$1\" -eq 0 ] && [ -n \"$previous\" ]; then if [ \"$previous\" = '{REMAIN_ON_EXIT_INHERITED}' ]; then tmux set-window-option -t \"$window\" -u remain-on-exit; else tmux set-window-option -t \"$window\" remain-on-exit \"$previous\"; fi; tmux set-window-option -t \"$window\" -u {REMAIN_ON_EXIT_PREVIOUS_OPTION}; fi; if [ \"$1\" -gt 0 ] && [ \"$2\" -eq 0 ]; then windows=$(tmux list-windows -t \"$session\" -F x | wc -l | tr -d ' '); if [ \"$windows\" -le 1 ]; then fallback=$(tmux list-sessions -F '{session_id}' | awk -v s=\"$session\" '$0 != s {{ print; exit }}'); tmux list-clients -t \"$session\" -F '{client_tty}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux switch-client -c \"$client\" -t \"$fallback\" >/dev/null 2>&1 || true; done; fi; tmux kill-window -t \"$window\" >/dev/null 2>&1 || true; else tmux kill-pane -t \"$pane\" >/dev/null 2>&1 || true; fi; }}"
+        "pane='#{{hook_pane}}'; tmux display-message -p -t \"$pane\" '{info}' | {{ IFS='|' read -r window session sidebar previous status; [ -n \"$window\" ] || exit 0; effective=on; if [ \"$previous\" = '{REMAIN_ON_EXIT_INHERITED}' ]; then effective=$(tmux show-options -gwv remain-on-exit); elif [ -n \"$previous\" ]; then effective=$previous; fi; if [ \"$sidebar\" != 1 ]; then [ \"$effective\" = on ] && exit 0; [ \"$effective\" = failed ] && [ \"$status\" != 0 ] && exit 0; fi; counts=$(tmux list-panes -t \"$window\" -F '{rows}' | awk -F '|' -v pane=\"$pane\" -v keep=\"$effective\" '{{ if ($2==\"1\") sidebars++; else if ($1!=pane && ($3!=\"1\" || keep==\"on\" || (keep==\"failed\" && $4!=\"0\"))) remaining++ }} END {{ print sidebars+0, remaining+0 }}'); set -- $counts; if [ \"$1\" -eq 0 ] && [ -n \"$previous\" ]; then if [ \"$previous\" = '{REMAIN_ON_EXIT_INHERITED}' ]; then tmux set-window-option -t \"$window\" -u remain-on-exit; else tmux set-window-option -t \"$window\" remain-on-exit \"$previous\"; fi; tmux set-window-option -t \"$window\" -u {REMAIN_ON_EXIT_PREVIOUS_OPTION}; fi; if [ \"$1\" -gt 0 ] && [ \"$2\" -eq 0 ]; then windows=$(tmux list-windows -t \"$session\" -F x | wc -l | tr -d ' '); if [ \"$windows\" -le 1 ]; then fallback=$({fallback}); tmux list-clients -t \"$session\" -F '{client_tty}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux switch-client -c \"$client\" -t \"$fallback\" >/dev/null 2>&1 || true; done; fi; tmux kill-window -t \"$window\" >/dev/null 2>&1 || true; else tmux kill-pane -t \"$pane\" >/dev/null 2>&1 || true; fi; }}"
     )
+}
+
+/// The `remain-on-exit` the user chose for a sidebar window, from its saved
+/// `REMAIN_ON_EXIT_PREVIOUS_OPTION` value. No saved value means opensessions
+/// did not need to force it, which happens only when it was already `on`.
+/// `global` reads the global window option and is called only when needed.
+pub fn effective_remain_on_exit(previous: &str, global: impl FnOnce() -> String) -> String {
+    match previous {
+        "" => "on".to_string(),
+        REMAIN_ON_EXIT_INHERITED => global(),
+        value => value.to_string(),
+    }
+}
+
+/// Whether opensessions removes a dead pane in a window whose user
+/// `remain-on-exit` is `effective`: the user's value would not have kept it
+/// (never for `on`, only clean exits for `failed`). Dead sidebar panes are
+/// always removed. An unknown (empty) status counts as a failure, as tmux
+/// itself treats it: tmux 3.4 sometimes never records a dead pane's status.
+/// `close_dead_content_pane_pipeline` encodes the same rule.
+pub fn dead_pane_is_removable(effective: &str, is_sidebar: bool, dead_status: &str) -> bool {
+    is_sidebar || !(effective == "on" || (effective == "failed" && dead_status != "0"))
+}
+
+/// One pane of a window, as the dead-pane cleanup sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupPane {
+    pub pane_id: String,
+    pub is_sidebar: bool,
+    pub dead: bool,
+    pub dead_status: String,
+}
+
+/// What removing a window's dead panes amounts to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeadPaneCleanup {
+    /// No dead pane is removable.
+    Keep,
+    /// Kill these dead panes. `window_has_sidebar` is false when the window
+    /// has no sidebar left, so its saved `remain-on-exit` is restored first.
+    KillPanes {
+        panes: Vec<String>,
+        window_has_sidebar: bool,
+    },
+    /// No content pane would remain beside the sidebar: close the window,
+    /// first moving its clients to the fallback session if it is the
+    /// session's last window.
+    KillWindow,
+}
+
+/// The `pane-died` hook's decision applied to every dead pane of a window at
+/// once. Running the hook pane by pane reaches the same result: each
+/// invocation counts the same remaining content panes (alive, or dead and
+/// kept), so they agree on closing the window or killing just the panes.
+pub fn dead_pane_cleanup(effective: &str, panes: &[CleanupPane]) -> DeadPaneCleanup {
+    let removable = |pane: &&CleanupPane| {
+        pane.dead && dead_pane_is_removable(effective, pane.is_sidebar, &pane.dead_status)
+    };
+    let doomed = panes
+        .iter()
+        .filter(removable)
+        .map(|pane| pane.pane_id.clone())
+        .collect::<Vec<_>>();
+    if doomed.is_empty() {
+        return DeadPaneCleanup::Keep;
+    }
+    let window_has_sidebar = panes.iter().any(|pane| pane.is_sidebar);
+    let content_remains = panes
+        .iter()
+        .any(|pane| !pane.is_sidebar && !doomed.contains(&pane.pane_id));
+    if window_has_sidebar && !content_remains {
+        return DeadPaneCleanup::KillWindow;
+    }
+    DeadPaneCleanup::KillPanes {
+        panes: doomed,
+        window_has_sidebar,
+    }
+}
+
+/// The session clients fall back to when `closing` closes: the previous one
+/// in creation order, else the next, as `fallback_session_script` picks it.
+/// `session_ids` are tmux `$N` ids in any order.
+pub fn fallback_session_id(session_ids: &[String], closing: &str) -> Option<String> {
+    let seq = |id: &str| id.strip_prefix('$').and_then(|seq| seq.parse::<u64>().ok());
+    let mut ids = session_ids
+        .iter()
+        .filter_map(|id| Some((seq(id)?, id)))
+        .collect::<Vec<_>>();
+    ids.sort();
+    let index = ids.iter().position(|(_, id)| *id == closing)?;
+    index
+        .checked_sub(1)
+        .and_then(|before| ids.get(before))
+        .or_else(|| ids.get(index + 1))
+        .map(|(_, id)| (*id).clone())
 }
 
 fn orphan_sidebar_row_format() -> String {

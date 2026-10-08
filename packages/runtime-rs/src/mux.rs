@@ -73,6 +73,8 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn name(&self) -> &str;
+    /// Sessions in creation order. `created_at` may be coarse (tmux reports
+    /// whole seconds), so callers keep this order for equal timestamps.
     fn list_sessions(&self) -> Vec<MuxSessionInfo>;
     /// Like `list_sessions`, but `None` when listing failed rather than found
     /// no sessions. Callers that prune or persist state, or decide the mux
@@ -222,6 +224,10 @@ pub trait MuxProvider: Send + Sync {
     /// Undoes `prepare_sidebar_window` for windows whose sidebar is gone
     /// (hidden or killed), so their panes exit normally again.
     fn restore_windows_without_sidebar(&self) {}
+    /// Removes dead panes left in sidebar windows exactly as the mux's own
+    /// pane-death hook would have. The server calls it as a fallback because
+    /// tmux 3.4 does not run `pane-died` for every pane death.
+    fn close_dead_content_panes(&self) {}
     fn resize_sidebar_pane(&self, _pane_id: &str, _width: u16) {}
     fn resize_sidebar_panes(&self, pane_ids: &[String], width: u16) {
         for pane_id in pane_ids {

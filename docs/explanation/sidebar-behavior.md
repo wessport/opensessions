@@ -66,7 +66,7 @@ Restarting the opensessions server (update, crash, SIGTERM, `q`) must not silent
 
 - the choice is stored in the tmux global user option `@opensessions_sidebar_visible` (`on`/`off`) on that tmux server, so it is naturally per-socket, survives opensessions restarts, and disappears with the tmux server; hook cleanup leaves it in place and `uninstall.sh` removes it
 - only explicit user transitions record it: toggle-on and the first sidebar connection on a fresh server record `on`; toggle-off records `off`
-- on startup, a server that finds no sidebar panes but a recorded `on` restores visibility exactly like toggle-on: `warming up…` and a sidebar in every window, before it starts accepting requests
+- on startup, a server that finds no sidebar panes but a recorded `on` restores visibility exactly like toggle-on: `warming up…` and a sidebar in every window, before its `GET /` liveness probe reports it live (it answers `503 … initializing` until then) and before it handles any state request; agent-event ingestion may already be accepted
 - a recorded `off` keeps the server hidden, so `/ensure-sidebar` and window/session hooks do not respawn sidebars
 - with no recorded choice (first start in a tmux server), the server starts hidden as before and the first toggle shows the sidebar
 - `toggle.sh` skips its toggle when its own `ensure_server` call just started a server that already restored sidebars; otherwise the restore would be undone immediately
@@ -115,7 +115,7 @@ The accepted rule set is:
 - `after-resize-pane` starts direct background repair of only the pane that triggered the hook, except while that pane's window carries the short-lived mouse-resize marker; it fires during our own repairs, so it must remain idempotent and must not launch a global scan
 - OpenSessions extends only tmux's default `MouseDrag1Border resize-pane -M` binding; an existing custom border binding is preserved rather than overwritten
 - `after-kill-pane`, `pane-exited`, `after-resize-window`, and `client-resized` request server-owned global repair; queued requests settle for 50 ms and coalesce into one pass
-- `pane-exited` also notifies the server for orphan-sidebar cleanup
+- `pane-exited` (and `pane-died`) also notify the server for orphan-sidebar cleanup and the dead-pane sweep
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - global repair is single-flight: a request that arrives during a pass causes one follow-up pass rather than concurrent work, and every pass reads the latest configured width
 - each provider starts a global pass with one mux invocation when possible, then uses independent race-tolerant pane repairs so interactive commands can interleave
@@ -161,6 +161,8 @@ That means:
 - transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
 - switching immediately after a slider or managed divider change converges to its new Fixed Sidebar Width; unrelated tmux resize observations are not adopted
 - switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane
+
+Without a custom order, sessions are listed in tmux creation order (`$N` session id). `#{session_created}` has whole-second resolution, so sessions created in the same second must not fall back to name order; otherwise `Tab` and number-key targets depend on whether the clock ticked between creations. When a session closes, its clients fall back to the previous session (else the next); the tmux hook scripts that close a session without the server use the same creation order.
 
 The sidebar session list has one durable local active row: this tmux client's confirmed active session. The keyboard-focused row may temporarily diverge while the user browses with `j`/`k`/arrow keys, but that temporary selection is local-only and must not be server-synced. `Enter` switches to the temporary selection and keeps that row visible as the pending switch target until `YourSession`/pane identity confirms the new context; it must not snap back to the old active row for an intermediate frame. `Tab`/`Shift-Tab` are the only keys that immediately switch to the next/previous visible session without first moving temporary focus. Mouse clicks on sessions also make the clicked concrete session the pending focus target. In all cases, the durable active row stays on the confirmed active session until confirmation.
 
@@ -213,6 +215,9 @@ These are non-negotiable:
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
 - `remain-on-exit` is forced `on` only while a window has a sidebar (the prior value is saved in `@opensessions_remain_on_exit_previous`); hiding the sidebar, a sidebar pane exiting or being killed, and shutdown restore the saved value, so panes in sidebar-less windows exit normally instead of lingering as "Pane is dead"
 - the `pane-died` hook removes a dead content pane only when the user's saved `remain-on-exit` would not have kept it (never for `on`, clean exits only for `failed`); dead sidebar panes are always removed, and a window found without a sidebar gets its saved value back
+- `pane-died` is best-effort: tmux 3.4 (Ubuntu 24.04) runs no hook at all for a sizeable share of pane deaths (those for which it never records an exit status), so the server sweeps dead panes as a fallback with the same rules (`MuxProvider::close_dead_content_panes`): every window with a sidebar or a saved `remain-on-exit`, one `list-panes -a` read, then only the option, kill, and fallback-switch commands the hook would have run; closing a window is guarded by its listed pane count so a pane created after the read is never taken along. The rules live in `dead_pane_cleanup` (Rust) and the hook script, and a unit test runs the script against every case to keep them identical
+- a dead pane without a recorded exit status counts as failed, as tmux itself treats it: under the user's `failed` it is kept (tmux 3.4 alone keeps it too), under `off` it is removed
+- the sweep runs whenever the tmux state fingerprint changes (it covers `pane_dead`, so a death is noticed by the next poll: 2 s while active, up to 30 s when idle) and on every `/pane-exited` request, which catches a pane whose hook was skipped when a sibling's hook did run
 - target sessions by exact name (`=name`, or `=name:` for window/pane targets); a bare `-t name` falls back to prefix/pattern matches and can act on another session
 
 ## Per-tmux-server Technical Contract
@@ -243,10 +248,11 @@ The control plane may have a sidebar process in every managed window, but only s
 
 Server backstops are adaptive rather than fixed-rate full snapshots:
 
-- tmux topology/focus fingerprints back off while unchanged, and only a changed fingerprint builds a complete state snapshot
+- tmux topology/focus fingerprints back off while unchanged, and only a changed fingerprint builds a complete state snapshot and sweeps dead panes (one extra `list-panes -a` when nothing is dead)
 - agent filesystem scans back off while no agent is active
 - Git and port discovery run independently on a slower adaptive schedule, so routine tmux polling cannot launch Git, `ps`, or `lsof`
 - synchronous state-provider work (tmux commands, Git, `ps`, and `lsof`) runs on Tokio's blocking pool rather than the HTTP/WebSocket event loop
+- every such subprocess is bounded (tmux, `ps`, and `kill` 5s; Git and `lsof` 10s); one that outlives its bound is killed, reaped, and reported as a failed command, so a wedged tmux cannot hold the state operation lock or keep the blocking pool, and therefore shutdown, waiting forever. A timed-out `list-sessions` is a transient failure, not an empty list
 - port cache refresh is single-flight, so a burst of new sidebar connections cannot turn one empty cache into one `ps`/`lsof` pair per connection
 - the owned tmux socket is checked without spawning commands; when it stops accepting connections, the server exits and skips cleanup commands that cannot succeed against the missing namespace
 - a transiently failed `tmux list-sessions` (tmux could not be spawned or reached) is not an empty session list: it never prunes session metadata, session order, or hidden sessions, and never counts toward deciding the namespace is gone; only tmux reporting its server missing or exiting (`no server running`, `server exited unexpectedly`, a refused or missing socket) means no sessions

@@ -203,6 +203,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 - `theme`, `transparentBackground`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, `autoHibernate`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
 - tmux is the only supported mux today.
+- On tmux 3.4, run tmux with a UTF-8 locale (for example `LANG=en_US.UTF-8`, or start it with `tmux -u`). Under a non-UTF-8 locale such as `LANG=C`, tmux 3.4 prints tabs in its formatted output as `_`, which breaks how opensessions reads sessions and panes.
 
 ## Star History
 

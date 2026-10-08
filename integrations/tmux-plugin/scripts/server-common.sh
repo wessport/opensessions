@@ -111,7 +111,7 @@ fi
 PLUGIN_DIR="$(tmux_global_env OPENSESSIONS_DIR)"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
-START_LOCK_DIR="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
+START_LOCK="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
 
 RUST_SERVER_BIN=""
 if [ -x "$PLUGIN_DIR/bin/opensessions-server" ]; then
@@ -138,49 +138,171 @@ auth_token() {
   cat "$TOKEN_FILE" 2>/dev/null
 }
 
-# A cold start answers `server_alive` only after the server's first snapshot
-# and hook setup, which can take several seconds on a busy machine (git, ps,
-# lsof). Launchers and lock waiters wait this long while the start is still
-# making progress, instead of giving up after a fixed number of polls.
+# A cold start answers `server_alive` only after the server has installed its
+# hooks and restored recorded sidebars (it reports "initializing" until then),
+# which can take several seconds on a busy machine. Launchers and lock waiters
+# wait this long while the start is still making progress, instead of giving
+# up after a fixed number of polls.
 START_TIMEOUT="${OPENSESSIONS_START_TIMEOUT:-30}"
+
+# `date +%s` has whole-second resolution, so `now + N` can expire after as
+# little as N-1 seconds. Add one second so every wait lasts at least
+# START_TIMEOUT.
+start_deadline() {
+  printf '%s\n' "$(( $(date +%s) + START_TIMEOUT + 1 ))"
+}
+
+# The start lock is a file holding its owner's pid, process start time, and a
+# nonce. It is published with `ln`, which atomically refuses an existing
+# target, so a lock never exists without its owner recorded. A lock is stale
+# when its pid is dead, when the pid now belongs to a process started at a
+# different time (pid reuse), or when it names no pid (an older version's lock
+# directory left by a launcher that died before writing its pid) for longer
+# than START_LOCK_GRACE seconds.
+START_LOCK_GRACE="${OPENSESSIONS_START_LOCK_GRACE:-2}"
+START_LOCK_TOKEN=""
+
+process_start_time() {
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'
+}
+
+start_lock_nonce() {
+  nonce="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  printf '%s\n' "${nonce:-$(date +%s)}"
+}
+
+# Prints the lock's owner record, or nothing when it is absent. An older
+# version's lock directory is read through its pid file.
+read_start_lock() {
+  if [ -d "$START_LOCK" ]; then
+    printf 'pid=%s\n' "$(cat "$START_LOCK/pid" 2>/dev/null)"
+  else
+    cat "$START_LOCK" 2>/dev/null
+  fi
+}
+
+# Status 0 when the record's owner is still running, 1 when it is dead or its
+# pid was reused, 2 when the record names no pid.
+start_lock_owner_state() {
+  owner_pid="$(printf '%s\n' "$1" | sed -n 's/^pid=//p')"
+  case "$owner_pid" in
+    '' | *[!0-9]*) return 2 ;;
+  esac
+  kill -0 "$owner_pid" 2>/dev/null || return 1
+  owner_start="$(printf '%s\n' "$1" | sed -n 's/^start=//p')"
+  [ -n "$owner_start" ] || return 0
+  current_start="$(process_start_time "$owner_pid")"
+  [ -z "$current_start" ] || [ "$current_start" = "$owner_start" ]
+}
+
+# Removes the lock only while it still holds the stale record $1. Waiters that
+# judged the same record stale serialize on a breaker directory and re-read
+# the lock inside it, so a lock re-acquired by a faster waiter is never
+# removed. The lock is renamed aside before deletion so removal is atomic.
+# Returns 0 when this call removed the stale lock.
+break_stale_start_lock() {
+  breaker="$START_LOCK.break"
+  if ! mkdir "$breaker" 2>/dev/null; then
+    # A breaker that died inside its few-command critical section.
+    now="$(date +%s)"
+    if [ -z "$breaker_seen_at" ]; then
+      breaker_seen_at="$now"
+    elif [ $((now - breaker_seen_at)) -ge "$START_LOCK_GRACE" ]; then
+      rmdir "$breaker" 2>/dev/null
+      breaker_seen_at=""
+    fi
+    return 1
+  fi
+  breaker_seen_at=""
+  broke=1
+  if [ "$(read_start_lock)" = "$1" ]; then
+    aside="$START_LOCK.stale.$$.$(start_lock_nonce)"
+    if mv "$START_LOCK" "$aside" 2>/dev/null; then
+      if [ -f "$aside" ] && [ "$(cat "$aside" 2>/dev/null)" != "$1" ]; then
+        # Lost a race after all: hand the live lock back.
+        ln "$aside" "$START_LOCK" 2>/dev/null
+      else
+        broke=0
+      fi
+      rm -rf "$aside"
+    fi
+  fi
+  rmdir "$breaker" 2>/dev/null
+  return "$broke"
+}
 
 # Returns 0 with the lock held, 1 on failure, or 2 when a server became
 # reachable while waiting. Sets saw_live_launcher=1 when it had to wait on a
 # live launcher, and SERVER_START_OBSERVED=1 when that launcher's server came
 # up while waiting (a fresh start by someone else).
 acquire_start_lock() {
-  deadline=$(( $(date +%s) + START_TIMEOUT ))
+  deadline=$(start_deadline)
   saw_live_launcher=0
-  while ! mkdir "$START_LOCK_DIR" 2>/dev/null; do
+  breaker_seen_at=""
+  pidless_record=""
+  pidless_seen_at=""
+  live_record=""
+  live_pid=""
+  START_LOCK_TOKEN="$(printf 'pid=%s\nstart=%s\nnonce=%s' "$$" "$(process_start_time "$$")" "$(start_lock_nonce)")"
+  candidate="$START_LOCK.$$.$(start_lock_nonce)"
+  if ! printf '%s\n' "$START_LOCK_TOKEN" >"$candidate" 2>/dev/null; then
+    show_startup_error "opensessions: cannot create server start lock $START_LOCK"
+    return 1
+  fi
+
+  while [ -d "$START_LOCK" ] || ! ln "$candidate" "$START_LOCK" 2>/dev/null; do
     if server_alive; then
+      rm -f "$candidate"
       [ "$saw_live_launcher" -eq 0 ] || SERVER_START_OBSERVED=1
       return 2
     fi
-
-    lock_pid=""
-    if [ -f "$START_LOCK_DIR/pid" ]; then
-      lock_pid="$(cat "$START_LOCK_DIR/pid" 2>/dev/null)"
-    fi
-    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-      rm -rf "$START_LOCK_DIR"
-      continue
-    fi
-    # No pid yet means the launcher has just created the lock.
-    saw_live_launcher=1
-
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      show_startup_error "opensessions: server start lock timed out. Remove $START_LOCK_DIR if no launcher is active."
+      rm -f "$candidate"
+      show_startup_error "opensessions: server start lock timed out. Remove $START_LOCK if no launcher is active."
       return 1
+    fi
+
+    record="$(read_start_lock)"
+    if [ -n "$record" ] || [ -e "$START_LOCK" ]; then
+      # Re-verify a known-live owner cheaply; only a new record needs `ps`.
+      if [ "$record" = "$live_record" ] && kill -0 "$live_pid" 2>/dev/null; then
+        owner_state=0
+      else
+        start_lock_owner_state "$record"
+        owner_state=$?
+      fi
+      case "$owner_state" in
+        0)
+          live_record="$record"
+          live_pid="$owner_pid"
+          saw_live_launcher=1
+          ;;
+        1)
+          break_stale_start_lock "$record" && continue
+          ;;
+        *)
+          now="$(date +%s)"
+          if [ -z "$pidless_seen_at" ] || [ "$record" != "$pidless_record" ]; then
+            pidless_record="$record"
+            pidless_seen_at="$now"
+          elif [ $((now - pidless_seen_at)) -ge "$START_LOCK_GRACE" ]; then
+            pidless_seen_at=""
+            break_stale_start_lock "$record" && continue
+          fi
+          ;;
+      esac
     fi
     sleep 0.1
   done
 
-  printf '%s\n' "$$" >"$START_LOCK_DIR/pid" 2>/dev/null || true
+  rm -f "$candidate"
   return 0
 }
 
 release_start_lock() {
-  rm -rf "$START_LOCK_DIR"
+  if [ "$(cat "$START_LOCK" 2>/dev/null)" = "$START_LOCK_TOKEN" ]; then
+    rm -f "$START_LOCK"
+  fi
 }
 
 # Set to 1 when this ensure_server call launched the server generation that is
@@ -243,7 +365,7 @@ ensure_server() {
 
   # Keep waiting while the launched server is still running; stop early only
   # when it exits (for example, another server already owns the port).
-  deadline=$(( $(date +%s) + START_TIMEOUT ))
+  deadline=$(start_deadline)
   while kill -0 "$server_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 0.1
     if launched_server_answering "$server_pid"; then

@@ -104,6 +104,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 const env = process.env;
 const readyAt = Date.now() + Number(env.FAKE_READY_MS ?? 0);
 let slowProbes = Number(env.FAKE_SLOW_PROBES ?? 0);
+appendFileSync(env.FAKE_LOG, "launch\\n");
 try {
   Bun.serve({
     hostname: "127.0.0.1",
@@ -195,7 +196,20 @@ exit 0
         stdio: "ignore",
       });
     const toggles = () => readFileSync(files.log, "utf8").split("\n").filter((line) => line.startsWith("/toggle"));
-    return { runToggle, startServer, toggles, killServer, files };
+    const launches = () => readFileSync(files.log, "utf8").split("\n").filter((line) => line === "launch").length;
+    const lock = `/tmp/opensessions.${key}.start.lock`;
+    // Runs ensure_server in a fresh shell; resolves with its exit status and
+    // how long it took.
+    const runEnsure = (extraEnv: Record<string, string> = {}) =>
+      new Promise<{ code: number; ms: number }>((done) => {
+        const started = Date.now();
+        const child = spawn("sh", ["-c", '. "$SCRIPT_DIR/server-common.sh"; ensure_server'], {
+          env: { ...env, SCRIPT_DIR: scriptsDir, ...extraEnv },
+          stdio: "ignore",
+        });
+        child.on("exit", (code) => done({ code: code ?? -1, ms: Date.now() - started }));
+      });
+    return { runToggle, startServer, toggles, launches, lock, runEnsure, killServer, files };
   }
 
   async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -240,6 +254,66 @@ exit 0
     expect(toggles()).toEqual(["/toggle Bearer secret"]);
     killServer();
   }, 15000);
+
+  describe("server-common.sh start lock", () => {
+    // A process that has already exited, so its pid is dead.
+    const deadPid = () => spawnSync("true").pid!;
+    const liveProcess = () => {
+      const child = spawn("sleep", ["30"], { stdio: "ignore" });
+      cleanups.push(() => child.kill());
+      return child;
+    };
+
+    // An older launcher that died between creating its lock directory and
+    // recording its pid, or a lock file whose record was never written.
+    test.each([
+      ["directory", (lock: string) => mkdirSync(lock)],
+      ["empty file", (lock: string) => writeFileSync(lock, "")],
+    ])("a pid-less lock %s is recovered quickly", async (_shape, createLock) => {
+      const { runEnsure, launches, lock, killServer } = await fixture();
+      createLock(lock);
+      const result = await runEnsure({ OPENSESSIONS_START_TIMEOUT: "10" });
+      expect(result.code).toBe(0);
+      expect(result.ms).toBeLessThan(5000);
+      expect(launches()).toBe(1);
+      expect(existsSync(lock)).toBe(false);
+      killServer();
+    }, 15000);
+
+    test("concurrent waiters on a dead launcher's lock launch exactly one server", async () => {
+      const { runEnsure, launches, lock, killServer } = await fixture();
+      mkdirSync(lock);
+      writeFileSync(join(lock, "pid"), `${deadPid()}\n`);
+      const results = await Promise.all(Array.from({ length: 6 }, () => runEnsure({ FAKE_READY_MS: "300" })));
+      expect(results.map((result) => result.code)).toEqual([0, 0, 0, 0, 0, 0]);
+      expect(launches()).toBe(1);
+      expect(existsSync(lock)).toBe(false);
+      killServer();
+    }, 15000);
+
+    test("a lock whose pid was reused by an unrelated process is stale", async () => {
+      const { runEnsure, launches, lock, killServer } = await fixture();
+      const unrelated = liveProcess();
+      writeFileSync(lock, `pid=${unrelated.pid}\nstart=Mon Jan  1 00:00:00 2001\nnonce=old\n`);
+      const result = await runEnsure({ OPENSESSIONS_START_TIMEOUT: "10" });
+      expect(result.code).toBe(0);
+      expect(result.ms).toBeLessThan(5000);
+      expect(launches()).toBe(1);
+      killServer();
+    }, 15000);
+
+    test("a live launcher's lock is waited on, not broken", async () => {
+      const { runEnsure, launches, lock } = await fixture();
+      const launcher = liveProcess();
+      mkdirSync(lock);
+      writeFileSync(join(lock, "pid"), `${launcher.pid}\n`);
+      const result = await runEnsure({ OPENSESSIONS_START_TIMEOUT: "2" });
+      expect(result.code).toBe(1);
+      expect(result.ms).toBeGreaterThanOrEqual(1500);
+      expect(launches()).toBe(0);
+      expect(existsSync(lock)).toBe(true);
+    }, 15000);
+  });
 });
 
 describe("even-horizontal.sh", () => {
